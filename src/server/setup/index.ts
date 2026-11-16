@@ -4,7 +4,7 @@ import { access, mkdir, rename, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type { ClientMsg } from '../../shared/protocol.js';
-import { droidReady, emptySetupState, type SetupState } from '../../shared/setup.js';
+import { emptySetupState, type SetupState } from '../../shared/setup.js';
 import { childEnv, defaultShell } from '../workers.js';
 import { readDroidModels } from '../droid-models.js';
 import { canInstall, droidVersion, installDroid, latestDroid, type Runner, runCommand } from './droid-install.js';
@@ -170,14 +170,14 @@ export function mountSetup(opts: SetupOptions): Setup {
   };
 
   /**
-   * The first check that can tell decides an office without setup.json and writes it down: Droid
-   * ready is an office that already worked, anything else a fresh one, whose welcome then survives
-   * reloads and restarts until the owner finishes it.
+   * The first check that can tell decides an office without setup.json and writes it down: a
+   * fresh office starts with onboarded false so it goes through setup onboarding even if Droid
+   * or subscriptions are already installed and signed in.
    */
   const settleOnboarded = async () => {
     if (stopped || decided || (!state.airgapped && state.droid.path && state.droid.signedIn === null)) return;
     decided = true;
-    state.onboarded = droidReady(state);
+    state.onboarded = false;
     await save();
   };
 

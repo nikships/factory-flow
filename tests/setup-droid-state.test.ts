@@ -137,7 +137,7 @@ async function until(pred: () => boolean, ms = 10_000) {
   }
 }
 
-test('an office with Droid ready and no setup.json is onboarded, and says so in setup.json', async (t) => {
+test('an office with Droid ready and no setup.json has onboarded false, and goes through setup onboarding', async (t) => {
   const o = office(t);
   assert.equal(o.last().droid.busy, 'checking');
   await until(() => o.last().droid.busy === null && o.last().droid.latest !== null);
@@ -148,8 +148,9 @@ test('an office with Droid ready and no setup.json is onboarded, and says so in 
   assert.equal(s.droid.signedIn, true);
   assert.equal(s.droid.account, 'o***@example.com');
   assert.equal(s.droid.canInstall, true);
-  assert.equal(s.onboarded, true);
-  assert.equal(readSetupFile(o.dataDir)?.onboarded, true);
+  assert.equal(s.onboarded, false);
+  assert.equal(needsWelcome(s), true);
+  assert.equal(readSetupFile(o.dataDir)?.onboarded, false);
   assert.deepEqual(o.changed, []);
 });
 
