@@ -1,0 +1,20 @@
+node_modules
+dist
+.firebase
+firebase-debug.log*
+# The Mac app that `npm run package:mac` builds.
+release
+.droid-office
+.factory-flow/
+*.log
+.DS_Store
+pw.txt
+# Local environment files hold secrets; .env.example lists the settings.
+.env
+.env.*
+!.env.example
+
+# Built native addons (npm run build:native).
+native/*/build
+__pycache__/
+*.pyc

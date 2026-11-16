@@ -1,0 +1,1977 @@
+import './scrollbars';
+import type { ClientMsg, WorkerInfo } from '../shared/protocol';
+import { needsOwnerInput } from '../shared/status';
+import { cardsNewestFirst, cardChanged, OWNER } from '../shared/whiteboard';
+import { repoChoices } from '../shared/floors';
+import { DESK_BY_ID } from '../shared/layout';
+import { originKind, type OriginKind } from '../shared/devices';
+import { BROWSER_KEY, DASHBOARD_FLOOR_KEY, browserCredential, draftKey, forgetBrowserCredential, isBrowserCredential, saveBrowserCredential, type BrowserCredential } from './browser-session';
+import { Net } from './net';
+import { bindFactory } from './factory';
+import { factoryPaletteEntries, openFactoryWindow } from './dashboard-factory';
+import { connectWhiteboard, store, words } from './state';
+import { setBrowserAuth, withToken } from './token';
+import { $, closeAllModals, closeTopModal, h, modalOpen, onModalChange, openModal, toast } from './ui/dom';
+import { windowHeader } from './ui/kit';
+import { icon, type IconName } from './ui/icons';
+import { confirmDialog, openPrompt, routeWorktreeMessage, sendHomeDialog } from './ui/prompt';
+import { CLOUD_HIRE_CONFIRM_MS } from '../shared/factory-cloud';
+import { cloudSpawn, runsOnPicker } from './ui/factory-cloud';
+import { openAddFloor, routeAddFloorMessage } from './ui/add-floor';
+import { routeFolderMessage } from './ui/folder-browser';
+import { openFloorOrder } from './ui/floor-reorder';
+import { openSubscriptionsStatus } from './ui/subscriptions-status';
+import { factoryHeaderRings } from './ui/subscriptions-rings';
+import { onTermFontSize, setTermFontSize, stepTermFont, termFontSize, TERM_FONT_MAX, TERM_FONT_MIN } from './ui/term-font';
+import { parsePlaceLink, parseWorkerLink } from './worker-link';
+import { DashboardWorkerLink } from './dashboard-worker-link';
+import { adjacentFloor, sideStep, WORKSPACE_KEY_HINTS, workspaceShortcut } from './dashboard-shortcuts';
+import { BOARDS_REPLY_TYPES, badgeFor, boardsPaletteEntries, type BoardTab, type PaletteEntry } from './dashboard-boards-model';
+import { rankItems } from '../shared/palette';
+import {
+  assign,
+  autoLayout,
+  clampRatio,
+  closeSlot,
+  emptyWorkspace,
+  fillPanes,
+  FULL_RECT,
+  focusedWorker,
+  LAYOUT_DIVIDERS,
+  LAYOUT_LABEL,
+  LAYOUT_ORDER,
+  type LayoutMode,
+  openInSplit,
+  openWorker,
+  paneOf,
+  type Rect,
+  rectsFor,
+  reconcilePanes,
+  restoreWorkspace,
+  serializeWorkspace,
+  setLayout,
+  SLOT_COUNT,
+  swap,
+  syncWorkspace,
+  toggleMax,
+  visibleSlots,
+  workerView,
+  type Workspace,
+} from './dashboard-workspace';
+import { createPane, type Pane, type PaneHost, VIEW_KEY } from './dashboard-pane';
+import { createWorkerRoster } from './dashboard-roster';
+import { buildingCounts, buildingRoster, type BuildingWorkerRow } from './dashboard-building';
+import { createBuildingView } from './dashboard-building-view';
+import { buildTriageFloors, filterSwitcherFloors, nextUrgentTarget, rankTriageFloors, type TriageFloor, unackedDoneBuildingCount } from './dashboard-triage';
+import { fitTabs } from '../shared/floor-relevance';
+import { createWorkerMenu } from './dashboard-worker-menu';
+import { openForkWorker } from './ui/fork-worker';
+import { copy } from './ui/clipboard';
+import { workersByTeam } from '../shared/team';
+import { resolveSettingsPane, type SettingsCardTitle, type SettingsPane } from '../shared/settings-nav';
+import { OPEN_SETTINGS_EVENT } from './ui/model-picker';
+import { officePrompt } from './ui/prompts';
+import { forgeVars } from '../shared/prompts';
+import { INCLUDE_FILE, SETUP_FILE, describeSetup } from '../shared/worktree-setup';
+import { ORCHESTRATOR_ID } from '../shared/mission-control';
+import { createMissionRoster } from './dashboard-mission';
+import { missionWaiting, missionWorker } from './mission';
+import { newOrchestratorConversation } from './ui/orchestrator';
+const read = (key: string) => {
+  try {
+    return localStorage.getItem(key) ?? '';
+  } catch {
+    return '';
+  }
+};
+const remember = (key: string, value: string) => {
+  try {
+    if (value) localStorage.setItem(key, value);
+    else localStorage.removeItem(key);
+  } catch {
+    /* Drafts stay in this view if storage is blocked. */
+  }
+};
+let credential = (() => {
+  try {
+    return browserCredential(localStorage);
+  } catch {
+    return undefined;
+  }
+})();
+let bootstrap = new URLSearchParams(location.search).get('t') ?? '';
+const workerLink = new DashboardWorkerLink(parseWorkerLink(location.hash));
+let placeLink = parsePlaceLink(location.hash);
+const arrivedWithLink = !!bootstrap;
+const nativeCompanion = /Macintosh/.test(navigator.userAgent) && /Electron\//.test(navigator.userAgent);
+// Remove credentials before loading a card or navigating anywhere else.
+if (location.search || workerLink.pending || placeLink) history.replaceState(null, '', location.pathname);
+const auth = () => setBrowserAuth(credential?.token ?? '', credential ? '' : bootstrap);
+auth();
+
+/** How this page reached the office, which decides what pairing means here. */
+const where: OriginKind = originKind(location.hostname);
+const WHERE: Record<OriginKind, { icon: IconName; label: string; line: string }> = {
+  local: { icon: 'monitor', label: 'This computer', line: 'You are on the computer that runs the office. It always opens here: there is nothing to pair.' },
+  lan: { icon: 'wifi', label: 'Wi-Fi', line: 'You reached the office over the local network (Wi-Fi or Ethernet). This works while this computer is on the same network as the office.' },
+  tailscale: { icon: 'globe', label: 'Tailscale', line: 'You reached the office over Tailscale. This works from anywhere, while this computer is signed in to the same tailnet.' },
+};
+
+/** Why the office isn't showing: still connecting, unreachable, no access, unpaired, or turned off. */
+type Gate = 'connecting' | 'unreachable' | 'access' | 'revoked' | 'off';
+let gate: Gate = 'connecting';
+let authorized = false;
+let fresh = false;
+let switching = false;
+let floor = '';
+let officeName = 'Factory Flow';
+let version = '';
+/** A one-off line for the banner (the office updated, a floor went away). Dismissed with its ✕. */
+let notice = '';
+let pairing = false;
+let persisted = true;
+let retryTimer: ReturnType<typeof setTimeout> | undefined;
+let terminal: typeof import('./ui/terminal') | undefined;
+let whiteboard: typeof import('./ui/whiteboard') | undefined;
+let settingsUi: typeof import('./ui/settings') | undefined;
+let changesUi: typeof import('./ui/changes') | undefined;
+let boardsUi: typeof import('./dashboard-boards') | undefined;
+/** The Boards window was open when the companion left its floor, so it opens again on the next. */
+let boardsFollow = false;
+const busy = new Set<string>();
+
+function defaultBrowserName() {
+  const ua = navigator.userAgent;
+  const browser = /Edg\//.test(ua) ? 'Edge' : /Firefox\//.test(ua) ? 'Firefox' : /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : 'Browser';
+  const os = /Mac OS X/.test(ua) ? 'Mac' : /Windows/.test(ua) ? 'Windows' : /Linux/.test(ua) ? 'Linux' : '';
+  // Each address pairs on its own, so the network tells two pairings of one browser apart in the list.
+  const name = os ? `${browser} on ${os}` : browser;
+  return where === 'local' ? name : `${name} · ${WHERE[where].label}`;
+}
+
+// --- The page's frame -----------------------------------------------------------------------------
+
+const live$ = h('span.dash-sr', { role: 'status', 'aria-live': 'polite' });
+const title = h('h1.dash-office', {}, officeName);
+const linkDot = h('span.dash-link', { role: 'img', 'aria-label': 'Connecting' });
+const brand = h(
+  'div.dash-brand',
+  {},
+  h(
+    'button.dash-factory-button',
+    { type: 'button', 'aria-label': 'Factory', title: 'Factory', onclick: () => openFactoryWindow(net, { nativeCompanion }) },
+    h('img.dash-brand-mark', { src: '/factory-glyph.svg', alt: '', width: 15, height: 15 }),
+  ),
+  title,
+  linkDot,
+);
+const gitPill = h('span.dash-git-pill', { hidden: true });
+const dragSpacer = h('div.dash-drag-spacer', { 'aria-hidden': 'true' });
+const pulseNeedsCount = h('span');
+const pulseNeedsBtn = h('button.dash-pulse-needs', { type: 'button', hidden: true, title: 'Jump to floor needing input', onclick: () => jumpToUrgent() }, h('span.dash-pulse-dot', { 'aria-hidden': 'true' }), pulseNeedsCount);
+const pulseCalm = h('span.dash-pulse-calm', {}, '● 0 blocked');
+const pulseWork = h('span.dash-pulse-work', { hidden: true });
+const pulseDone = h('span.dash-pulse-done', { hidden: true });
+const pulse = h('div.dash-pulse', { hidden: true }, pulseNeedsBtn, pulseCalm, pulseWork, pulseDone);
+const topSep = h('span.dash-top-sep', { 'aria-hidden': 'true', hidden: true });
+
+const floors = h('nav.dash-floor-bays', { 'aria-label': 'Floors' });
+const quietLabel = h('span.dash-quiet-label');
+let quietOpen = false;
+let quietCursor = 0;
+let quietReturnFocus: HTMLElement | undefined;
+const quietTrigger = h(
+  'button.dash-quiet-bay',
+  {
+    type: 'button',
+    'aria-haspopup': 'dialog',
+    'aria-expanded': 'false',
+    'aria-controls': 'dash-quiet-pop',
+    hidden: true,
+    onclick: () => showQuiet(!quietOpen, quietOpen),
+  },
+  quietLabel,
+  h('span.key.dash-quiet-key', { 'aria-hidden': 'true' }, '⌘K'),
+  h('span.dash-quiet-caret', { 'aria-hidden': 'true' }, icon('chevron', 11)),
+);
+const floorTrackText = h('span');
+const floorTrack = h('div.dash-floor-track', {}, floorTrackText);
+const reorderFloors = h('button.dash-end-bay', { type: 'button', 'aria-label': 'Reorder floors', title: 'Reorder floors', onclick: () => openFloorOrder(net) }, icon('grip', 13));
+const addFloorLabel = h('span.dash-floor-add-label', { hidden: true }, 'Add floor');
+const addFloorBtn = h('button.dash-end-bay.dash-floor-add', { type: 'button', 'aria-label': 'Add floor', title: 'Add floor', onclick: () => addFloor() }, icon('plus', 13), addFloorLabel);
+const quietInput = h('input.dash-quiet-input', {
+  type: 'search',
+  placeholder: 'Jump to a floor or run an action…',
+  'aria-label': 'Search floors',
+  autocomplete: 'off',
+  spellcheck: 'false',
+}) as HTMLInputElement;
+const quietSectionTitle = h('span');
+const quietList = h('div.dash-quiet-list', { role: 'listbox', 'aria-label': 'Switch floor' });
+const quietReorderBtn = h(
+  'button.dash-quiet-act',
+  {
+    type: 'button',
+    onclick: () => {
+      showQuiet(false);
+      openFloorOrder(net);
+    },
+  },
+  icon('grip', 11),
+  'Reorder',
+);
+const quietAddBtn = h(
+  'button.dash-quiet-act',
+  {
+    type: 'button',
+    onclick: () => {
+      showQuiet(false);
+      addFloor();
+    },
+  },
+  icon('plus', 11),
+  'Add floor',
+);
+const quietPop = h(
+  'div.dash-quiet-pop',
+  { id: 'dash-quiet-pop', role: 'dialog', 'aria-label': 'Switch floor', hidden: true },
+  h('div.dash-quiet-search', {}, icon('search', 13), quietInput, h('span.key', { 'aria-hidden': 'true' }, 'ESC')),
+  h('div.dash-quiet-section', {}, quietSectionTitle, h('span', {}, 'Chord')),
+  quietList,
+  h('div.dash-quiet-foot', {}, h('span', {}, nativeCompanion ? '⌘ − / ⌘ + step adjacent floors' : '⇧ ⌘ 1–0 jump directly'), h('span.dash-quiet-actions', {}, quietReorderBtn, quietAddBtn)),
+);
+const lowerDeck = h('div.dash-top-lower', { hidden: true }, floors, quietTrigger, floorTrack, reorderFloors, addFloorBtn, quietPop);
+
+const boardCount = h('span.dash-count.hidden');
+let showingWorkers = false;
+const sideToggle = h('button.btn.icon.sm.ghost.dash-top-btn', { type: 'button', onclick: () => toggleSide() }, icon('panel', 14));
+const allWorkersCount = h('span.dash-building-nav-count');
+const allWorkersBtn = h(
+  'button.btn.sm.ghost.dash-top-btn.dash-all-workers',
+  { type: 'button', title: 'All building workers', 'aria-controls': 'all-workers', 'aria-pressed': 'false', onclick: () => showWorkers(!showingWorkers) },
+  icon('bot', 14),
+  h('span.dash-all-label', {}, 'All'),
+  allWorkersCount,
+);
+const board = h('button.btn.sm.ghost.dash-top-btn.dash-board', { type: 'button', title: 'The floor’s Whiteboard (⌘ B)', onclick: () => void openBoard() }, icon('board', 14), boardCount);
+const boardsCount = h('span.dash-count.dash-count-alert.hidden');
+const boards = h(
+  'button.btn.sm.ghost.dash-top-btn.dash-boards',
+  { type: 'button', title: 'The floor’s issues, pull requests, pipelines, Linear and Jira (⌘ I)', 'aria-label': 'Boards', onclick: () => void openBoards() },
+  icon('columns', 14),
+  boardsCount,
+);
+const subscriptions = h('button.btn.icon.sm.ghost.dash-top-btn', { type: 'button', 'aria-label': 'Subscriptions', title: 'Subscriptions and account usage', onclick: () => openSubscriptionsStatus() }, icon('key', 14));
+const paintQuotaHeader = () => {
+  const factory = store.factory;
+  const rings = !store.setup.airgapped && factory.connection.connected && !factory.connection.rejected ? factoryHeaderRings(factory.limits, Date.now()) : null;
+  subscriptions.classList.toggle('icon', !rings);
+  subscriptions.replaceChildren(...(rings ? [rings] : [icon('key', 14)]));
+};
+store.on('factory', paintQuotaHeader);
+store.on('setup', paintQuotaHeader);
+setInterval(paintQuotaHeader, 60_000);
+paintQuotaHeader();
+const settingsBtn = h('button.btn.icon.sm.ghost.dash-top-btn', { type: 'button', 'aria-label': 'Settings', title: 'Settings (⌘ ,)', onclick: () => void showSettings() }, icon('settings', 14));
+
+const bannerIcon = h('span.dash-banner-icon');
+const bannerText = h('p.dash-banner-text');
+const bannerActions = h('div.dash-banner-actions');
+const banner = h('div.dash-banner', { hidden: true }, bannerIcon, bannerText, bannerActions);
+
+const authPanel = h('section.dash-gate', { hidden: true });
+
+const sideTitle = h('h2.dash-side-title');
+const sideSub = h('p.dash-side-sub');
+const agentBtn = h('button.btn.accent.dash-hire', { type: 'button', title: 'Hire a Droid on this floor (⌘ N)', onclick: () => hire() }, icon('plus', 14), h('span', {}, 'Hire Droid'));
+const shellBtn = h('button.btn.dash-hire', { type: 'button', title: 'Open a plain shell at the next free desk', onclick: () => openShell() }, icon('terminal', 14), h('span', {}, 'Shell'));
+const workerList = h('nav.dash-workers', { 'aria-label': 'Workers' });
+const missionList = h('nav.dash-mission', { 'aria-label': 'Mission Control', hidden: true });
+const missionRoster = createMissionRoster(missionList, {
+  open: (id) => openHere(id, true),
+  split: (id) => openBesideHere(id),
+  member: (m) => openAcross(m.id, m.floor),
+  settings: () => void showSettings('orchestrator'),
+});
+const workerMenu = createWorkerMenu({
+  state(id) {
+    const worker = store.workers.get(id);
+    return worker ? { worker, floor, pane: paneOf(ws, id), live: live(), busy: busy.has(id), native: nativeCompanion } : undefined;
+  },
+  run(command, { worker: w, floor: intended, pane }) {
+    switch (command) {
+      case 'open':
+        openHere(w.id, true);
+        break;
+      case 'split':
+        openBesideHere(w.id);
+        break;
+      case 'close':
+        paneHost.close(pane);
+        break;
+      case 'resume':
+        void action({ t: 'worker.resume', workerId: w.id }, w.id, intended).then(warn);
+        break;
+      case 'interrupt':
+        void action({ t: 'worker.interrupt', workerId: w.id }, w.id, intended).then(warn);
+        break;
+      case 'fork':
+        openForkWorker(net, w.id);
+        break;
+      case 'pr':
+        if (w.pr) {
+          const url = URL.canParse(w.pr.url) ? new URL(w.pr.url) : undefined;
+          if (url && (url.protocol === 'https:' || url.protocol === 'http:')) window.open(url.href, '_blank', 'noopener,noreferrer');
+          else toast('This pull request link is invalid.', 'warn');
+        } else void action({ t: 'worker.pr', workerId: w.id }, w.id, intended, 'Opening a pull request…').then(warn);
+        break;
+      case 'copy-name':
+      case 'copy-branch':
+        void copy(command === 'copy-name' ? w.name : (w.worktree?.branch ?? '')).then((ok) => toast(ok ? 'Copied.' : 'Could not copy.', ok ? 'info' : 'warn'));
+        break;
+      case 'home':
+        sendHome(w);
+        break;
+    }
+  },
+});
+const roster = createWorkerRoster(
+  workerList,
+  (id) => openHere(id, true),
+  openBesideHere,
+  (id, event, anchor) => {
+    if (!modalOpen()) workerMenu.open(id, event, anchor);
+  },
+);
+onModalChange((open) => {
+  if (open) {
+    workerMenu.close();
+    showLayouts(false);
+    showQuiet(false);
+  }
+});
+const side = h('aside.dash-side', { 'aria-label': 'Floor' }, missionList, h('div.dash-side-head', {}, sideTitle, sideSub), workerList, h('footer.dash-side-foot', {}, h('div.dash-side-hire', {}, agentBtn, shellBtn), keyLegend()));
+
+/** The workspace's shortcuts, folded under one line until the owner opens them (remembered in this browser). */
+function keyLegend() {
+  const KEYS_KEY = 'factory-flow.companion-keys';
+  const fold = h(
+    'details.dash-keys-fold',
+    { open: read(KEYS_KEY) === 'open' },
+    h('summary', {}, 'Keyboard shortcuts', h('span.wt-chevron', { 'aria-hidden': 'true' }, icon('chevron', 12))),
+    h('div.dash-keys', { 'aria-hidden': 'true' }, ...keyHints(nativeCompanion ? [...WORKSPACE_KEY_HINTS, ['⌘ − +', 'step floor'], ['⌘ W', 'close pane'], ['⇧ ⌘ W', 'send home']] : WORKSPACE_KEY_HINTS)),
+  ) as HTMLDetailsElement;
+  fold.addEventListener('toggle', () => remember(KEYS_KEY, fold.open ? 'open' : ''));
+  return fold;
+}
+
+/** The layout switcher's little pictures: the same boxes the layout puts its panes in. */
+function layoutGlyph(mode: LayoutMode) {
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  for (const [k, v] of Object.entries({ width: '18', height: '14', viewBox: '0 0 18 14', 'aria-hidden': 'true' })) svg.setAttribute(k, v);
+  const rects = rectsFor(mode, 0.5, 0.5);
+  const half = rects.length > 4 ? 0.5 : 0.75;
+  rects.forEach(([x, y, w, hgt], i) => {
+    const inset = (inner: boolean) => (inner ? half : 0);
+    const rect = document.createElementNS(ns, 'rect');
+    const box = {
+      x: 1 + x * 16 + inset(x > 0.001),
+      y: 1 + y * 12 + inset(y > 0.001),
+      width: Math.max(1.5, w * 16 - inset(x > 0.001) - inset(x + w < 0.999)),
+      height: Math.max(1.5, hgt * 12 - inset(y > 0.001) - inset(y + hgt < 0.999)),
+      rx: 1.2,
+    };
+    for (const [k, v] of Object.entries(box)) rect.setAttribute(k, String(v));
+    if (i === 0) rect.classList.add('lead');
+    svg.append(rect);
+  });
+  return svg;
+}
+
+const autoButton = h(
+  'button.dash-layout.dash-layout-auto',
+  {
+    type: 'button',
+    role: 'radio',
+    'aria-label': 'Automatic layout',
+    onclick: () => {
+      autoLayout(ws, ordered());
+      changed();
+    },
+  },
+  'Auto',
+);
+const layoutButtons = LAYOUT_ORDER.map((mode, i) =>
+  h(
+    'button.dash-layout',
+    { type: 'button', role: 'radio', 'aria-label': LAYOUT_LABEL[mode], title: `${LAYOUT_LABEL[mode]} (⌘ ${i + 1})`, onclick: () => changeLayout(mode) },
+    layoutGlyph(mode),
+    h('span.dash-layout-label', { 'aria-hidden': 'true' }, LAYOUT_LABEL[mode]),
+  ),
+);
+const layouts = h('div.dash-layouts', { role: 'radiogroup', 'aria-label': 'Pane layout' }, autoButton, ...layoutButtons);
+const smaller = h('button.btn.sm', { type: 'button', 'aria-label': 'Smaller terminal text', title: 'Smaller terminal text', onclick: () => zoom(-1) }, 'A−');
+const bigger = h('button.btn.sm', { type: 'button', 'aria-label': 'Bigger terminal text', title: 'Bigger terminal text', onclick: () => zoom(1) }, 'A+');
+const zoomSize = h('span.dash-zoom-size');
+const zoomSeg = h('div.seg.dash-zoom', { role: 'group', 'aria-label': 'Terminal text size' }, smaller, zoomSize, bigger);
+// The layouts and the terminal text size are set now and then, so they wait behind one button that names the layout.
+const layoutNow = h('span.dash-layout-now');
+const layoutName = h('span.dash-layout-name');
+const layoutTrigger = h(
+  'button.btn.sm.ghost.dash-layout-trigger.dash-top-btn',
+  { type: 'button', 'aria-haspopup': 'dialog', 'aria-expanded': 'false', 'aria-controls': 'dash-layout-pop', title: 'Pane layout (⌘ 1–8)', onclick: () => showLayouts(!!layoutPop.hidden) },
+  layoutNow,
+  layoutName,
+  h('span.dash-layout-caret', { 'aria-hidden': 'true' }, icon('chevron', 11)),
+);
+const layoutPop = h(
+  'div.dash-layout-pop',
+  { id: 'dash-layout-pop', role: 'dialog', 'aria-label': 'Workspace layout', hidden: true },
+  h('p.dash-layout-pop-title', {}, 'Layout'),
+  layouts,
+  h('div.dash-layout-pop-row', {}, h('span', {}, 'Terminal text'), zoomSeg),
+);
+const layoutMenu = h('div.dash-layout-menu', {}, layoutTrigger, layoutPop);
+const upperDeck = h('div.dash-top-upper', {}, brand, gitPill, dragSpacer, pulse, topSep, h('div.dash-top-end', {}, sideToggle, allWorkersBtn, layoutMenu, board, boards, subscriptions, settingsBtn));
+const top = h('header.dash-top', {}, upperDeck, lowerDeck);
+
+function showLayouts(open: boolean, refocus = false) {
+  if (open && quietOpen) showQuiet(false);
+  layoutPop.hidden = !open;
+  layoutTrigger.setAttribute('aria-expanded', String(open));
+  layoutTrigger.classList.toggle('on', open);
+  if (open) (layouts.querySelector<HTMLElement>('[aria-checked=true]') ?? autoButton).focus({ preventScroll: true });
+  else if (refocus) layoutTrigger.focus({ preventScroll: true });
+}
+function positionQuietPop() {
+  if (!quietOpen) return;
+  const lowerRect = lowerDeck.getBoundingClientRect();
+  const rawLeft = !quietTrigger.hidden ? quietTrigger.getBoundingClientRect().left - lowerRect.left : 12;
+  const maxLeft = Math.max(0, lowerDeck.clientWidth - 360);
+  quietPop.style.left = `${Math.round(Math.max(0, Math.min(rawLeft, maxLeft)))}px`;
+}
+function showQuiet(open: boolean, refocus = false) {
+  if (open === quietOpen) return;
+  if (open) {
+    showLayouts(false);
+    workerMenu.close();
+    quietReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : undefined;
+    quietInput.value = '';
+    quietCursor = 0;
+  }
+  quietOpen = open;
+  quietPop.hidden = !open;
+  quietTrigger.setAttribute('aria-expanded', String(open));
+  quietTrigger.classList.toggle('open', open);
+  if (open) {
+    paintQuietPop(live());
+    positionQuietPop();
+    quietInput.focus({ preventScroll: true });
+  } else if (refocus) {
+    const target = !quietTrigger.hidden ? quietTrigger : quietReturnFocus;
+    target?.focus({ preventScroll: true });
+  }
+}
+document.addEventListener('pointerdown', (e) => {
+  const target = e.target as Node;
+  if (!layoutPop.hidden && !layoutMenu.contains(target)) showLayouts(false);
+  if (quietOpen && !quietPop.contains(target) && !quietTrigger.contains(target)) showQuiet(false);
+});
+layoutMenu.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape' || layoutPop.hidden) return;
+  e.preventDefault();
+  e.stopPropagation();
+  showLayouts(false, true);
+});
+layoutMenu.addEventListener('focusout', (e) => {
+  if (e.relatedTarget instanceof Node && !layoutMenu.contains(e.relatedTarget)) showLayouts(false);
+});
+layouts.addEventListener('click', (e) => {
+  if ((e.target as Element).closest('.dash-layout')) showLayouts(false, true);
+});
+quietPop.addEventListener('focusout', (e) => {
+  if (e.relatedTarget instanceof Node && !quietPop.contains(e.relatedTarget) && !quietTrigger.contains(e.relatedTarget)) showQuiet(false);
+});
+quietInput.addEventListener('input', () => {
+  quietCursor = 0;
+  paintQuietPop(live());
+});
+quietPop.addEventListener('keydown', (e) => {
+  if (!quietOpen) return;
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    e.stopPropagation();
+    if (quietInput.value) {
+      quietInput.value = '';
+      quietCursor = 0;
+      paintQuietPop(live());
+    } else {
+      showQuiet(false, true);
+    }
+    return;
+  }
+  if (e.altKey || e.ctrlKey || e.metaKey || e.isComposing) return;
+  const rows = [...quietList.querySelectorAll<HTMLButtonElement>('.dash-quiet-row:not(:disabled)')];
+  if (!rows.length) return;
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    quietCursor = (quietCursor + (e.key === 'ArrowDown' ? 1 : -1) + rows.length) % rows.length;
+    rows.forEach((row, i) => {
+      row.setAttribute('aria-selected', String(i === quietCursor));
+      row.classList.toggle('cursor', i === quietCursor);
+    });
+    rows[quietCursor]?.scrollIntoView({ block: 'nearest' });
+  } else if (e.key === 'Enter' && e.target === quietInput) {
+    e.preventDefault();
+    rows[quietCursor]?.click();
+  }
+});
+const colHandle = h('div.dash-handle.col', { role: 'separator', 'aria-orientation': 'vertical', 'aria-label': 'Resize columns', tabindex: 0, title: 'Drag to resize · double-click to even out' });
+const rowHandle = h('div.dash-handle.row', { role: 'separator', 'aria-orientation': 'horizontal', 'aria-label': 'Resize rows', tabindex: 0, title: 'Drag to resize · double-click to even out' });
+const workspaceEl = h('div.dash-workspace', {}, colHandle, rowHandle);
+const mainEl = h('main.dash-main', { id: 'worker-detail', tabindex: '-1', 'aria-label': 'Workspace' }, workspaceEl);
+const content = h('div.dash-body', { hidden: true }, side, mainEl);
+const buildingView = createBuildingView({
+  open: (row) => {
+    if (!live()) return;
+    if (row.kind === 'desk' || row.navigationFloor) openAcross(row.worker.id, row.navigationFloor ?? row.floorId);
+    else openHere(row.worker.id, true);
+  },
+  workspace: () => showWorkers(false),
+  hire: () => hire(),
+});
+
+$('dashboard').replaceChildren(h('a.dash-skip', { href: '#worker-detail' }, 'Skip to the work'), top, banner, authPanel, content, buildingView.el, live$);
+
+function showWorkers(show: boolean) {
+  showingWorkers = show;
+  showLayouts(false);
+  showQuiet(false);
+  workerMenu.close();
+  paint();
+  if (show) buildingView.focus();
+  else allWorkersBtn.focus({ preventScroll: true });
+}
+
+function keyHints(pairs: [string, string][]) {
+  return pairs.map(([k, label]) => h('span', {}, h('span.key', {}, k), label));
+}
+
+const SIDE_KEY = 'factory-flow.companion-sidebar';
+let sideOpen = read(SIDE_KEY) ? read(SIDE_KEY) === 'open' : window.innerWidth >= 1024;
+function toggleSide() {
+  sideOpen = !sideOpen;
+  remember(SIDE_KEY, sideOpen ? 'open' : 'closed');
+  paint();
+}
+
+function paintZoom() {
+  const px = termFontSize();
+  smaller.disabled = px <= TERM_FONT_MIN;
+  bigger.disabled = px >= TERM_FONT_MAX;
+  zoomSeg.title = `Terminal text ${px} px`;
+  zoomSize.textContent = `${px} px`;
+}
+function zoom(dir: 1 | -1) {
+  setTermFontSize(stepTermFont(termFontSize(), dir));
+}
+onTermFontSize(paintZoom);
+paintZoom();
+
+// --- The workspace: which workers are open in which panes, saved per floor ---------------------------
+
+const WS_KEY = 'factory-flow.companion-workspace';
+let ws: Workspace = emptyWorkspace();
+/** The floor `ws` belongs to. Until the floor's first snapshot arrives it is still the last floor's. */
+let wsFloor = '';
+const panes: (Pane | undefined)[] = [];
+/** Whether a terminal that opens now takes the keyboard (not while the arrow keys walk the list). */
+let takeFocus = true;
+/** Names of the workers seen, to say who left after they're gone from the store. */
+const names = new Map<string, string>();
+/** Membership and layout priorities at the last paint; ordinary activity updates never rearrange panes. */
+const onFloor = new Map<string, number>();
+/** Sidebar order, used when loading or explicitly changing the layout. */
+const staff = () => ordered().map((w) => w.id);
+
+function loadWorkspace(f: string) {
+  disposePanes();
+  wsFloor = f;
+  ws = restoreWorkspace(read(`${WS_KEY}:${f}`), ordered(), onFloor, inMission);
+  saveWorkspace();
+}
+function saveWorkspace() {
+  if (wsFloor) remember(`${WS_KEY}:${wsFloor}`, serializeWorkspace(ws));
+}
+function changed() {
+  saveWorkspace();
+  paint();
+}
+function disposePanes() {
+  for (const p of panes) p?.dispose();
+  panes.length = 0;
+}
+function viewOf(id: string) {
+  return workerView(ws, id, read(VIEW_KEY) === 'terminal' ? 'terminal' : 'thread');
+}
+function changeLayout(mode: LayoutMode) {
+  setLayout(ws, mode);
+  fillPanes(ws, staff());
+  changed();
+}
+function toggleMaxPane(i: number) {
+  toggleMax(ws, i);
+  changed();
+}
+/** A worker on this floor, or a building agent, which every floor's workspace can open. */
+function workerOf(id: string): WorkerInfo | undefined {
+  return store.workers.get(id) ?? missionWorker(store.missionControl, id);
+}
+/** Building agents open in this floor's panes: the workspace keeps them while Mission Control has them. */
+const inMission = (id: string) => !store.workers.has(id) && !!missionWorker(store.missionControl, id);
+/** Opens a worker in the workspace; `focusIt` puts the keyboard in it as well. */
+function openHere(id: string, focusIt = false, targetPane?: number) {
+  if (!workerOf(id)) return;
+  showingWorkers = false;
+  roster.reveal(id);
+  openWorker(ws, id, targetPane);
+  takeFocus = focusIt;
+  changed();
+  takeFocus = true;
+  if (focusIt) panes[ws.focused]?.focusContent();
+  if (inMission(id)) missionRoster.scrollTo(id);
+  else roster.scrollTo(id);
+}
+/** Opens a building agent's subagent: here when it's on this floor, else on its own floor once the page has gone there. */
+function openAcross(id: string, to: string) {
+  if (!live()) return;
+  if (to === floor) return openHere(id, true);
+  workerLink.set({ worker: id, floor: to });
+  followWorkerLink();
+}
+function openBesideHere(id: string) {
+  if (!workerOf(id)) return;
+  openInSplit(ws, id);
+  fillPanes(ws, staff());
+  changed();
+}
+async function loadTerminal() {
+  if (!terminal) {
+    terminal = await import('./ui/terminal');
+    terminal.onOpenTeammate((mate) => openBesideHere(mate));
+  }
+  return terminal;
+}
+const paneHost: PaneHost = {
+  get net() {
+    return net;
+  },
+  live: () => live(),
+  floor: () => floor,
+  busy: (id) => busy.has(id),
+  action: (msg, id, intendedFloor, done) => action(msg, id, intendedFloor, done),
+  usable: (id, intendedFloor) => usable(id, intendedFloor),
+  read,
+  remember,
+  terminal: loadTerminal,
+  setView(id, view) {
+    ws.views[id] = view;
+    remember(VIEW_KEY, view);
+    changed();
+  },
+  focus(i) {
+    if (ws.focused === i) return;
+    ws.focused = i;
+    changed();
+  },
+  close(i) {
+    closeSlot(ws, i);
+    changed();
+    panes[ws.focused]?.focusContent();
+  },
+  toggleMax: (i) => toggleMaxPane(i),
+  assign(i, id) {
+    if (!usable(id, floor)) return;
+    assign(ws, i, id);
+    changed();
+  },
+  swap(from, to) {
+    if (!Number.isInteger(from) || from < 0 || from >= SLOT_COUNT[ws.layout]) return;
+    swap(ws, from, to);
+    changed();
+  },
+  openBeside: (id) => openBesideHere(id),
+  sendHome: (w) => sendHome(w),
+  hire: (index) => hire('auto', index),
+  worker: (id) => workerOf(id),
+  mission: () => store.missionControl,
+  openAcross: (id, to) => openAcross(id, to),
+  resetOrchestrator: () => newOrchestratorConversation(net),
+  settings: (pane) => void showSettings(pane),
+  changes: (id) => void showChanges(id),
+  toWhiteboard: (id, path, intended) => void toBoard(id, path, intended),
+};
+/** A file a worker made, as a card on this floor's Whiteboard, opened there. */
+async function toBoard(workerId: string, path: string, intended: string) {
+  const { sendWorkspaceFile } = await import('./ui/thread-deliverable');
+  whiteboard ??= await import('./ui/whiteboard');
+  if (!live() || intended !== floor) return toast('Reconnect to the office to send it to the Whiteboard', 'warn');
+  const card = await sendWorkspaceFile(floor, workerId, path);
+  if (card && live() && intended === floor && store.currentFloor()) whiteboard.openWhiteboard(net, { card, queueOffline: false });
+}
+/** A worker's Changes window: its changed files and their diff, with commit, discard and open a PR. */
+async function showChanges(id: string) {
+  const w = store.workers.get(id);
+  if (!w || w.cloud) return;
+  if (w.lost) return toast(`${w.name}'s worktree is missing, so there are no changes to show`, 'warn');
+  changesUi ??= await import('./ui/changes');
+  changesUi.openChanges(net, id);
+}
+
+/** Where a pane sits: its box, less half the 8px gap on every side that touches another pane. */
+function place(el: HTMLElement, [x, y, w, hgt]: Rect) {
+  const half = (inner: boolean) => (inner ? '4px' : '0px');
+  const vars: Record<string, string> = {
+    '--x': String(x),
+    '--y': String(y),
+    '--w': String(w),
+    '--h': String(hgt),
+    '--gl': half(x > 0.001),
+    '--gr': half(x + w < 0.999),
+    '--gt': half(y > 0.001),
+    '--gb': half(y + hgt < 0.999),
+  };
+  for (const [k, v] of Object.entries(vars)) el.style.setProperty(k, v);
+}
+
+let dragAxis: 'col' | 'row' | '' = '';
+for (const [handle, axis] of [
+  [colHandle, 'col'],
+  [rowHandle, 'row'],
+] as const) {
+  handle.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    handle.setPointerCapture(e.pointerId);
+    dragAxis = axis;
+    workspaceEl.classList.add('resizing');
+  });
+  handle.addEventListener('pointermove', (e) => {
+    if (dragAxis !== axis) return;
+    const r = workspaceEl.getBoundingClientRect();
+    ws[axis] = clampRatio(axis === 'col' ? (e.clientX - r.left) / r.width : (e.clientY - r.top) / r.height);
+    paintWorkspace();
+  });
+  const end = () => {
+    if (dragAxis !== axis) return;
+    dragAxis = '';
+    workspaceEl.classList.remove('resizing');
+    saveWorkspace();
+  };
+  handle.addEventListener('pointerup', end);
+  handle.addEventListener('pointercancel', end);
+  handle.addEventListener('lostpointercapture', end);
+  handle.addEventListener('dblclick', () => {
+    ws[axis] = 0.5;
+    changed();
+  });
+  handle.addEventListener('keydown', (e) => {
+    const step = e.key === (axis === 'col' ? 'ArrowLeft' : 'ArrowUp') ? -0.03 : e.key === (axis === 'col' ? 'ArrowRight' : 'ArrowDown') ? 0.03 : 0;
+    if (!step) return;
+    e.preventDefault();
+    ws[axis] = clampRatio(ws[axis] + step);
+    changed();
+  });
+}
+// --- The connection --------------------------------------------------------------------------------
+
+const net = new Net(() => ({ ...store.profile, name: 'Owner · browser' }), {
+  client: 'dashboard',
+  device: () => credential?.token ?? '',
+  floor: () => (store.floor ?? read(DASHBOARD_FLOOR_KEY)) || null,
+  authorize: async (signal) => {
+    let response: Response;
+    try {
+      response = await fetch(withToken('/api/mobile/hello?client=dashboard'), { cache: 'no-store', credentials: 'same-origin', signal: AbortSignal.any([signal, AbortSignal.timeout(8000)]) });
+    } catch (error) {
+      if (!signal.aborted && !authorized) {
+        gate = 'unreachable';
+        paint();
+      }
+      throw error;
+    }
+    if (response.status === 401 || response.status === 403) {
+      heard = await refusal(response);
+      return false;
+    }
+    if (!response.ok) throw new Error('Office unavailable');
+    const hello = (await response.json()) as { office?: { name: string; version: string } };
+    if (signal.aborted) throw new Error('Access check cancelled');
+    officeName = hello.office?.name ?? 'Factory Flow';
+    const next = hello.office?.version ?? '';
+    if (version && version !== next) notice = 'The office was updated. Reload this page if something looks out of place.';
+    version = next;
+    authorized = true;
+    return true;
+  },
+  unauthorized: () => {
+    authorized = false;
+    fresh = false;
+    bootstrap = '';
+    auth();
+    closeAllModals();
+    const why = heard;
+    heard = undefined;
+    if (why) locked(why);
+    // The socket was closed on us (unpaired, or the companion turned off): ask the office which.
+    else
+      void fetch(withToken('/api/mobile/hello?client=dashboard'), { cache: 'no-store', credentials: 'same-origin' })
+        .then((res) => (res.ok ? net.connect() : refusal(res).then(locked)))
+        .catch(() => locked('unreachable'));
+  },
+});
+/** Why the last access check was refused, for `unauthorized` to show. */
+bindFactory(net);
+let heard: Gate | undefined;
+async function refusal(response: Response): Promise<Gate> {
+  const body = (await response.json().catch(() => ({}))) as { companionOff?: boolean };
+  return body.companionOff ? 'off' : credential ? 'revoked' : 'access';
+}
+function locked(why: Gate) {
+  gate = why;
+  clearTimeout(retryTimer);
+  // Turned off, or out of reach, can end by itself: check back now and then. Off is one cheap check-in
+  // on a reachable office, so it's asked often enough that switching it back on feels immediate.
+  if (gate === 'off' || gate === 'unreachable') retryTimer = setTimeout(() => void net.connect(), gate === 'off' ? 3_000 : 10_000);
+  paint();
+}
+connectWhiteboard((msg) => net.send(msg));
+net.onStatus((up) => {
+  store.whiteboard.status(up);
+  if (!up) {
+    fresh = false;
+    switching = false;
+    workerLink.arrive();
+  }
+  paint();
+});
+net.onMessage((msg) => {
+  const entering = msg.t === 'welcome' || msg.t === 'floor.enter';
+  if (entering) {
+    fresh = true;
+    switching = false;
+    workerLink.arrive();
+    if (floor && floor !== msg.floor) closeForFloorChange();
+    floor = msg.floor ?? '';
+    remember(DASHBOARD_FLOOR_KEY, floor);
+    if (msg.arrival?.removed) notice = 'The floor you were on was removed. This is the office’s current floor.';
+  }
+  store.apply(msg);
+  terminal?.routeTerminalMessage(msg);
+  whiteboard?.routeWhiteboardMessage(msg);
+  routeWorktreeMessage(msg);
+  routeAddFloorMessage(msg);
+  routeFolderMessage(msg);
+  changesUi?.routeChangesMessage(msg);
+  if (BOARDS_REPLY_TYPES.has(msg.t)) {
+    if (boardsUi) boardsUi.routeBoardsMessage(msg);
+    else void import('./dashboard-boards').then((m) => ((boardsUi ??= m), m.routeBoardsMessage(msg)));
+  }
+  if (msg.t === 'welcome') {
+    // After a reconnect the office has forgotten which worker's changes were on screen.
+    const watching = changesUi?.openChangesFor();
+    if (watching && store.workers.has(watching.workerId)) net.send({ t: 'changes.watch', ...watching });
+  }
+  if (entering) {
+    if (wsFloor !== floor) loadWorkspace(floor);
+    else for (const p of panes) p?.reattach();
+    paint();
+    if (boardsFollow) {
+      boardsFollow = false;
+      void openBoards();
+    }
+  }
+  if (msg.t === 'toast') {
+    toast(msg.text, msg.level);
+    if (switching && msg.level !== 'info') {
+      workerLink.clear();
+      switching = false;
+      notice = msg.text;
+      paint();
+    }
+  }
+  if (entering || msg.t === 'floors' || msg.t === 'worker.update') followWorkerLink();
+});
+for (const topic of ['floors', 'workers', 'building', 'pulls', 'whiteboard', 'project', 'missionControl'] as const) store.on(topic, paint);
+store.on('screens', () => {
+  for (const p of panes) p?.paintQuestion();
+  schedulePreviews();
+});
+function addFloor() {
+  if (!live()) return;
+  openAddFloor(net, (id) => goFloor(id));
+}
+function goFloor(id: string) {
+  if (!live()) return;
+  showQuiet(false);
+  showLayouts(false);
+  if (showingWorkers) showWorkers(false);
+  if (id === store.floor) return;
+  closeForFloorChange();
+  switching = true;
+  if (!net.send({ t: 'floor.go', floor: id })) {
+    switching = false;
+    boardsFollow = false;
+    toast('Disconnected. Nothing was sent.', 'warn');
+  }
+  paint();
+}
+lowerDeck.addEventListener('keydown', (event) => {
+  if (quietOpen && quietPop.contains(event.target as Node)) return;
+  const buttons = [...lowerDeck.querySelectorAll<HTMLButtonElement>(':scope > nav > button:not(:disabled):not([hidden]), :scope > button:not(:disabled):not([hidden])')];
+  const at = buttons.indexOf(event.target as HTMLButtonElement);
+  if (at < 0 || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+  const targets: Record<string, number> = { ArrowLeft: at - 1, ArrowRight: at + 1, Home: 0, End: buttons.length - 1 };
+  const next = targets[event.key];
+  if (next === undefined) return;
+  event.preventDefault();
+  event.stopPropagation();
+  buttons[(next + buttons.length) % buttons.length]?.focus();
+});
+/**
+ * The floor strip's measurements, read only when its tabs change (or fonts load) rather than on every
+ * paint: each tab's full width, the "+N more" button's at its widest count, and what the strip can't use.
+ */
+let stripSize: { deck: number; fixed: number; reserved: number; more: number; tabs: Map<string, number> } | undefined;
+function measureFloorStrip() {
+  const deck = Math.floor(lowerDeck.getBoundingClientRect().width);
+  if (!deck) return undefined;
+  const chips = [...floors.querySelectorAll<HTMLElement>('.dash-floor-chip')];
+  const wasHidden = chips.map((c) => c.hidden);
+  const moreHidden = quietTrigger.hidden;
+  const moreLabel = quietLabel.textContent;
+  for (const c of chips) c.hidden = false;
+  quietTrigger.hidden = false;
+  quietLabel.textContent = `+${Math.max(1, latestTriageItems.length - 1)} more`;
+  floors.classList.remove('squeeze');
+  const width = (el: HTMLElement) => Math.ceil(el.getBoundingClientRect().width);
+  const tabs = new Map<string, number>();
+  let reserved = 0;
+  for (const c of chips) {
+    if (c.dataset.floor) tabs.set(c.dataset.floor, width(c));
+    else reserved += width(c);
+  }
+  stripSize = { deck, fixed: width(reorderFloors) + width(addFloorBtn), reserved, more: width(quietTrigger), tabs };
+  chips.forEach((c, i) => {
+    c.hidden = wasHidden[i] ?? false;
+  });
+  quietTrigger.hidden = moreHidden;
+  quietLabel.textContent = moreLabel;
+  return stripSize;
+}
+/** Shows the most relevant floors' full tabs that fit beside the strip's buttons, and folds the rest into "+N more". */
+function fitFloorStrip() {
+  const size = stripSize ?? measureFloorStrip();
+  if (!size) return;
+  const chips = [...floors.querySelectorAll<HTMLButtonElement>('button.dash-floor-chip')];
+  const available = size.deck - size.fixed - size.reserved;
+  const current = store.floor;
+  const fit = fitTabs({ widths: chips.map((c) => ({ id: c.dataset.floor ?? '', width: size.tabs.get(c.dataset.floor ?? '') ?? 0 })), ranked: latestRanked, current, available, more: size.more });
+  const shown = new Set(fit.shown);
+  const focused = chips.find((c) => c === document.activeElement);
+  for (const c of chips) c.hidden = !shown.has(c.dataset.floor ?? '');
+  // Narrower than even the current floor's own tab: only then may its name shorten.
+  const alone = fit.shown.length === 1 ? (size.tabs.get(fit.shown[0] ?? '') ?? 0) + (fit.hidden.length ? size.more : 0) : 0;
+  floors.classList.toggle('squeeze', alone > available);
+  const byId = new Map(latestTriageItems.map((item) => [item.floor.id, item]));
+  latestHidden = fit.hidden.flatMap((id) => byId.get(id) ?? []);
+  const more = latestHidden.length;
+  quietTrigger.hidden = more === 0;
+  quietLabel.textContent = `+${more} more`;
+  quietTrigger.title = more ? `Show ${more} more ${more === 1 ? 'floor' : 'floors'} or search all (⌘ K)` : 'Search floors (⌘ K)';
+  // A focused tab that just folded away hands focus to "+N more", where its floor now is.
+  if (focused?.hidden) quietTrigger.focus({ preventScroll: true });
+  if (quietOpen) {
+    paintQuietPop(live());
+    positionQuietPop();
+  }
+}
+if (typeof ResizeObserver === 'function')
+  new ResizeObserver(() => {
+    const deck = Math.floor(lowerDeck.getBoundingClientRect().width);
+    if (stripSize && deck) stripSize.deck = deck;
+    else stripSize = undefined;
+    fitFloorStrip();
+  }).observe(lowerDeck);
+const remeasureFloorStrip = () => {
+  stripSize = undefined;
+  fitFloorStrip();
+};
+document.fonts?.addEventListener('loadingdone', remeasureFloorStrip);
+// Visits and workers count for less as they age: re-rank now and then even when nothing else changes.
+setInterval(() => {
+  if (!latestTriageItems.length) return;
+  latestRanked = rankTriageFloors(latestTriageItems, Date.now());
+  fitFloorStrip();
+}, 60_000);
+void document.fonts?.ready.then(remeasureFloorStrip);
+window.addEventListener('resize', () => {
+  if (quietOpen) positionQuietPop();
+});
+
+function live() {
+  return authorized && net.up && fresh && !switching;
+}
+function followWorkerLink() {
+  if (!live()) return;
+  if (placeLink) {
+    const target = placeLink;
+    if (target.floor && target.floor !== store.floor) {
+      if (!store.floors.some((f) => f.id === target.floor)) {
+        placeLink = undefined;
+        return toast('That floor is no longer available.', 'warn');
+      }
+      if (net.send({ t: 'floor.go', floor: target.floor })) {
+        switching = true;
+        paint();
+      } else placeLink = undefined;
+      return;
+    }
+    placeLink = undefined;
+    if (target.card) void openBoard(target.card);
+    return;
+  }
+  const result = workerLink.follow({ floor: store.floor, hasWorker: (id) => !!workerOf(id), hasFloor: (id) => store.floors.some((f) => f.id === id) }, (floor) => net.send({ t: 'floor.go', floor }));
+  if (result.step === 'go') {
+    switching = true;
+    paint();
+    return;
+  }
+  if (result.step === 'wait') return;
+  if (result.step === 'failed') {
+    switching = false;
+    notice = 'Disconnected. The worker link was not opened. Open it again after reconnecting.';
+    toast(notice, 'warn');
+    paint();
+    return;
+  }
+  if (result.step === 'gone') return toast('That worker or floor is no longer available.', 'warn');
+  if (result.link.view === 'thread') ws.views[result.link.worker] = 'thread';
+  openHere(result.link.worker, true);
+}
+window.addEventListener('hashchange', () => {
+  const next = parseWorkerLink(location.hash);
+  const place = parsePlaceLink(location.hash);
+  if (!next && !place) return;
+  workerLink.clear();
+  placeLink = place;
+  if (next) workerLink.set(next);
+  history.replaceState(null, '', location.pathname);
+  followWorkerLink();
+});
+function usable(id: string, intendedFloor: string) {
+  return live() && floor === intendedFloor && !!workerOf(id);
+}
+async function action(msg: ClientMsg, id = '', intendedFloor = floor, done?: string, targetPane?: number): Promise<string | undefined> {
+  if (!live() || floor !== intendedFloor || (id && !workerOf(id))) return 'The connection, floor or worker changed. Nothing was sent.';
+  const key = id || 'hire';
+  if (busy.has(key)) return 'An action for this worker is still waiting for confirmation.';
+  busy.add(key);
+  paint();
+  let hired = '';
+  try {
+    const result = await net.request(msg, msg.t === 'worker.spawn' && msg.cloud ? CLOUD_HIRE_CONFIRM_MS : undefined);
+    if (!result.ok) return result.error ?? 'The office refused this action.';
+    if (done) say(done);
+    if (msg.t === 'worker.spawn' && result.workerId && floor === intendedFloor) hired = result.workerId;
+  } finally {
+    busy.delete(key);
+    paint();
+  }
+  if (hired) openHere(hired, true, targetPane);
+}
+function say(text: string) {
+  live$.textContent = text;
+}
+
+// --- Painting ----------------------------------------------------------------------------------------
+
+/** Workers in the order the sidebar lists them, for the arrow keys. */
+const ordered = () => workersByTeam(store.workers.values());
+
+let floorListKey = '';
+let gitPillKey = '';
+let latestTriageItems: TriageFloor[] = [];
+let latestRanked: string[] = [];
+/** Floors without a tab, most relevant first, for "+N more". */
+let latestHidden: TriageFloor[] = [];
+let latestBuildingRows: BuildingWorkerRow[] = [];
+
+function jumpToUrgent() {
+  if (!live()) return;
+  const target = nextUrgentTarget(latestBuildingRows, latestTriageItems, store.floor, focusedWorker(ws) ?? undefined);
+  if (!target) return;
+  if (target.kind === 'worker') {
+    if (target.row.kind === 'desk' || target.row.navigationFloor) openAcross(target.row.worker.id, target.row.navigationFloor ?? target.row.floorId);
+    else openHere(target.row.worker.id, true);
+  } else {
+    goFloor(target.floorId);
+  }
+}
+
+function quietRowStatus(item: TriageFloor): HTMLElement {
+  if (item.needsInput > 0) return h('span.dash-quiet-stat.needs', {}, `${item.needsInput} needs you`);
+  if (item.unackedDone > 0) return h('span.dash-quiet-stat.done', {}, `${item.unackedDone} done`);
+  if (item.busy > 0) return h('span.dash-quiet-stat.work', {}, `${item.busy} working`);
+  return h('span.dash-quiet-stat.idle', {}, item.totalWorkers ? item.idleState : 'empty');
+}
+
+/** The actions ⌘K lists under the floors: all of them with nothing typed, else the ones the query finds, best first. */
+function quietActions(query: string): PaletteEntry[] {
+  const entries = paletteActions();
+  const q = query.trim();
+  if (!q) return entries;
+  return rankItems(
+    q,
+    entries.map((entry) => ({ title: entry.group ?? entry.label, keywords: entry.keywords, entry })),
+  ).map((match) => match.item.entry);
+}
+
+function paintQuietPop(up: boolean) {
+  if (!quietOpen) return;
+  const query = quietInput.value;
+  const filtered = filterSwitcherFloors(latestTriageItems, latestHidden, query);
+  if (query.trim()) quietSectionTitle.textContent = `Matching floors (${filtered.length})`;
+  else if (latestHidden.length > 0) quietSectionTitle.textContent = `More floors (${latestHidden.length} of ${latestTriageItems.length})`;
+  else quietSectionTitle.textContent = `All floors (${latestTriageItems.length})`;
+  quietReorderBtn.disabled = !up || store.floors.length < 2;
+  quietAddBtn.disabled = !up;
+  const entries = quietActions(query);
+  if (!filtered.length && !entries.length) {
+    quietCursor = 0;
+    quietList.replaceChildren(h('div.dash-quiet-empty', {}, latestTriageItems.length ? 'No matching floors or actions.' : 'No floors yet.'));
+    return;
+  }
+  quietCursor = Math.max(0, Math.min(quietCursor, filtered.length + entries.length - 1));
+  const here = !!store.currentFloor();
+  const actionRows = entries.map((entry, i) =>
+    h(
+      'button.dash-quiet-row',
+      {
+        type: 'button',
+        role: 'option',
+        'data-action': entry.id,
+        'aria-selected': String(filtered.length + i === quietCursor),
+        disabled: !up || !here,
+        onclick: () => {
+          showQuiet(false);
+          entry.run();
+        },
+      },
+      h('span.dash-quiet-action', {}, entry.label),
+    ),
+  );
+  quietList.replaceChildren(
+    ...(filtered.length ? [] : [h('div.dash-quiet-empty', {}, 'No matching floors.')]),
+    ...filtered.map((item, i) => {
+      const badge = h('span.dash-quiet-badge', { 'aria-hidden': 'true' }, item.number);
+      badge.style.setProperty('--trim', item.trim);
+      const status = quietRowStatus(item);
+      return h(
+        'button.dash-quiet-row',
+        {
+          type: 'button',
+          role: 'option',
+          'data-floor': item.floor.id,
+          'aria-selected': String(i === quietCursor),
+          disabled: !up,
+          onclick: () => {
+            showQuiet(false);
+            goFloor(item.floor.id);
+          },
+        },
+        badge,
+        h('span.dash-quiet-main', {}, h('span.dash-quiet-repo', {}, item.floor.name), item.metaLabel ? h('span.dash-quiet-branch', {}, item.metaLabel) : null),
+        h('span.dash-quiet-right', {}, status, item.chord ? h('span.key.dash-quiet-chord', { 'aria-hidden': 'true' }, item.chord.replace(/\s+/g, '')) : null),
+      );
+    }),
+    ...(actionRows.length ? [h('div.dash-quiet-group', {}, 'Actions'), ...actionRows] : []),
+  );
+  quietList.querySelectorAll<HTMLElement>('.dash-quiet-row')[quietCursor]?.classList.add('cursor');
+}
+
+function bayStats(item: TriageFloor): HTMLElement {
+  const parts: HTMLElement[] = [];
+  if (item.needsInput > 0) parts.push(h('span.dash-stat-needs', { 'aria-label': `${item.needsInput} needs you` }, `${item.needsInput}!`));
+  if (item.unackedDone > 0) parts.push(h('span.dash-stat-done', { 'aria-label': `${item.unackedDone} done` }, `${item.unackedDone}✓`));
+  if (item.busy > 0) parts.push(h('span.dash-stat-work', {}, `${item.busy}w`));
+  else if (!item.needsInput && !item.unackedDone) parts.push(h('span.dash-stat-idle', {}, item.totalWorkers ? item.idleState : 'empty'));
+  return h('span.dash-floor-stat', {}, ...parts);
+}
+
+function paintConsole(up: boolean, buildingRows: readonly BuildingWorkerRow[]) {
+  latestTriageItems = buildTriageFloors({
+    floors: store.floors,
+    building: store.building,
+    currentFloor: store.floor,
+    workers: store.workers.values(),
+    pulls: store.pulls.loading ? undefined : store.pulls.items,
+  });
+  latestRanked = rankTriageFloors(latestTriageItems, Date.now());
+
+  // Upper active git context pill
+  const activeItem = latestTriageItems.find((item) => item.floor.id === store.floor);
+  const prWord = words().pr;
+  const nextGitKey = activeItem ? JSON.stringify([activeItem.floor.id, activeItem.floor.name, activeItem.floor.repo, activeItem.branch, activeItem.floor.plain, activeItem.openPrs, prWord]) : '';
+  gitPill.hidden = !nextGitKey;
+  if (nextGitKey !== gitPillKey) {
+    gitPillKey = nextGitKey;
+    if (activeItem) {
+      const prText = activeItem.openPrs > 0 ? `· ${activeItem.openPrs} ${activeItem.openPrs === 1 ? prWord : `${prWord}s`}` : '';
+      gitPill.title = [activeItem.floor.repo ?? activeItem.floor.name, activeItem.branch, activeItem.openPrs > 0 ? `${activeItem.openPrs} open ${prWord}` : ''].filter(Boolean).join(' · ');
+      gitPill.replaceChildren(
+        icon('branch', 11),
+        h('b.dash-git-name', {}, activeItem.floor.name),
+        ...(activeItem.branch ? [h('span.dash-git-branch', {}, `/${activeItem.branch}`)] : activeItem.floor.plain ? [h('span.dash-git-branch', {}, '· plain')] : []),
+        ...(prText ? [h('span.dash-git-prs', {}, prText)] : []),
+      );
+    } else {
+      gitPill.replaceChildren();
+    }
+  }
+
+  // Upper building pulse
+  const counts = buildingCounts(buildingRows);
+  const unackedDone = unackedDoneBuildingCount(buildingRows);
+  pulse.hidden = false;
+  pulseNeedsBtn.hidden = counts.needs_input === 0;
+  pulseNeedsBtn.disabled = !up;
+  pulseNeedsCount.textContent = `${counts.needs_input} needs you`;
+  pulseCalm.hidden = counts.needs_input > 0;
+  pulseWork.hidden = counts.working === 0;
+  pulseWork.textContent = `${counts.working} working`;
+  pulseDone.hidden = unackedDone === 0;
+  pulseDone.textContent = `${unackedDone} done`;
+
+  // Lower floor tabs: every floor gets one, and fitFloorStrip hides those that don't fit.
+  const key = JSON.stringify([
+    store.floor,
+    latestTriageItems.map((item) => [item.floor.id, item.number, item.floor.name, item.floor.repo, item.branch, item.chord, item.triage, item.needsInput, item.unackedDone, item.busy, item.totalWorkers, item.idleState]),
+  ]);
+  const changedList = key !== floorListKey;
+  let focused: string | undefined;
+  if (changedList) {
+    focused = document.activeElement instanceof HTMLElement && floors.contains(document.activeElement) ? document.activeElement.dataset.floor : undefined;
+    floors.replaceChildren(
+      ...latestTriageItems.map((item) => {
+        let waitingSummary = '';
+        if (item.needsInput > 0) waitingSummary = `${item.needsInput} needs you`;
+        else if (item.unackedDone > 0) waitingSummary = `${item.unackedDone} done`;
+        return h(
+          'button.dash-floor-chip',
+          {
+            type: 'button',
+            'data-floor': item.floor.id,
+            'data-triage': item.triage,
+            title: [`F${item.number} ${item.floor.name}`, item.floor.repo ?? (item.floor.plain ? 'plain folder' : 'git'), item.branch ? `⎇ ${item.branch}` : '', waitingSummary, item.chord ? `(${item.chord})` : '']
+              .filter(Boolean)
+              .join(' · '),
+            onclick: () => goFloor(item.floor.id),
+          },
+          h('span.dash-floor-number', { 'aria-hidden': 'true' }, item.number),
+          h('span.dash-floor-name', {}, item.floor.name),
+          bayStats(item),
+        );
+      }),
+    );
+    floorListKey = key;
+    stripSize = undefined;
+  }
+  for (const button of floors.querySelectorAll<HTMLButtonElement>('button')) {
+    button.disabled = !up;
+    button.classList.toggle('on', button.dataset.floor === store.floor);
+    if (button.dataset.floor === store.floor) button.setAttribute('aria-current', 'page');
+    else button.removeAttribute('aria-current');
+  }
+  // Lower "+N more" bay & track
+  quietTrigger.disabled = !up;
+  floorTrackText.textContent = store.floors.length ? '' : 'No floors yet — add a project or folder';
+  fitFloorStrip();
+  if (focused) [...floors.querySelectorAll<HTMLButtonElement>('button')].find((b) => b.dataset.floor === focused && !b.hidden)?.focus({ preventScroll: true });
+}
+
+function paint() {
+  workerMenu.refresh();
+  title.textContent = officeName;
+  const up = live();
+  const here = store.currentFloor();
+  const hasFloors = store.floors.length > 0;
+  addFloorBtn.disabled = !up;
+  addFloorBtn.classList.toggle('with-label', !hasFloors);
+  addFloorLabel.hidden = hasFloors;
+  reorderFloors.disabled = !up || store.floors.length < 2;
+  agentBtn.disabled = shellBtn.disabled = !up || !here || busy.has('hire');
+  // An empty floor's pane carries the orange Hire; once someone works here the sidebar's does.
+  agentBtn.classList.toggle('accent', !here || store.workers.size > 0);
+  board.disabled = boards.disabled = !up || !here;
+  subscriptions.disabled = settingsBtn.disabled = !up;
+  sideToggle.disabled = !authorized;
+  sideToggle.hidden = !authorized || showingWorkers;
+  layoutMenu.hidden = !authorized || showingWorkers;
+  const link = up ? 'Connected' : authorized && !net.up ? 'Disconnected' : 'Connecting';
+  linkDot.dataset.state = up ? 'up' : authorized && !net.up ? 'down' : 'wait';
+  linkDot.setAttribute('aria-label', link);
+  linkDot.title = link;
+  content.classList.toggle('dash-stale', !up);
+  content.classList.toggle('side-closed', !sideOpen);
+  content.hidden = !authorized || showingWorkers;
+  buildingView.el.hidden = !authorized || !showingWorkers;
+  allWorkersBtn.hidden = !authorized;
+  allWorkersBtn.disabled = !authorized;
+  allWorkersBtn.setAttribute('aria-pressed', String(showingWorkers));
+  $('dashboard')
+    .querySelector('.dash-skip')
+    ?.setAttribute('href', showingWorkers ? '#all-workers-heading' : '#worker-detail');
+  authPanel.hidden = authorized;
+  lowerDeck.hidden = !authorized;
+  topSep.hidden = !authorized;
+  board.hidden = boards.hidden = subscriptions.hidden = settingsBtn.hidden = !authorized;
+  paintBanner();
+  if (!authorized) {
+    gitPill.hidden = true;
+    pulse.hidden = true;
+    showQuiet(false);
+    showLayouts(false);
+    disposePanes();
+    return paintGate();
+  }
+  const buildingRows = buildingRoster({ floors: store.floors, building: store.building, currentFloor: store.floor, workers: store.workers.values(), mission: store.missionControl });
+  latestBuildingRows = buildingRows;
+  paintConsole(up, buildingRows);
+  allWorkersCount.textContent = String(buildingRows.length);
+  allWorkersBtn.setAttribute('aria-label', `All workers, ${buildingRows.length}`);
+  if (showingWorkers) buildingView.update({ rows: buildingRows, floors: store.floors, live: up, canHire: !!here, mission: store.missionControl });
+  const b = store.floor && store.whiteboard.board(store.floor);
+  const unread = b ? cardsNewestFirst(b).filter((c) => cardChanged(b, OWNER, c.id)).length : 0;
+  boardCount.textContent = String(unread);
+  boardCount.classList.toggle('hidden', !unread);
+  board.setAttribute('aria-label', unread ? `Whiteboard, ${unread} unread` : 'Whiteboard');
+  paintBoardsBadge();
+  const needs = [...store.workers.values()].filter(needsOwnerInput).length + missionWaiting(store.missionControl);
+  document.title = `${needs ? `(${needs}) ` : ''}${officeName} · Web companion`;
+  if (fresh && wsFloor === floor) {
+    const { gone, filled } = syncWorkspace(ws, ordered(), onFloor, inMission);
+    // A building agent leaves no floor: it was turned off or removed, which the office already says.
+    for (const id of gone) if (names.has(id)) toast(`${names.get(id)} has left the floor.`, 'info');
+    if (gone.length || filled) saveWorkspace();
+  }
+  for (const w of store.workers.values()) names.set(w.id, w.name);
+  paintSide();
+  paintWorkspace();
+}
+
+let bannerKey = '';
+let sideSubKey = '';
+
+function paintBanner() {
+  let tone = '';
+  let text = '';
+  let glyph: IconName = 'alert';
+  let actionKind = '';
+  if (authorized && !net.up) {
+    tone = 'warn';
+    text = navigator.onLine ? 'Disconnected from the office. What you see may be out of date, and nothing you type is queued. Reconnecting…' : 'This computer is offline. Worker actions and terminal input are off; nothing will be replayed.';
+    actionKind = 'reconnect';
+  } else if (switching) {
+    tone = 'info';
+    glyph = 'refresh';
+    text = 'Loading the floor…';
+  } else if (notice) {
+    tone = 'info';
+    text = notice;
+    actionKind = 'dismiss';
+  } else if (authorized && !credential && where !== 'local') {
+    tone = 'accent';
+    glyph = 'key';
+    text = 'This browser is using the office’s link for this start. Pair it to keep access after the office restarts.';
+    actionKind = 'pair';
+  }
+  const key = `${tone}\0${glyph}\0${text}\0${actionKind}`;
+  if (key === bannerKey) return;
+  bannerKey = key;
+  const actions: HTMLElement[] = [];
+  if (actionKind === 'reconnect') actions.push(h('button.btn.sm', { type: 'button', onclick: () => void net.connect() }, icon('refresh', 14), 'Reconnect'));
+  else if (actionKind === 'dismiss') {
+    actions.push(
+      h(
+        'button.btn.ghost.sm',
+        {
+          type: 'button',
+          'aria-label': 'Dismiss',
+          onclick: () => {
+            notice = '';
+            paint();
+          },
+        },
+        '✕',
+      ),
+    );
+  } else if (actionKind === 'pair') actions.push(h('button.btn.accent.sm', { type: 'button', onclick: () => accessDialog() }, 'Pair this browser'));
+  banner.hidden = !text;
+  banner.dataset.tone = tone;
+  bannerIcon.replaceChildren(icon(glyph, 16));
+  bannerText.textContent = text;
+  bannerActions.replaceChildren(...actions);
+}
+
+function paintGate() {
+  const steps = (
+    where === 'local'
+      ? []
+      : [
+          h('span', {}, 'On the office’s computer, open ', h('b', {}, '⚙️ Settings → Phone & web → Web companion'), '.'),
+          h('span', {}, 'Click ', h('b', {}, 'Copy pairing link'), ' beside Wi-Fi or Tailscale, then paste the complete link into this browser.'),
+          h('span', {}, 'Choose ', h('b', {}, 'Pair this browser'), ' before refreshing, then bookmark the page.'),
+        ]
+  ).map((s, i) => h('li', {}, h('span.dash-step-no', {}, String(i + 1)), s));
+  const whereChip = h('p.dash-where-chip', {}, icon(WHERE[where].icon, 14), h('span', {}, `${WHERE[where].label} · ${location.host}`));
+  const forget = h('button.btn', { type: 'button', onclick: () => forgetHere('Saved access forgotten. Open a fresh link from the office to pair again.') }, 'Forget saved access');
+  const retry = h(
+    'button.btn.primary',
+    {
+      type: 'button',
+      onclick: () => {
+        gate = 'connecting';
+        paint();
+        void net.connect();
+      },
+    },
+    icon('refresh', 14),
+    'Try again',
+  );
+  const views: Record<Gate, () => HTMLElement[]> = {
+    connecting: () => [h('div.spinner'), h('h2', {}, 'Connecting to the office…')],
+    unreachable: () => [
+      h('div.dash-gate-icon.warn', {}, icon('alert', 28)),
+      h('h2', {}, 'Can’t reach the office'),
+      h('p', {}, 'Retrying by itself. Check that:'),
+      h(
+        'ul.dash-checks',
+        {},
+        h('li', {}, icon('check', 14), 'The office’s computer is awake, with Factory Flow running.'),
+        where === 'tailscale'
+          ? h('li', {}, icon('check', 14), 'Tailscale is connected on both computers, on the same tailnet.')
+          : where === 'lan'
+            ? h('li', {}, icon('check', 14), 'This computer is on the same network as the office.')
+            : null,
+      ),
+      retry,
+    ],
+    access: () => [
+      h('div.dash-gate-icon', {}, icon('lock', 28)),
+      h('h2', {}, where === 'local' ? 'The office didn’t let this page in' : 'Open a pairing link to connect'),
+      h(
+        'p',
+        {},
+        arrivedWithLink
+          ? 'That link is from an earlier start of the office, so it no longer opens it. Links change every time the office starts; a paired browser doesn’t need one.'
+          : where === 'local'
+            ? 'Try connecting again.'
+            : 'You reached the office, but this browser has no access key. Typing the address alone won’t connect it or send an approval request to the office’s computer.',
+      ),
+      steps.length ? h('ol.dash-steps', {}, ...steps) : retry,
+    ],
+    revoked: () => [
+      h('div.dash-gate-icon.warn', {}, icon('key', 28)),
+      h('h2', {}, 'This browser isn’t paired any more'),
+      h('p', {}, 'It was unpaired on the office, or its pairing expired. Forget the saved access here, then pair again with a fresh link.'),
+      h('div.row.dash-gate-actions', {}, forget),
+      h('ol.dash-steps', {}, ...steps),
+    ],
+    off: () => [
+      h('div.dash-gate-icon', {}, icon('power', 28)),
+      h('h2', {}, 'The web companion is off'),
+      h('p', {}, 'It’s turned off on the office’s computer, in ', h('b', {}, '⚙️ Settings → Phone & web → Web companion'), '. Paired browsers stay paired, and this page opens by itself once it’s back on.'),
+      h('div.row.dash-gate-actions', {}, retry),
+    ],
+  };
+  authPanel.dataset.gate = gate;
+  authPanel.replaceChildren(h('div.dash-gate-card', {}, ...views[gate](), whereChip));
+}
+
+function paintSide() {
+  const here = store.currentFloor();
+  sideTitle.textContent = here?.name ?? 'No floor';
+  sideTitle.title = sideTitle.textContent;
+  const where = here ? [here.repo ?? 'Not a git repository', here.branch].filter(Boolean).join(' · ') : store.floors.length ? 'Choose a floor above.' : 'No floors yet. Add a floor above.';
+  const subText = here?.repo && here.branch ? here.branch : where;
+  const nextSubKey = `${where}\0${subText}`;
+  // The floor name above already says which repository this is, so the line under it is the branch.
+  if (nextSubKey !== sideSubKey) {
+    sideSubKey = nextSubKey;
+    sideSub.replaceChildren(icon('branch', 12), h('span', { title: where }, subText));
+  }
+  roster.update({ floor, workers: [...store.workers.values()], focused: focusedWorker(ws) ?? '', live: live(), pane: (id) => paneOf(ws, id), mission: store.missionControl });
+  missionRoster.update({ mission: store.missionControl, floor, focused: focusedWorker(ws) ?? '', live: live(), pane: (id) => paneOf(ws, id), here: (id) => store.workers.get(id), shortcut: '⌘ O' });
+}
+
+function paintWorkspace() {
+  if (wsFloor !== floor) return;
+  const count = SLOT_COUNT[ws.layout];
+  const rects = rectsFor(ws.layout, ws.col, ws.row);
+  const shown = visibleSlots(ws);
+  const candidates = ordered().filter((w) => !shown.includes(w.id));
+  // Move live panes with their workers, retaining thread drafts, images and terminal attachments.
+  reconcilePanes(panes, shown);
+  for (let i = 0; i < count; i++) {
+    const p = panes[i] ?? createPane(paneHost, i);
+    panes[i] = p;
+    if (p.el.parentElement !== workspaceEl) workspaceEl.insertBefore(p.el, colHandle);
+    const max = ws.maximized === i;
+    place(p.el, max ? FULL_RECT : (rects[i] ?? FULL_RECT));
+    const id = ws.slots[i];
+    const w = id ? workerOf(id) : undefined;
+    p.update({
+      worker: w,
+      view: w ? viewOf(w.id) : 'terminal',
+      focused: ws.focused === i,
+      maximized: max,
+      canMaximize: count > 1,
+      covered: ws.maximized !== null && !max,
+      candidates,
+      anyone: store.workers.size > 0,
+      takeFocus: !showingWorkers && takeFocus && ws.focused === i,
+    });
+  }
+  workspaceEl.dataset.layout = ws.layout;
+  const handles = ws.maximized === null;
+  const dividers = LAYOUT_DIVIDERS[ws.layout];
+  colHandle.hidden = !handles || !dividers.col;
+  rowHandle.hidden = !handles || !dividers.row;
+  colHandle.style.setProperty('--at', String(ws.col));
+  rowHandle.style.setProperty('--at', String(ws.row));
+  rowHandle.style.setProperty('--from', ws.layout === 'triple' ? String(ws.col) : '0');
+  rowHandle.style.setProperty('--from-gap', ws.layout === 'triple' ? '4px' : '0px');
+  colHandle.setAttribute('aria-valuenow', String(Math.round(ws.col * 100)));
+  rowHandle.setAttribute('aria-valuenow', String(Math.round(ws.row * 100)));
+  const open = shown.filter(Boolean).length;
+  const fw = workerOf(focusedWorker(ws) ?? '');
+  layoutTrigger.title = `Pane layout (⌘ 1–8) · ${open} of ${count} open${fw && count > 1 ? ` · focused on ${fw.name}` : ''}`;
+  layoutButtons.forEach((b, i) => {
+    b.setAttribute('aria-checked', String(!ws.auto && LAYOUT_ORDER[i] === ws.layout));
+  });
+  autoButton.setAttribute('aria-checked', String(ws.auto));
+  const shownLayout = `${ws.auto ? 'Auto · ' : ''}${LAYOUT_LABEL[ws.layout]}`;
+  if (layoutName.textContent !== shownLayout || layoutNow.dataset.mode !== ws.layout) {
+    layoutName.textContent = shownLayout;
+    layoutTrigger.setAttribute('aria-label', `Layout: ${shownLayout}`);
+    layoutNow.dataset.mode = ws.layout;
+    layoutNow.replaceChildren(layoutGlyph(ws.layout));
+  }
+  autoButton.title = `Auto: ${LAYOUT_LABEL[ws.layout].toLowerCase()}. Subagents expand the layout only below five main workers.`;
+  sideToggle.setAttribute('aria-label', sideOpen ? 'Hide floor' : 'Show floor');
+  sideToggle.setAttribute('aria-pressed', String(!sideOpen));
+  sideToggle.title = `${sideOpen ? 'Hide floor' : 'Show floor'} (⌘ \\)`;
+}
+
+let previewFrame = 0;
+let previewAt = 0;
+function schedulePreviews() {
+  if (previewFrame || !panes.some((p) => p?.mode() === 'info')) return;
+  // Screens stream a few times a second per worker; a quarter second is plenty for a glance.
+  const wait = Math.max(0, 250 - (performance.now() - previewAt));
+  previewFrame = window.setTimeout(() => {
+    previewFrame = 0;
+    previewAt = performance.now();
+    for (const p of panes) p?.paintPreview();
+  }, wait);
+}
+// --- Actions ------------------------------------------------------------------------------------------
+
+/** A shell opens at once, as B at an empty desk does in the office: no prompt and no worktree. */
+function openShell() {
+  if (!live() || !store.currentFloor()) return;
+  void action({ t: 'worker.spawn', deskId: 'auto', kind: 'shell' }, '', floor, 'Shell opened.').then(warn);
+}
+function hire(deskId = 'auto', targetPane?: number) {
+  if (!live() || !store.currentFloor()) return;
+  const intended = floor;
+  const key = draftKey(intended, 'hire:agent');
+  const desk = deskId === 'auto' ? undefined : DESK_BY_ID.get(deskId)?.label;
+  openPrompt({
+    title: 'Hire Droid',
+    subtitle: [store.currentFloor()?.name, desk].filter(Boolean).join(' · '),
+    submitLabel: 'Hire Droid',
+    allowEmpty: true,
+    initial: read(key),
+    onDraft: (v) => remember(key, v),
+    modelOption: true,
+    deskId: deskId === 'auto' ? undefined : deskId,
+    imagesOption: true,
+    recall: true,
+    worktreeOption: !store.currentFloor()?.home && !store.currentFloor()?.plain && !!store.currentFloor()?.branch,
+    repoOptions: repoChoices(store.floors, intended),
+    runsOn: runsOnPicker(),
+    onCloud: async (text, o) => {
+      const error = await action(cloudSpawn(deskId, text, o), '', intended, `Droid hired on ${o.cloud.computerName}.`, targetPane);
+      if (!error) remember(key, '');
+      return error;
+    },
+    onSubmit: async (text, opts) => {
+      const error = await action({ t: 'worker.spawn', deskId, kind: 'agent', prompt: text, ...opts }, '', intended, 'Droid hired.', targetPane);
+      if (!error) remember(key, '');
+      return error;
+    },
+  });
+}
+const warn = (error: string | undefined) => {
+  if (error) toast(error, 'warn');
+};
+function sendHome(w: WorkerInfo) {
+  const intended = floor;
+  const confirm = (cleanup: 'keep' | 'worktree' | 'all' = 'keep') => void action({ t: 'worker.kill', workerId: w.id, cleanup, deleteSession: false }, w.id, intended, `${w.name} went home.`).then(warn);
+  if (w.worktree && !w.cloud)
+    sendHomeDialog({
+      workerId: w.id,
+      name: w.name,
+      where: store.currentFloor()?.name ?? 'this floor',
+      worktree: w.worktree,
+      ask: () => {
+        if (usable(w.id, intended)) net.send({ t: 'worker.worktree', workerId: w.id });
+      },
+      onConfirm: confirm,
+    });
+  else
+    confirmDialog(
+      `Send ${w.name} home?`,
+      w.cloud ? 'This frees its desk. Its Factory session stays archived; a computer this worker made is deleted, as in the office.' : 'This stops its terminal for every window and frees its desk. Work in the checkout is kept.',
+      'Send home',
+      () => confirm(),
+    );
+}
+/** Shared settings; device controls are authorized by the server's own-page check. */
+async function showSettings(pane?: SettingsPane, focusCard?: SettingsCardTitle) {
+  settingsUi ??= await import('./ui/settings');
+  if (!live()) return;
+  settingsUi.openSettings(net, { surface: nativeCompanion ? 'mac-companion' : 'companion', first: pane, focusCard, hireForSetup: hireForWorktreeSetup });
+}
+// A model picker's "Use your Claude or ChatGPT plan": Settings on that pane, or the open Settings turned to it.
+window.addEventListener(OPEN_SETTINGS_EVENT, (e) => {
+  const pane = resolveSettingsPane((e as CustomEvent<{ pane?: string }>).detail?.pane);
+  const tab = pane && document.getElementById(`settings-tab-${pane}`);
+  if (tab) tab.click();
+  else void showSettings(pane);
+});
+/** Settings' "Have a worker set it up…": the hire window with a task to write this repository's worktree setup and open a pull request. */
+function hireForWorktreeSetup() {
+  if (!live() || !store.currentFloor()) return;
+  const intended = floor;
+  const now = store.worktreeSetup ? describeSetup(store.worktreeSetup.resolved) : 'runs what the office detects from its lockfiles';
+  openPrompt({
+    title: 'Set up worktrees',
+    subtitle: 'A worker writes this repository’s worktree setup, tests it, and opens a pull request with it. Pick its model, edit the task if you like, then hire.',
+    initial: officePrompt('worktree.setup', { file: SETUP_FILE, include: INCLUDE_FILE, now, ...forgeVars(store.project?.forge) }),
+    submitLabel: 'Hire & start',
+    modelOption: true,
+    worktreeOption: true,
+    worktreeChecked: true,
+    imagesOption: true,
+    onSubmit: (text, opts) => action({ t: 'worker.spawn', deskId: 'auto', kind: 'agent', prompt: text, ...opts }, '', intended, 'Droid hired.'),
+  });
+}
+/** The count on the Boards button: open pull requests that need you and workflows whose latest run failed, once the floor's boards have loaded. */
+function paintBoardsBadge() {
+  const badge = badgeFor({ plain: !!store.currentFloor()?.plain, forge: store.project?.forge, pulls: store.pulls, pipelines: store.pipelines });
+  boardsCount.textContent = badge ? String(badge.count) : '';
+  boardsCount.classList.toggle('hidden', !badge);
+  boards.setAttribute('aria-label', badge ? `Boards, ${badge.summary}` : 'Boards');
+  boards.title = `The floor’s issues, pull requests, pipelines, Linear and Jira (⌘ I)${badge ? `. ${badge.summary}.` : ''}`;
+}
+/** Opens the Boards window on a tab (the floor's last one when none is named). */
+async function openBoards(tab?: BoardTab) {
+  const intended = floor;
+  boardsUi ??= await import('./dashboard-boards');
+  if (!live() || intended !== floor || !store.currentFloor()) return;
+  boardsUi.openBoards(
+    {
+      net,
+      floor: () => floor,
+      spawn: (msg, done, at) => action(msg, '', at, done),
+      goToWorker: (id) => openHere(id, true),
+      openSettings: (pane, card) => void showSettings(pane, card),
+    },
+    tab,
+  );
+}
+/** Closes every window as the companion moves to another floor; the Boards window comes back there on its own. */
+function closeForFloorChange() {
+  boardsFollow ||= !!boardsUi?.boardsOpen();
+  closeAllModals();
+}
+/** What ⌘K's Actions group lists: the Boards tabs, and any other window with entries of its own. */
+function paletteActions(): PaletteEntry[] {
+  return [...factoryPaletteEntries(net, nativeCompanion), ...boardsPaletteEntries((tab) => void openBoards(tab), store.project?.forge)];
+}
+async function openBoard(card?: string) {
+  const intended = floor;
+  whiteboard ??= await import('./ui/whiteboard');
+  if (live() && intended === floor && store.currentFloor()) whiteboard.openWhiteboard(net, { card, queueOffline: false });
+}
+
+// --- This browser's access ------------------------------------------------------------------------------
+
+function forgetHere(text: string) {
+  let removed = false;
+  try {
+    removed = forgetBrowserCredential(localStorage);
+  } catch {
+    /* blocked */
+  }
+  credential = undefined;
+  bootstrap = '';
+  auth();
+  net.close();
+  authorized = false;
+  gate = 'access';
+  closeAllModals();
+  toast(removed ? text : 'Access closed, but this browser’s storage could not be cleared. Remove this site’s data before opening it again.', removed ? 'info' : 'warn');
+  paint();
+}
+
+function accessDialog() {
+  const info = WHERE[where];
+  const note = h('p.note', { role: 'status', hidden: true });
+  const fail = (text: string) => {
+    note.hidden = false;
+    note.className = 'note bad';
+    note.textContent = text;
+  };
+  const whereCard = h('div.dash-where', { 'data-where': where }, h('span.dash-where-icon', {}, icon(info.icon, 20)), h('div.dash-where-text', {}, h('b', {}, info.label), h('code', {}, location.host), h('p', {}, info.line)));
+  const footer = h('footer');
+  const body = h('div.body.stack', {}, whereCard);
+  const el = h('div.modal', { role: 'dialog', 'aria-label': 'Browser access' }, windowHeader('Browser access', officeName), body, footer);
+  const modal = openModal(el);
+
+  const deviceName = h('input.input', { value: defaultBrowserName(), maxlength: 64, 'aria-label': 'Name this browser' });
+  const pair = h('button.btn.accent', { type: 'button', disabled: pairing }, icon('key', 14), 'Pair this browser');
+  body.append(
+    h(
+      'p',
+      {},
+      'Pairing keeps this browser’s own access at ',
+      h('code', {}, location.origin),
+      ', so a bookmark opens the office after it restarts. It’s you, not a new account, and you can unpair it any time from the office’s Phone & web window.',
+    ),
+    h('div.field', {}, h('label', {}, 'Name'), deviceName, h('p.field-hint', {}, 'How the office lists it under Paired devices.')),
+    h(
+      'p.field-hint',
+      {},
+      `Each address pairs on its own: pairing ${location.host} doesn’t pair the office’s other addresses.${where === 'lan' ? ' Tailscale’s name works at home and away, so it’s the best one to bookmark on a laptop.' : ''}`,
+    ),
+    note,
+  );
+  footer.append(h('span.grow'), h('button.btn.ghost', { type: 'button', onclick: () => modal.close() }, 'Not now'), pair);
+  const submit = () => {
+    if (pairing || credential) return;
+    pairing = true;
+    pair.disabled = true;
+    void (async () => {
+      try {
+        const res = await fetch(withToken('/api/mobile/pair'), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ device: deviceName.value, kind: 'browser' }), signal: AbortSignal.timeout(8000) });
+        let body: BrowserCredential & { error?: string };
+        try {
+          body = (await res.json()) as BrowserCredential & { error?: string };
+        } catch {
+          throw new Error('The browser could not be paired.');
+        }
+        if (!res.ok) throw new Error(body.error ?? 'The browser could not be paired.');
+        if (!isBrowserCredential(body)) throw new Error('The browser could not be paired.');
+        credential = body;
+        try {
+          persisted = saveBrowserCredential(localStorage, body);
+        } catch {
+          persisted = false;
+        }
+        bootstrap = '';
+        auth();
+        net.close();
+        modal.close();
+        toast(
+          persisted ? 'Paired. Bookmark this page: it opens the office from now on.' : 'Paired for this page only: this browser blocks storage. Unpair it from the office’s Phone & web window so no unused pairing is left.',
+          persisted ? 'info' : 'warn',
+        );
+        void net.connect();
+        paint();
+      } catch (error) {
+        fail((error as Error).message);
+      } finally {
+        pairing = false;
+        pair.disabled = !!credential;
+      }
+    })();
+  };
+  pair.addEventListener('click', submit);
+  deviceName.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') submit();
+  });
+  deviceName.select();
+}
+
+// --- Keys ------------------------------------------------------------------------------------------------
+
+if (nativeCompanion) {
+  window.addEventListener('factory-flow:close-pane', () => {
+    if (quietOpen) return showQuiet(false, true);
+    if (!layoutPop.hidden) return showLayouts(false, true);
+    if (workerMenu.close(true) || closeTopModal()) return;
+    if (showingWorkers) return showWorkers(false);
+    if (live() && (focusedWorker(ws) || SLOT_COUNT[ws.layout] > 1)) paneHost.close(ws.focused);
+  });
+  window.addEventListener('factory-flow:send-home', () => {
+    if (!live() || showingWorkers || quietOpen || modalOpen() || workerMenu.isOpen()) return;
+    const w = store.workers.get(focusedWorker(ws) ?? '');
+    if (w && !busy.has(w.id)) sendHome(w);
+  });
+}
+
+// Capture Command chords even inside terminals and composers. Other keys belong to their editor.
+window.addEventListener(
+  'keydown',
+  (e) => {
+    if (!live() || modalOpen() || workerMenu.isOpen()) return;
+    workspaceShortcut(
+      e,
+      (command) => {
+        switch (command.action) {
+          case 'floors':
+            showQuiet(!quietOpen, quietOpen);
+            break;
+          case 'floorIndex': {
+            const target = store.floors[command.index];
+            if (target) {
+              showQuiet(false);
+              goFloor(target.id);
+            }
+            break;
+          }
+          case 'floor': {
+            const next = adjacentFloor(store.floors, store.floor, command.direction);
+            if (next) goFloor(next);
+            break;
+          }
+          case 'layout':
+            changeLayout(command.mode);
+            panes[ws.focused]?.focusContent();
+            break;
+          case 'maximize':
+            toggleMaxPane(ws.focused);
+            panes[ws.focused]?.focusContent();
+            break;
+          case 'pane':
+            ws.focused = (ws.focused + command.direction + SLOT_COUNT[ws.layout]) % SLOT_COUNT[ws.layout];
+            if (ws.maximized !== null) ws.maximized = ws.focused;
+            changed();
+            panes[ws.focused]?.focusContent();
+            break;
+          case 'worker': {
+            const list = ordered();
+            const at = list.findIndex((w) => w.id === focusedWorker(ws));
+            const next = at < 0 ? (command.direction > 0 ? 0 : list.length - 1) : (at + command.direction + list.length) % list.length;
+            const w = list[next];
+            if (w) openHere(w.id, true);
+            break;
+          }
+          case 'hire':
+            showQuiet(false);
+            hire('auto', ws.focused);
+            break;
+          case 'board':
+            showQuiet(false);
+            void openBoard();
+            break;
+          case 'boards':
+            showQuiet(false);
+            void openBoards();
+            break;
+          case 'settings':
+            showQuiet(false);
+            void showSettings();
+            break;
+          case 'orchestrator':
+            showQuiet(false);
+            if (workerOf(ORCHESTRATOR_ID)) openHere(ORCHESTRATOR_ID, true);
+            else void showSettings('orchestrator');
+            break;
+          case 'sidebar':
+            toggleSide();
+            if (sideOpen) {
+              roster.reveal(focusedWorker(ws) ?? '');
+              const id = focusedWorker(ws) ?? '';
+              ((inMission(id) ? missionRoster.button(id) : roster.button(id)) ?? agentBtn).focus({ preventScroll: true });
+            } else panes[ws.focused]?.focusContent();
+            break;
+        }
+      },
+      nativeCompanion,
+      showingWorkers || quietOpen ? 'directory' : 'workspace',
+    );
+  },
+  true,
+);
+
+/** The arrow keys walk Mission Control, then the floor's list, as one list. */
+function sideKeys(e: KeyboardEvent) {
+  if (!authorized || modalOpen() || e.metaKey || e.ctrlKey || e.altKey || e.isComposing) return;
+  const t = e.target as HTMLElement | null;
+  if (t?.closest('input, textarea, select, [contenteditable], .xterm, [role=separator], [role=radiogroup]')) return;
+  const rows = [...missionRoster.visible(), ...roster.visible().map((w) => ({ id: w.id, button: roster.button(w.id), opens: true }))];
+  const go = (direction: -1 | 1) => {
+    const row = sideStep(rows, t, focusedWorker(ws) ?? '', direction);
+    if (!row) return;
+    if (row.opens) openHere(row.id);
+    row.button?.focus({ preventScroll: true });
+  };
+  const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  if (k === 'ArrowDown' || k === 'j') go(1);
+  else if (k === 'ArrowUp' || k === 'k') go(-1);
+  else return;
+  e.preventDefault();
+}
+workerList.addEventListener('keydown', sideKeys);
+missionList.addEventListener('keydown', sideKeys);
+window.addEventListener('storage', (event) => {
+  if (event.key !== BROWSER_KEY) return;
+  net.close();
+  closeAllModals();
+  try {
+    credential = browserCredential(localStorage);
+  } catch {
+    credential = undefined;
+  }
+  bootstrap = '';
+  auth();
+  authorized = false;
+  fresh = false;
+  gate = credential ? 'connecting' : 'access';
+  toast('This browser’s access changed in another tab.', 'info');
+  if (credential) void net.connect();
+  paint();
+});
+window.addEventListener('online', () => {
+  if (authorized) void net.connect();
+  paint();
+});
+window.addEventListener('offline', () => {
+  net.close();
+  paint();
+});
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && (authorized || gate === 'off')) void net.connect();
+});
+window.addEventListener('pagehide', () => net.close());
+window.addEventListener('pageshow', (e) => {
+  if (e.persisted) void net.connect();
+});
+paint();
+void net.connect();

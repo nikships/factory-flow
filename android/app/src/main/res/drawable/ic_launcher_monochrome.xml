@@ -1,0 +1,42 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group android:rotation="-15" android:pivotX="54" android:pivotY="54">
+        <group android:scaleX="2.9" android:scaleY="2.9" android:translateX="25.72" android:translateY="27.21">
+        <path
+            android:fillColor="#FFFFFF"
+            android:fillAlpha="0.017"
+            android:fillType="evenOdd"
+            android:pathData="@string/glyph_path" />
+        </group>
+    </group>
+    <group android:rotation="-10" android:pivotX="54" android:pivotY="54">
+        <group android:scaleX="2.9" android:scaleY="2.9" android:translateX="25.72" android:translateY="27.21">
+        <path
+            android:fillColor="#FFFFFF"
+            android:fillAlpha="0.139"
+            android:fillType="evenOdd"
+            android:pathData="@string/glyph_path" />
+        </group>
+    </group>
+    <group android:rotation="-5" android:pivotX="54" android:pivotY="54">
+        <group android:scaleX="2.9" android:scaleY="2.9" android:translateX="25.72" android:translateY="27.21">
+        <path
+            android:fillColor="#FFFFFF"
+            android:fillAlpha="0.322"
+            android:fillType="evenOdd"
+            android:pathData="@string/glyph_path" />
+        </group>
+    </group>
+    <group android:rotation="-0" android:pivotX="54" android:pivotY="54">
+        <group android:scaleX="2.9" android:scaleY="2.9" android:translateX="25.72" android:translateY="27.21">
+        <path
+            android:fillColor="#FFFFFF"
+            android:fillType="evenOdd"
+            android:pathData="@string/glyph_path" />
+        </group>
+    </group>
+</vector>

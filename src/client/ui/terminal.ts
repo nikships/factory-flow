@@ -1,0 +1,689 @@
+import { Terminal } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
+import { WebLinksAddon } from '@xterm/addon-web-links';
+import { Unicode11Addon } from '@xterm/addon-unicode11';
+import type { Net } from '../net';
+import { store } from '../state';
+import { withToken } from '../token';
+import { TERM_THEME } from '../term-theme';
+import { suppressMirrorQueries, TerminalMirror } from '../term-mirror';
+import { h, hintToast, openModal, STATUS_LABEL, toast, type Modal } from './dom';
+import { colorDot } from './kit';
+import type { ServerMsg, WorkerInfo } from '../../shared/protocol';
+import { teamSummary, workerTeams } from '../../shared/team';
+import { buildingAgent, missionLead } from '../mission';
+import { missionTeamLine } from '../mission-status';
+import { forkRefusal } from '../../shared/worker-fork';
+import { openForkWorker } from './fork-worker';
+import { creditsNote } from '../../shared/factory-sessions';
+import { findLine } from '../../shared/search';
+import { DROP_MAX_BYTES, droppedPaths } from '../../shared/drops';
+import { loadFonts, TERM_FONT } from '../fonts';
+import { attachKittyTerminal, type ExpandedKittyImage } from '../term-kitty';
+import { wantsCsiEnter } from '../term-keys';
+import { viewPicture } from './picture-viewer';
+import { onTermFontSize, setTermFontSize, stepTermFont, termFontSize, TERM_FONT_MAX, TERM_FONT_MIN } from './term-font';
+import { mountWorkerThread, type WorkerThread } from './worker-thread';
+
+function openKittyPicture(img: ExpandedKittyImage, about: string, isAlive: () => boolean, focusTerm: () => void, state: { modal: Modal | null }) {
+  if (state.modal || !isAlive()) return;
+  const url = URL.createObjectURL(img.blob);
+  state.modal = viewPicture(url, 'Terminal image', {
+    width: img.width,
+    height: img.height,
+    about,
+    onClose: () => {
+      state.modal = null;
+      URL.revokeObjectURL(url);
+      if (isAlive()) focusTerm();
+    },
+  });
+}
+
+/** A line to scroll to once the terminal has loaded: a search hit (see search.ts). */
+export interface TerminalFind {
+  /** What was searched for, as a searchKey. */
+  needle: string;
+  /** How many rows from the bottom of the worker's terminal the line was. */
+  fromEnd: number;
+}
+
+/** Sends a file dropped or pasted into a worker's terminal to the office; where the office keeps it. */
+async function uploadDrop(workerId: string, f: File): Promise<string> {
+  const name = f.name || 'That file';
+  if (f.size > DROP_MAX_BYTES) throw new Error(`${name} is too big to drop into a terminal (${DROP_MAX_BYTES / 1024 / 1024} MB at most)`);
+  const q = new URLSearchParams({ floor: store.floor ?? '', worker: workerId, name: f.name });
+  const res = await fetch(withToken(`/api/term/drop?${q}`), { method: 'POST', headers: { 'content-type': f.type || 'application/octet-stream' }, body: f });
+  const r = (await res.json().catch(() => ({}))) as { path?: string; error?: string };
+  if (!res.ok || !r.path) throw new Error(r.error ?? `${name} could not be dropped into the terminal`);
+  return r.path;
+}
+
+let current: { workerId: string; modal: Modal; find(f: TerminalFind): void } | null = null;
+const threadDrafts = new Map<string, string>();
+const THREAD_VIEW_KEY = 'factory-flow.desk-thread-view:';
+
+/**
+ * The team strip's people for `w`: its lead and teammates on this floor, or its own subagents. A building
+ * agent (the Orchestrator) leads from Mission Control, so its team spans floors and the strip shows the ones
+ * here with the whole team's line.
+ */
+function teamAround(w: WorkerInfo): { lead?: WorkerInfo; mates: WorkerInfo[]; summary?: string } {
+  const agent = buildingAgent(store.missionControl, w.id);
+  if (agent) return { mates: agent.team.flatMap((m) => store.workers.get(m.id) ?? []), summary: missionTeamLine(agent.team) };
+  const building = missionLead(store.missionControl, w.lead);
+  if (building) return { lead: building.worker, mates: [...store.workers.values()].filter((x) => x.lead === w.lead && x.id !== w.id) };
+  const group = workerTeams(store.workers.values()).find((t) => t.lead.id === w.id || t.children.some((s) => s.id === w.id));
+  const mates = group?.children.filter((s) => s.id !== w.id) ?? [];
+  return { lead: group && group.lead.id !== w.id ? group.lead : undefined, mates, summary: teamSummary(mates) };
+}
+/** Opens a teammate's terminal from the team strip (main wires it up, to resume or fix it first). */
+let openTeammate: (workerId: string) => void = () => {};
+
+export function onOpenTeammate(fn: (workerId: string) => void) {
+  openTeammate = fn;
+}
+/** Whether we've said, this page load, that Esc now goes to the terminal and how to leave instead. */
+let escHinted = false;
+const listeners = new Set<(msg: ServerMsg) => void>();
+
+/** Main feeds every server message through here so open terminals can pick theirs. */
+export function routeTerminalMessage(msg: ServerMsg) {
+  listeners.forEach((fn) => fn(msg));
+}
+
+/** The worker whose terminal window is open, if any. */
+export function openTerminalFor(): string | null {
+  return current?.workerId ?? null;
+}
+
+/** The terminal is the front window, not covered by another dialog. */
+export function terminalOnTop(): boolean {
+  const backdrop = current?.modal.backdrop;
+  return !!backdrop && backdrop.parentElement?.lastElementChild === backdrop;
+}
+
+/** Closes the open terminal window, if there is one. Inline terminals have their own handles. */
+export function closeTerminal() {
+  current?.modal.close();
+}
+
+/** Where a headerless inline terminal goes, and what Ctrl+] does there. */
+export interface InlineTerminal {
+  mount: HTMLElement;
+  /** Ctrl+] in the terminal: leave it. Without one, Ctrl+] goes to the program. */
+  onLeave?: () => void;
+  /** Take the keyboard once it has loaded. Defaults to true; a pane opened beside others leaves focus where it is. */
+  focus?: boolean;
+  /** The containing pane already provides navigation between team members. */
+  hideTeam?: boolean;
+}
+
+/**
+ * An inline terminal. Any number can be open at once, one per worker, and none of them is the
+ * terminal window that `openTerminalFor` and `closeTerminal` speak of.
+ */
+export interface InlineTerminalHandle {
+  workerId: string;
+  close(): void;
+  focus(): void;
+  /** Asks the office for a fresh snapshot, after a reconnect. */
+  attach(): void;
+}
+
+/**
+ * Opens a worker's terminal in a window. With `inline`, it fills `inline.mount` instead: no window,
+ * backdrop or ✕, and Esc goes to the program. It doesn't replace the terminal window or other inline
+ * terminals; the caller closes it with the handle this returns.
+ */
+export function openTerminal(net: Net, workerId: string, onChanges?: () => void, find?: TerminalFind): void;
+export function openTerminal(net: Net, workerId: string, onChanges: (() => void) | undefined, find: TerminalFind | undefined, inline: InlineTerminal): InlineTerminalHandle | undefined;
+export function openTerminal(net: Net, workerId: string, onChanges?: () => void, find?: TerminalFind, inline?: InlineTerminal): InlineTerminalHandle | undefined {
+  if (!inline) {
+    if (current?.workerId === workerId) {
+      if (find) current.find(find);
+      return;
+    }
+    current?.modal.close();
+  }
+  const info = store.worker(workerId);
+  // An external bot runs elsewhere and has no terminal here: its card in Mission Control stands in.
+  if (!info || info.remote) return;
+  const canThread = !inline && info.kind === 'agent' && !info.cloud;
+  let thread: WorkerThread | undefined;
+  let threadView = false;
+  let setThreadView = (_next: 'thread' | 'raw', _focus = true) => {};
+  const threadButton = canThread ? h('button.btn.sm', { type: 'button', onclick: () => setThreadView('thread') }, 'Thread') : null;
+  const rawButton = canThread ? h('button.btn.sm', { type: 'button', onclick: () => setThreadView('raw') }, 'Raw TTY') : null;
+  const viewSwitch = canThread ? h('span.seg.term-view', { role: 'group', 'aria-label': 'Worker view' }, threadButton, rawButton) : null;
+
+  const header = inline
+    ? undefined
+    : (() => {
+        const title = h('h2');
+        const sub = h('p.sub.hidden');
+        const pill = h('span.pill');
+        const smaller = h('button.btn.icon', { type: 'button', title: 'Smaller text', 'aria-label': 'Smaller terminal text', onclick: () => zoomBy(-1) }, 'A−');
+        const bigger = h('button.btn.icon', { type: 'button', title: 'Bigger text', 'aria-label': 'Bigger terminal text', onclick: () => zoomBy(1) }, 'A+');
+        const zoom = h('span.seg.term-zoom', { role: 'group', 'aria-label': 'Terminal text size' }, smaller, bigger);
+        const changes = onChanges
+          ? h(
+              'button.btn',
+              {
+                type: 'button',
+                title: 'What this worker changed: files, diff, commit, open a PR (C at the desk)',
+                onclick: () => {
+                  onChanges();
+                  modal.close();
+                },
+              },
+              '🌿 Changes',
+            )
+          : null;
+        // A building agent has no desk for a fork to sit at.
+        const fork = info.kind === 'agent' && info.deskId ? h('button.btn', { type: 'button', onclick: () => openForkWorker(net, workerId) }, 'Fork') : null;
+        const close = h('button.btn.icon.close', { title: 'Leave terminal (Shift+Esc or Ctrl+]) · Esc goes to the terminal', 'aria-label': 'Close', onclick: () => modal.close() }, '✕');
+        const element = h('header', {}, colorDot(info.color), h('div.titles', {}, h('div.term-title', {}, title, pill), sub), h('div.actions', {}, viewSwitch, zoom, changes, fork), close);
+        const zoomBy = (dir: 1 | -1) => {
+          setTermFontSize(stepTermFont(term.options.fontSize ?? termFontSize(), dir));
+          if (threadView) setThreadView('raw');
+          else term.focus();
+        };
+        return {
+          element,
+          refresh(w: WorkerInfo) {
+            const engine = w.kind !== 'agent' ? null : 'Droid';
+            title.textContent = [engine, w.name].filter(Boolean).join(' · ');
+            title.title = title.textContent;
+            sub.textContent = [
+              w.task?.name ?? w.title,
+              w.forkedFrom && `Fork of ${w.forkedFrom.name}`,
+              w.worktree && `🌿 ${w.worktree.branch}`,
+              creditsNote(store.factory.sessions, w.sessionId),
+              w.repos?.length && `🗂️ ${[w.worktree?.path.split(/[\\/]/).pop(), ...w.repos.map((r) => r.name)].join(' + ')}`,
+            ]
+              .filter(Boolean)
+              .join(' · ');
+            sub.title = sub.textContent;
+            sub.classList.toggle('hidden', !sub.textContent);
+            pill.className = `pill ${w.status}`;
+            pill.textContent = STATUS_LABEL[w.status] ?? w.status;
+            if (fork) {
+              const why = forkRefusal(w);
+              fork.disabled = !net.up || !!why;
+              fork.title = why ?? 'Fork this conversation and its files into an independent worker';
+            }
+          },
+          zoom(px: number) {
+            smaller.toggleAttribute('disabled', px <= TERM_FONT_MIN);
+            bigger.toggleAttribute('disabled', px >= TERM_FONT_MAX);
+            zoom.title = `Text size ${px} px`;
+          },
+        };
+      })();
+  const disconnected = h('p.note.warn.hidden', { role: 'status' }, 'Disconnected. Terminal input is disabled until a fresh snapshot arrives.');
+  const host = h('div.term-host', { 'data-drop': 'Drop screenshots or files to put them in the terminal' });
+  const threadHost = canThread ? h('div.term-thread-host', { hidden: true }) : null;
+  // A lead's subagents, or a subagent's lead and teammates: one click to the next terminal.
+  const team = h('div.term-team.chips.hidden', { role: 'group', 'aria-label': 'Team' });
+  let teamKey = '';
+  const el = h(
+    inline ? 'div.modal.term.inline' : 'div.modal.full.term',
+    inline ? { role: 'region', 'aria-label': `${info.name} terminal` } : { role: 'dialog', 'aria-label': `${info.name} terminal` },
+    header?.element ?? null,
+    team,
+    disconnected,
+    threadHost,
+    host,
+  );
+  const paintTeam = (w: WorkerInfo) => {
+    if (inline?.hideTeam) return;
+    const { lead, mates, summary } = teamAround(w);
+    const chipKey = (x: WorkerInfo | undefined) => (x ? `${x.id}:${x.name}:${x.status}:${x.acked}:${x.title ?? ''}` : '');
+    const key = [summary ?? '', chipKey(lead), ...mates.map(chipKey)].join('|');
+    if (key === teamKey) return;
+    teamKey = key;
+    const chip = (x: WorkerInfo) =>
+      h(
+        'button.chip.team-chip',
+        { type: 'button', title: `Open ${x.name}'s terminal${x.title ? `: ${x.title}` : ''}`, onclick: () => openTeammate(x.id) },
+        colorDot(x.color),
+        h('span.team-chip-name', {}, x.name),
+        h('span.pill', { class: x.status }, STATUS_LABEL[x.status] ?? x.status),
+      );
+    team.classList.toggle('hidden', !lead && !mates.length);
+    if (lead) team.replaceChildren(h('span.term-team-label', {}, 'Subagent of'), chip(lead), ...(mates.length ? [h('span.term-team-label', {}, 'with'), ...mates.map(chip)] : []));
+    else team.replaceChildren(h('span.term-team-label', {}, summary ?? ''), ...mates.map(chip));
+  };
+
+  const term = new Terminal({
+    fontFamily: TERM_FONT,
+    fontSize: termFontSize(),
+    lineHeight: 1.1,
+    theme: TERM_THEME,
+    minimumContrastRatio: 4.5,
+    cursorBlink: true,
+    disableStdin: true,
+    scrollback: 5000,
+    allowProposedApi: true,
+    macOptionIsMeta: true,
+  });
+  const fit = new FitAddon();
+  term.loadAddon(fit);
+  // The addon's default opens a blank window and then assigns its location. Electron's window
+  // open handler only sees the blank URL and denies it, so pass the real URL up front.
+  term.loadAddon(
+    new WebLinksAddon((event, uri) => {
+      if (!(event.metaKey || event.ctrlKey)) return;
+      window.open(uri, '_blank', 'noopener,noreferrer');
+    }),
+  );
+  // Unicode 11 widths, so powerline glyphs, emoji, CJK and combining marks take the cells
+  // they should instead of overlapping or leaving gaps (oh-my-zsh, agnoster…).
+  const unicode = new Unicode11Addon();
+  term.loadAddon(unicode);
+  term.unicode.activeVersion = '11';
+  let opened = false;
+  let alive = true;
+  const expanded = { modal: null as Modal | null };
+  const kitty = attachKittyTerminal(term, {
+    onExpandImage: (img) =>
+      openKittyPicture(
+        img,
+        store.worker(workerId)?.name ?? info.name,
+        () => alive,
+        () => term.focus(),
+        expanded,
+      ),
+  });
+
+  const offQueries = suppressMirrorQueries(term);
+  let lastSentSize = '';
+  let lastPtySize = '';
+  const pendingSizes: string[] = [];
+  let paneSizeChanged = false;
+  /**
+   * Whether another window already had this terminal open when this one attached. Merely
+   * opening or resizing then adopts the shared size instead of reflowing the terminal under
+   * it; typing or changing an inline pane's box reclaims the size. Captured when attaching: the
+   * open flag includes this window afterwards, so it can't tell them apart any more.
+   */
+  let adoptSharedSize = false;
+  /** Sizes the shared PTY to this window, or this window to the shared PTY (see adoptSharedSize). */
+  const sendSize = (typing = false) => {
+    if (!mirror.ready || !opened || !net.up) return;
+    if (!host.clientWidth || !host.clientHeight) return;
+    if (typing || paneSizeChanged) adoptSharedSize = false;
+    paneSizeChanged = false;
+    if (!typing && adoptSharedSize) {
+      const w = store.worker(workerId);
+      if (w && (w.cols !== term.cols || w.rows !== term.rows)) term.resize(w.cols, w.rows);
+      return;
+    }
+    try {
+      const size = fit.proposeDimensions();
+      if (!size || !Number.isFinite(size.cols) || !Number.isFinite(size.rows)) return;
+      // Match WorkerManager.resize's limits so the server can acknowledge the exact request.
+      term.resize(Math.max(20, Math.min(400, size.cols)), Math.max(5, Math.min(200, size.rows)));
+    } catch {
+      return;
+    }
+    const key = `${term.cols}x${term.rows}`;
+    const w = store.worker(workerId);
+    if (w && (pendingSizes.length || w.cols !== term.cols || w.rows !== term.rows) && key !== lastSentSize) {
+      lastSentSize = key;
+      pendingSizes.push(key);
+      net.send({ t: 'term.resize', workerId, cols: term.cols, rows: term.rows });
+    }
+  };
+
+  const refresh = () => {
+    const w = store.worker(workerId);
+    if (!w) {
+      modal.close();
+      return;
+    }
+    header?.refresh(w);
+    paintTeam(w);
+    thread?.update(w, net.up);
+    if (thread) {
+      const asking = w.status === 'needs_input';
+      const question = thread.element.querySelector<HTMLElement>('.dash-question');
+      if (question) {
+        question.hidden = !asking;
+        if (asking && !question.childElementCount) {
+          question.replaceChildren(
+            h(
+              'div.dash-question-card.quiet',
+              { role: 'status' },
+              h('span.dash-question-icon', {}, '●'),
+              h('p', {}, `${w.name} is waiting for an answer. Answer its question in Raw TTY.`),
+              h('button.btn.sm', { type: 'button', onclick: () => setThreadView('raw') }, 'Open Raw TTY'),
+            ),
+          );
+        } else if (!asking) question.replaceChildren();
+      }
+    }
+    // Status updates can still carry the old size while our resize is in flight. Only a new
+    // PTY size not acknowledging one of our requests means another window claimed it.
+    const ptySize = `${w.cols}x${w.rows}`;
+    const changed = ptySize !== lastPtySize;
+    lastPtySize = ptySize;
+    const acknowledged = changed ? pendingSizes.indexOf(ptySize) : -1;
+    if (acknowledged >= 0) pendingSizes.splice(0, acknowledged + 1);
+    if (mirror.ready && changed && acknowledged < 0 && ptySize !== `${term.cols}x${term.rows}` && ptySize !== lastSentSize) {
+      adoptSharedSize = true;
+      term.resize(w.cols, w.rows);
+      lastSentSize = '';
+      pendingSizes.length = 0;
+    }
+  };
+
+  /** Scrolls a search hit into view and lights it up for a few seconds. */
+  const jumpTo = (f: TerminalFind) => {
+    const buf = term.buffer.active;
+    const row = findLine(buf, f.needle, f.fromEnd);
+    if (row === undefined) return toast('That line has scrolled out of the terminal since', 'warn');
+    let end = row;
+    while (buf.getLine(end + 1)?.isWrapped) end++;
+    // A marker follows the line when the terminal reflows, which it does as the window settles.
+    const marker = term.registerMarker(row - (buf.baseY + buf.cursorY));
+    if (!marker) return;
+    const mark = term.registerDecoration({ marker, width: term.cols, height: end - row + 1, backgroundColor: TERM_THEME.yellow, foregroundColor: TERM_THEME.background });
+    const scroll = () => {
+      if (marker.line < 0) return;
+      // xterm scrolls from where its scrollbar is, which lags behind a resize; from the top is exact.
+      term.scrollLines(-term.buffer.active.length);
+      term.scrollLines(Math.max(0, marker.line - Math.floor(term.rows / 3)));
+    };
+    scroll();
+    // The window settles its size just after it opens; stay on the line through that.
+    const follow = term.onResize(() => setTimeout(scroll, 50));
+    setTimeout(() => follow.dispose(), 1500);
+    setTimeout(() => {
+      mark?.dispose();
+      marker.dispose();
+    }, 8000);
+  };
+  let pendingFind = find;
+
+  const mirror = new TerminalMirror(
+    term,
+    (snapshot) => {
+      adoptSharedSize = snapshot.shared ?? adoptSharedSize;
+      lastSentSize = '';
+      pendingSizes.length = 0;
+      term.options.disableStdin = !net.up;
+      disconnected.classList.add('hidden');
+      sendSize();
+      term.scrollToBottom();
+      refresh();
+      if (pendingFind) jumpTo(pendingFind);
+      pendingFind = undefined;
+    },
+    () => net.send({ t: 'worker.attach', workerId }),
+  );
+  const onMsg = (msg: ServerMsg) => {
+    if (msg.t === 'term.data' && msg.workerId === workerId) mirror.data(msg.data);
+    else if (msg.t === 'term.snapshot' && msg.workerId === workerId) {
+      term.options.disableStdin = true;
+      mirror.snapshot(msg);
+    }
+  };
+  listeners.add(onMsg);
+  // A building agent (the Orchestrator) comes and goes with Mission Control state, not the floor's workers.
+  const offWorkers = store.on('workers', refresh);
+  const offMission = store.on('missionControl', refresh);
+  const unsub = () => {
+    offWorkers();
+    offMission();
+  };
+  const unsubCredits = store.on('factory', refresh);
+  let box: { width: number; height: number } | undefined;
+  const ro = new ResizeObserver(([entry]) => {
+    if (!entry) return;
+    const { width, height } = entry.contentRect;
+    if (width <= 0 || height <= 0) return;
+    // The initial observation is not a layout change and must not seize a shared terminal.
+    // Keep a change pending through snapshot loading/disconnection, without fitting hidden boxes.
+    if (inline && box && (width !== box.width || height !== box.height)) paneSizeChanged = true;
+    box = { width, height };
+    sendSize();
+  });
+  const offStatus = net.onStatus((up) => {
+    header?.refresh(store.worker(workerId) ?? info);
+    thread?.update(store.worker(workerId) ?? info, up);
+    if (up) return; // The welcome handler reattaches only after the authoritative worker snapshot.
+    mirror.disconnect();
+    term.options.disableStdin = true;
+    disconnected.classList.remove('hidden');
+  });
+
+  const onClose = () => {
+    thread?.dispose();
+    listeners.delete(onMsg);
+    unsub();
+    unsubCredits();
+    offStatus();
+    offQueries();
+    mirror.disconnect();
+    offFont();
+    ro.disconnect();
+    net.send({ t: 'worker.detach', workerId });
+    term.dispose();
+    alive = false;
+    if (current?.modal === modal) current = null;
+  };
+  let modal: Modal;
+  if (inline) {
+    let closed = false;
+    modal = {
+      el,
+      backdrop: inline.mount,
+      close() {
+        if (closed) return;
+        closed = true;
+        el.remove();
+        onClose();
+      },
+    };
+    inline.mount.replaceChildren(el);
+  } else
+    modal = openModal(el, {
+      backdropCloses: true,
+      // TUIs use Esc to back out of their own menus, so while you're typing in the terminal it goes
+      // to the program. Shift+Esc (or Ctrl+], or Esc once focus is off the terminal) leaves.
+      escCloses: (e) => {
+        if (e.shiftKey || !host.contains(document.activeElement)) return true;
+        if (!escHinted) {
+          escHinted = true;
+          hintToast('Esc went to the terminal. Shift+Esc or Ctrl+] leaves it');
+        }
+        return false;
+      },
+      onClose,
+    });
+  const csiEnter = () => wantsCsiEnter(store.worker(workerId)?.kind);
+  if (!inline)
+    current = {
+      workerId,
+      modal,
+      find: (f) => {
+        setThreadView('raw', false);
+        if (mirror.ready) jumpTo(f);
+        else pendingFind = f;
+      },
+    };
+  if (canThread && threadHost) {
+    const question = h('section.dash-question', { 'aria-label': 'Question requiring input', hidden: true });
+    thread = mountWorkerThread(net, {
+      worker: info,
+      question,
+      queueKey: `factory-flow.desk-queue:${workerId}`,
+      draft: threadDrafts.get(workerId) ?? '',
+      onDraft: (text) => (text ? threadDrafts.set(workerId, text) : threadDrafts.delete(workerId)),
+      send: async (msg) => {
+        const result = await net.request(msg);
+        return result.ok ? undefined : (result.error ?? 'The office refused that.');
+      },
+      screen: () => {
+        const s = store.screens.get(workerId);
+        return s && Array.from({ length: s.rows }, (_, i) => (s.lines[i] ?? []).map((run) => run[0]).join(''));
+      },
+      raw: () => setThreadView('raw'),
+      openChanges: onChanges
+        ? () => {
+            onChanges();
+            modal.close();
+          }
+        : undefined,
+      openWorker: (id) => openTeammate(id),
+      team: () => [...store.workers.values()],
+      floor: store.floor ?? undefined,
+    });
+    threadHost.append(thread.element);
+    thread.dropZone(threadHost);
+    let saved = 'thread';
+    try {
+      saved = localStorage.getItem(`${THREAD_VIEW_KEY}${workerId}`) ?? 'thread';
+    } catch {}
+    setThreadView = (next, focus = true) => {
+      if (!thread || !threadHost) return;
+      threadView = next === 'thread';
+      threadHost.hidden = !threadView;
+      host.hidden = threadView;
+      threadButton?.classList.toggle('on', threadView);
+      rawButton?.classList.toggle('on', !threadView);
+      threadButton?.setAttribute('aria-pressed', String(threadView));
+      rawButton?.setAttribute('aria-pressed', String(!threadView));
+      try {
+        localStorage.setItem(`${THREAD_VIEW_KEY}${workerId}`, next);
+      } catch {}
+      if (threadView) {
+        thread.activate(true);
+        term.options.disableStdin = true;
+      } else {
+        thread.activate(false);
+        net.send({ t: 'worker.attach', workerId });
+        term.options.disableStdin = !net.up;
+        sendSize();
+        if (focus) setTimeout(() => alive && term.focus(), 0);
+      }
+      refresh();
+    };
+    setThreadView(saved === 'raw' ? 'raw' : 'thread', false);
+  }
+  header?.zoom(termFontSize());
+  const offFont = onTermFontSize((px) => {
+    term.options.fontSize = px;
+    header?.zoom(px);
+    sendSize();
+  });
+
+  term.attachCustomKeyEventHandler((e) => {
+    if (e.ctrlKey && e.key === ']' && (!inline || inline.onLeave)) {
+      if (e.type === 'keydown') {
+        if (inline) inline.onLeave?.();
+        else modal.close();
+      }
+      return false;
+    }
+    if (!inline && e.key === 'Escape' && e.shiftKey) return false;
+    const action = kitty.keyAction(e, csiEnter());
+    if (action.do === 'default') return true;
+    if (action.do === 'send') {
+      e.preventDefault();
+      term.input(action.data);
+    }
+    return false;
+  });
+  term.onData((data) => {
+    if (!mirror.ready || !net.up) return;
+    sendSize(true);
+    net.send({ t: 'term.input', workerId, data });
+  });
+
+  // Files dropped in, or a screenshot pasted, go up to the office's machine and the terminal types
+  // where they are, as a terminal does with a file dragged into it: Droid attaches a picture.
+  let uploading = 0;
+  const insertFiles = async (files: File[]) => {
+    if (!files.length || threadView) return;
+    if (!mirror.ready || !net.up) return toast('Disconnected. No files were sent.', 'warn');
+    el.classList.toggle('uploading', ++uploading > 0);
+    try {
+      const paths = await Promise.all(files.map((f) => uploadDrop(workerId, f)));
+      if (!alive || !mirror.ready || !net.up) return;
+      sendSize(true);
+      term.paste(droppedPaths(paths));
+      term.focus();
+    } catch (err) {
+      toast((err as Error).message, 'warn');
+    } finally {
+      el.classList.toggle('uploading', --uploading > 0);
+    }
+  };
+  const hasFiles = (e: DragEvent) => !!e.dataTransfer?.types.includes('Files');
+  // The whole screen is the drop zone while the terminal is open, so a near miss doesn't open the file in the browser.
+  let dragDepth = 0;
+  const dragEnd = () => {
+    dragDepth = 0;
+    el.classList.remove('dropping');
+  };
+  modal.backdrop.addEventListener('dragenter', (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    dragDepth++;
+    el.classList.add('dropping');
+  });
+  modal.backdrop.addEventListener('dragover', (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer!.dropEffect = 'copy';
+  });
+  modal.backdrop.addEventListener('dragleave', (e) => {
+    if (hasFiles(e) && --dragDepth <= 0) dragEnd();
+  });
+  modal.backdrop.addEventListener('drop', (e) => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    dragEnd();
+    void insertFiles([...e.dataTransfer!.files]);
+  });
+  // A picture on the clipboard with no text (a screenshot) pastes like a dropped file. Caught on the
+  // way down, before xterm would paste it as nothing.
+  host.addEventListener(
+    'paste',
+    (e) => {
+      const files = [...(e.clipboardData?.files ?? [])];
+      if (!files.length || e.clipboardData?.getData('text/plain')) return;
+      e.preventDefault();
+      e.stopPropagation();
+      void insertFiles(files);
+    },
+    true,
+  );
+
+  refresh();
+  // xterm caches glyph widths when it opens. Opening after the shared font load prevents a
+  // slow first visit from retaining fallback measurements even after the icons arrive.
+  void loadFonts().then(() => {
+    if (!alive) return;
+    term.open(host);
+    opened = true;
+    ro.observe(host);
+    adoptSharedSize = store.worker(workerId)?.open === true;
+    net.send({ t: 'worker.attach', workerId });
+    setTimeout(() => {
+      if (alive && inline?.focus !== false && !threadView) term.focus();
+    }, 50);
+  });
+  if (!inline) return;
+  return {
+    workerId,
+    close: () => modal.close(),
+    focus: () => term.focus(),
+    attach: () => {
+      if (alive && opened) net.send({ t: 'worker.attach', workerId });
+    },
+  };
+}

@@ -1,0 +1,739 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { test } from 'node:test';
+import { latestThreadPlan, pageRows, presentThread, threadAction, threadArguments, threadArgumentsText, type ThreadRow } from '../src/shared/thread-presentation.js';
+import type { ThreadEntry } from '../src/shared/worker-thread.js';
+
+// Shapes observed in Byte's real local session, also shown in the owner's Android capture.
+const tool = (id: string, name: string, input: Record<string, unknown> = {}, extra: Partial<ThreadEntry> = {}): ThreadEntry => ({
+  id,
+  seq: Number(id.replace(/\D/g, '')) || 0,
+  role: 'assistant',
+  kind: 'tool',
+  name,
+  input: JSON.stringify(input),
+  output: 'Done',
+  ...extra,
+});
+const actionsOf = (row: ThreadRow | undefined) => (row?.kind === 'activity' ? row.blocks.flatMap((block) => (block.kind === 'tools' ? block.actions : [])) : []);
+/** The cancellations an activity's status line counts, which both clients show. */
+const cancelledOf = (row: ThreadRow | undefined) => Number((row?.kind === 'activity' && /(\d+) cancelled/.exec(row.status ?? '')?.[1]) || 0);
+const noResultOf = (row: ThreadRow | undefined) => Number((row?.kind === 'activity' && /(\d+) no result/.exec(row.status ?? '')?.[1]) || 0);
+const text = (id: string, role: 'user' | 'assistant' = 'assistant'): ThreadEntry => ({ id, seq: 0, role, kind: 'text', text: 'The release is published.' });
+const capturedEntries = (name: string): ThreadEntry[] =>
+  JSON.parse(readFileSync(new URL('../android/app/src/test/resources/thread-presentation-golden.json', import.meta.url), 'utf8')).cases.find((example: { name: string }) => example.name === name).entries;
+const capturedFailure = () => capturedEntries('unit_real_missing_read_causal_wrapper');
+const capturedCrash = () => capturedEntries('unit_real_crash_wrapper_flushed_by_a_later_stop');
+// The crash's Script and its interrupted child, with the wrapper's by-user result as if it had come in time.
+const capturedCancellation = () => {
+  const [wrapper, child] = capturedCrash();
+  return [{ ...wrapper, resultSeq: undefined }, child];
+};
+
+test('thoughts sit inside the Activity between messages, splitting its tool runs', () => {
+  const thought: ThreadEntry = { id: 'thought', seq: 2, kind: 'thinking', role: 'assistant', text: '**Deciding the next step**\nThe thought remains available without opening tool activity.' };
+  const rows = presentThread([tool('r1', 'Read'), thought, tool('e3', 'Execute')], true);
+  assert.deepEqual(
+    rows.map((row) => row.kind),
+    ['activity'],
+  );
+  const row = rows[0];
+  assert.ok(row.kind === 'activity');
+  assert.deepEqual(
+    row.blocks.map((block) => block.kind),
+    ['tools', 'thought', 'tools'],
+  );
+  assert.equal(row.blocks[1].kind === 'thought' && row.blocks[1].preview, 'Deciding the next step');
+  assert.deepEqual(
+    row.blocks.map((block) => block.live),
+    [false, false, true],
+  );
+  assert.equal(row.live, true);
+  assert.equal(row.label, 'Read a file · Ran a command');
+  assert.ok(
+    [row, ...row.blocks, ...actionsOf(row)].every((node) => node.open === false),
+    'every disclosure starts closed',
+  );
+  assert.deepEqual(
+    presentThread([thought], true).map((only) => only.kind === 'activity' && [only.label, only.blocks[0].live]),
+    [['Thought', true]],
+  );
+  assert.deepEqual(presentThread([{ ...thought, text: '  \n' }], false), []);
+});
+test('the reported release-check turn becomes one activity disclosure without bookkeeping', () => {
+  const rows = presentThread(
+    [
+      text('u', 'user'),
+      text('answer'),
+      tool('s1', 'Script', { code: 'await Promise.allSettled([...])' }),
+      tool('t2', 'TodoWrite', { todos: '1. [in_progress] Check release' }),
+      tool('r3', 'Read', { file_path: '/Users/dev/project/.factory-flow/floor-branch.json' }),
+      tool('e4', 'Execute', { command: 'gh pr view 307', summary: 'Check merge and release runs' }),
+      { id: 'todo', seq: 5, role: 'assistant', kind: 'todo', text: '1. [in progress] Check release' },
+      tool('s6', 'Script', { code: 'await Promise.allSettled([...])' }),
+      tool('e7', 'Execute', { command: 'gh release view v0.1.611', summary: 'Verify published release' }),
+      tool('t8', 'TodoWrite', { todos: '1. [completed] Check release' }),
+      text('final'),
+    ],
+    false,
+  );
+  assert.deepEqual(
+    rows.map((r) => r.kind),
+    ['message', 'message', 'activity', 'message'],
+  );
+  const row = rows[2];
+  assert.equal(row.kind, 'activity');
+  if (row.kind !== 'activity') return;
+  assert.equal(actionsOf(row).length, 3);
+  assert.equal(row.label, 'Read a file · Ran 2 commands');
+  assert.equal(row.state, 'complete');
+  assert.deepEqual(
+    actionsOf(row).map((a) => a.title),
+    ['Read floor-branch.json', 'Check merge and release runs', 'Verify published release'],
+  );
+  assert.ok(!JSON.stringify(actionsOf(row).map((a) => a.title)).includes('/Users/dev'));
+});
+
+test('standalone script results remain available without showing source as their title', () => {
+  const rows = presentThread([tool('s1', 'functions.Script', { code: 'secret source' })], false);
+  assert.equal(rows[0].kind, 'activity');
+  if (rows[0].kind !== 'activity') return;
+  assert.equal(actionsOf(rows[0])[0].title, 'Ran a script');
+  assert.equal(actionsOf(rows[0])[0].result, 'Result');
+});
+
+test('a turn with repeated command and script failures has the same quiet summary as other commands', () => {
+  const entries = [
+    tool('e1', 'Execute', { command: 'test -f missing', summary: 'Check for optional file' }, { error: true, output: 'Command failed (exit code: 1)' }),
+    tool('e2', 'Execute', { command: 'rg optional', summary: 'Find optional setting' }, { error: true, output: 'exit 1' }),
+    tool('s3', 'Script', { code: 'throw new Error("diagnostic")' }, { error: true, output: 'diagnostic' }),
+  ];
+  const row = presentThread(entries, false)[0];
+  assert.ok(row.kind === 'activity');
+  assert.equal(row.label, 'Ran 2 commands · Ran a script');
+  assert.equal(row.status, undefined);
+  assert.deepEqual(
+    actionsOf(row).map((action) => action.status),
+    ['', '', ''],
+  );
+  assert.equal(actionsOf(row)[2].title, 'Ran a script');
+  assert.ok(actionsOf(row).every((action) => !action.open && action.result === 'Error' && action.arguments));
+  assert.equal(entries[0].output, 'Command failed (exit code: 1)');
+  const stopped = presentThread([...entries, { id: 'turn:t:error', seq: 4, role: 'system', kind: 'notice', text: 'Turn ended · error' }], false);
+  assert.ok(stopped.some((item) => item.kind === 'notice' && item.tone === 'danger'));
+});
+
+test('failed wrappers and bookkeeping cannot be silently hidden', () => {
+  const rows = presentThread([tool('s1', 'Script', {}, { error: true }), tool('t2', 'TodoWrite', {}, { error: true }), tool('r3', 'Read')], false);
+  assert.equal(rows[0].kind, 'activity');
+  if (rows[0].kind !== 'activity') return;
+  assert.equal(rows[0].state, 'failed');
+  assert.equal(rows[0].failed.length, 2);
+  assert.equal(actionsOf(rows[0]).length, 3);
+});
+
+test('unit: the captured causal Script diagnostics stay accessible but only Read counts as failed', () => {
+  const entries = capturedFailure();
+  const row = presentThread(entries, false)[0];
+  assert.equal(row.kind, 'activity');
+  if (row.kind !== 'activity') return;
+  assert.equal(row.label, 'Read a file');
+  assert.equal(row.failed.length, 1);
+  assert.equal(row.failed[0].id, entries[1].id);
+  assert.match(row.failed[0].preview, /^Error reading file: ENOENT/);
+  assert.equal(actionsOf(row)[0].causedBy, entries[1].id);
+  assert.equal(actionsOf(row)[0].id, entries[0].id);
+  assert.equal(actionsOf(row)[0].state, 'failed');
+  assert.equal(row.state, 'failed');
+  assert.deepEqual(
+    row.sourceIds,
+    entries.map((entry) => entry.id),
+  );
+});
+
+test('unit variants of the capture never deduplicate unrelated or unproven wrapper failures', () => {
+  const [wrapper, child] = capturedFailure();
+  for (const output of [
+    wrapper.output?.replace('Error: tools.Read: Error reading file:', 'SyntaxError:'),
+    wrapper.output?.replace('"status":"failed"', '"status":"complete"'),
+    wrapper.output?.replace('"toolCallId":"call_', '"toolCallId":"other_'),
+    wrapper.output?.split('\n')[0],
+    wrapper.output?.replace('"status":"failed"', '"status":"failed","independentError":"SyntaxError"'),
+    wrapper.output?.replace(/{"toolCallId".*$/, '{invalid JSON'),
+    `${wrapper.output}\nAdditional independent failure`,
+    'SyntaxError: Unexpected token',
+  ]) {
+    const row = presentThread([{ ...wrapper, output }, child], false)[0];
+    assert.equal(row.kind, 'activity');
+    if (row.kind === 'activity') assert.equal(row.failed.length, 2, output);
+  }
+  for (const entries of [
+    [wrapper],
+    [wrapper, { ...child, error: false }],
+    [wrapper, { ...child, output: undefined }],
+    [wrapper, { ...child, output: 'An independent error' }],
+    [child, wrapper],
+    [wrapper, tool('next-script', 'Script'), child],
+  ]) {
+    const row = presentThread(entries, false)[0];
+    assert.equal(row.kind, 'activity');
+    if (row.kind === 'activity') assert.equal(actionsOf(row).find((action) => action.id === wrapper.id)?.causedBy, undefined);
+  }
+});
+
+test('todo snapshots never become repeated transcript cards', () => {
+  assert.deepEqual(presentThread([tool('t1', 'TodoWrite'), { id: 'todo', seq: 2, role: 'assistant', kind: 'todo', text: '1. [completed] Done' }], false), []);
+});
+
+test('a successful wrapper yields to a failed bookkeeping child, but not an unrelated earlier call', () => {
+  const rows = presentThread([tool('r1', 'Read'), tool('s2', 'Script'), tool('t3', 'TodoWrite', {}, { error: true })], false);
+  assert.equal(rows[0].kind, 'activity');
+  if (rows[0].kind === 'activity') {
+    assert.deepEqual(
+      actionsOf(rows[0]).map((a) => a.title),
+      ['Read a file', "Couldn't update the plan"],
+    );
+    assert.equal(rows[0].label, 'Read a file');
+  }
+  const standalone = presentThread([tool('r1', 'Read'), tool('s2', 'Script')], false);
+  if (standalone[0].kind === 'activity') assert.equal(actionsOf(standalone[0]).at(-1)?.title, 'Ran a script');
+});
+
+test('group IDs survive appends, result updates and busy state changes', () => {
+  const pending = tool('s1', 'Script', {}, { output: undefined });
+  const first = presentThread([text('user', 'user'), pending], true)[1];
+  const next = presentThread([text('user', 'user'), pending, tool('r2', 'Read')], true)[1];
+  assert.equal(first.id, next.id);
+  const done = presentThread([text('user', 'user'), { ...pending, output: 'Done' }, tool('r2', 'Read')], false)[1];
+  assert.equal(done.id, first.id);
+  if (done.kind === 'activity') assert.deepEqual(done.sourceIds, ['s1', 'r2']);
+});
+
+test('unknown results are not presented as successful and historical pending tools are not running', () => {
+  for (const [busy, expected] of [
+    [true, 'working'],
+    [false, 'incomplete'],
+  ] as const) {
+    const rows = presentThread([tool('e1', 'Execute', {}, { output: undefined })], busy);
+    assert.equal(rows[0].kind, 'activity');
+    if (rows[0].kind === 'activity') assert.equal(rows[0].state, expected);
+  }
+  const rows = presentThread([tool('e1', 'Execute', {}, { output: undefined }), text('answer')], true);
+  assert.equal(rows[0].kind, 'activity');
+  if (rows[0].kind === 'activity') assert.equal(rows[0].state, 'incomplete');
+});
+
+test('messages and cancellation form readable boundaries and do not disappear', () => {
+  const cancelled: ThreadEntry = { id: 'cancel', seq: 8, role: 'system', kind: 'notice', text: 'Turn cancelled' };
+  const rows = presentThread([tool('r1', 'Read'), text('commentary'), tool('e2', 'Execute'), cancelled, text('u', 'user')], false);
+  assert.deepEqual(
+    rows.map((r) => r.kind),
+    ['activity', 'message', 'activity', 'notice', 'message'],
+  );
+  assert.equal(rows[3].kind, 'notice');
+  if (rows[3].kind === 'notice') assert.equal(rows[3].text, 'Turn cancelled');
+});
+
+test('human summaries tolerate plain text, missing fields, namespaces and long paths', () => {
+  assert.equal(threadAction(tool('r1', 'Read', { file_path: 'C:\\project\\src\\main.ts' })).title, 'Read main.ts');
+  assert.equal(threadAction(tool('e2', 'functions.Execute', { summary: 'Run\n  release checks', command: 'raw command' })).title, 'Run');
+  assert.equal(threadAction(tool('g3', 'Grep', { pattern: 'auth token' })).title, 'Searched for “auth token”');
+  assert.equal(threadAction(tool('p4', 'ApplyPatch', {})).title, 'Edited files');
+  assert.equal(threadAction(tool('a5', 'AskUser')).title, 'Asked you a question');
+  assert.equal(threadAction(tool('x6', 'Custom_Tool', {}, { input: 'old format' })).title, 'Used custom tool');
+  assert.ok(threadAction(tool('r7', 'Read', { file_path: `/${'long'.repeat(50)}` })).title.length <= 90);
+});
+
+test('a real cancellation stays quiet without concealing an earlier genuine failure', () => {
+  const rows = presentThread(
+    [
+      tool('r1', 'Read', { file_path: '/missing' }, { error: true, output: 'File not found' }),
+      tool('e2', 'Execute', {}, { error: true, output: 'Tool execution cancelled by user' }),
+      { id: 'turn:t:cancelled', seq: 3, role: 'system', kind: 'notice', text: 'Turn cancelled' },
+    ],
+    false,
+  );
+  assert.equal(rows[0].kind, 'activity');
+  if (rows[0].kind !== 'activity') return;
+  assert.equal(cancelledOf(rows[0]), 1);
+  assert.equal(rows[0].status, '1 cancelled');
+  assert.equal(rows[0].failed.length, 1);
+  assert.equal(actionsOf(rows[0])[1].state, 'cancelled');
+  assert.equal(actionsOf(rows[0])[1].result, 'Cancelled');
+  // An exact by-user CLI result is itself owner evidence, even without a turn notice.
+  const explicit = presentThread([tool('e2', 'Execute', {}, { error: true, output: 'Tool execution cancelled by user' })], false)[0];
+  assert.equal(explicit.kind, 'activity');
+  if (explicit.kind === 'activity') {
+    assert.equal(explicit.state, 'cancelled');
+    assert.equal(actionsOf(explicit)[0].state, 'cancelled');
+    assert.equal(cancelledOf(explicit), 1);
+  }
+});
+
+test('unit: a crash wrapper flushed by a later Stop stays one failure, counted on its interrupted child', () => {
+  const entries = capturedCrash();
+  const original = JSON.stringify(entries);
+  const [wrapper, child] = entries;
+  const rows = presentThread(entries, false);
+  const row = rows[0];
+  assert.equal(row.kind, 'activity');
+  if (row.kind !== 'activity') return;
+  assert.equal(row.state, 'failed');
+  assert.equal(cancelledOf(row), 0);
+  assert.deepEqual(
+    row.failed.map((action) => action.id),
+    [child.id],
+  );
+  assert.deepEqual(
+    actionsOf(row).map((action) => action.state),
+    ['failed', 'failed'],
+  );
+  assert.equal(actionsOf(row)[0].causedBy, child.id);
+  assert.equal(actionsOf(row)[0].title, 'Ran a script');
+  assert.equal(row.label, 'Ran a command');
+  assert.equal(JSON.stringify(entries), original);
+  const stop = rows.find((item) => item.kind === 'activity' && item.id !== row.id);
+  assert.ok(stop?.kind === 'activity' && cancelledOf(stop) === 1 && !stop.failed.length, 'the later genuine Stop stays cancelled');
+  // An office from before resultSeq, or a by-user wrapper that came in time: the interrupted child still marks a crash.
+  for (const late of [
+    { ...wrapper, resultSeq: undefined },
+    { ...wrapper, resultSeq: child.seq + 1 },
+  ]) {
+    const again = presentThread([late, child], false)[0];
+    assert.ok(again.kind === 'activity' && again.failed.length === 1 && cancelledOf(again) === 0 && actionsOf(again)[0].causedBy === child.id);
+  }
+  const earlier = presentThread([{ ...wrapper, output: undefined, error: undefined, resultSeq: undefined }, child], false)[0];
+  assert.equal(earlier.id, row.id, 'late results preserve the activity key');
+});
+
+test('unit: a by-user result is owner evidence only when it came before a later message, notice or Script', () => {
+  const stopped = (resultSeq: number | undefined, between: ThreadEntry[] = [], last = 3) => {
+    const entries = [
+      tool('e1', 'Execute', {}, { error: true, output: 'Tool execution cancelled by user', resultSeq }),
+      ...between,
+      { id: 'turn:t:cancelled', seq: last, role: 'system', kind: 'notice', text: 'Turn cancelled' } as ThreadEntry,
+    ];
+    const row = presentThread(entries, false)[0];
+    return row.kind === 'activity' ? row.state : row.kind;
+  };
+  assert.equal(stopped(2), 'cancelled');
+  assert.equal(stopped(undefined), 'cancelled');
+  assert.equal(stopped(3, [tool('r2', 'Read')]), 'cancelled', 'calls of the same run are not a boundary');
+  assert.equal(stopped(4, [{ ...text('m2'), seq: 2 }]), 'failed');
+  assert.equal(stopped(4, [{ id: 'turn:x:completed', seq: 2, role: 'system', kind: 'notice', text: 'Turn ended · completed' }]), 'failed');
+  assert.equal(stopped(4, [tool('s2', 'Script', {}, { error: true, output: 'SyntaxError' })]), 'failed');
+  assert.equal(stopped(9), 'failed', 'a result past the loaded entries cannot be placed');
+});
+
+test('unit capture variants: malformed, truncated or unknown wrapper outcomes never prove owner cancellation', () => {
+  const [wrapper, child] = capturedCancellation();
+  for (const output of [
+    'Tool execution was interrupted',
+    'Tool execution was cancelled',
+    'Error: Tool execution cancelled by us',
+    'Error: Tool execution cancelled by user.json',
+    'Error: Tool execution cancelled by user\nSyntaxError: Unexpected token',
+    '{"error":"Error: Tool execution cancelled by user"}',
+  ]) {
+    const row = presentThread([{ ...wrapper, output }, child], false)[0];
+    assert.equal(row.kind, 'activity');
+    if (row.kind === 'activity') {
+      assert.equal(row.failed.length, 2, output);
+      assert.equal(cancelledOf(row), 0, output);
+    }
+  }
+  const row = presentThread([{ ...wrapper, error: false }, child], false)[0];
+  if (row.kind === 'activity') {
+    assert.equal(row.failed.length, 1, 'a non-error wrapper is not cancellation evidence');
+    assert.equal(cancelledOf(row), 0);
+  }
+});
+
+test('unit capture variants: owner-cancelled wrappers never conceal independent child or wrapper errors', () => {
+  const [wrapper, child] = capturedCancellation();
+  const missing = tool('read-cancelled-file', 'Read', { file_path: '/tmp/cancelled.json' }, { error: true, output: "Error reading file: ENOENT: no such file or directory, access '/tmp/cancelled.json'" });
+  for (const failedChild of [missing, { ...child, output: 'SyntaxError: Unexpected token' }, { ...child, output: 'Tool execution was interrupted by an external signal' }]) {
+    const row = presentThread([wrapper, failedChild], false)[0];
+    assert.equal(row.kind, 'activity');
+    if (row.kind === 'activity') {
+      assert.equal(row.failed.length, 1);
+      assert.equal(row.failed[0].id, failedChild.id);
+      assert.equal(cancelledOf(row), 1);
+      assert.equal(actionsOf(row)[0].causedBy, undefined);
+    }
+  }
+  const row = presentThread(
+    [
+      { ...wrapper, output: 'SyntaxError: Unexpected token' },
+      { ...child, output: 'Tool execution cancelled by user' },
+    ],
+    false,
+  )[0];
+  if (row.kind === 'activity') {
+    assert.equal(row.failed[0].id, wrapper.id);
+    assert.equal(cancelledOf(row), 1);
+  }
+});
+
+test('unit capture variants: owner evidence stays inside its Script and message boundaries', () => {
+  const [wrapper, child] = capturedCancellation();
+  const independent = tool('independent-script', 'Script', {}, { error: true, output: 'SyntaxError: Unexpected token' });
+  for (const entries of [
+    [wrapper, independent, child],
+    [child, wrapper, independent],
+  ]) {
+    const row = presentThread(entries, false)[0];
+    assert.equal(row.kind, 'activity');
+    if (row.kind === 'activity') {
+      assert.equal(row.failed.length, 2);
+      assert.equal(cancelledOf(row), 1);
+      assert.equal(actionsOf(row).find((action) => action.id === wrapper.id)?.causedBy, undefined);
+    }
+  }
+  const twice = presentThread([wrapper, child, { ...child, id: 'another-interrupted-call' }], false)[0];
+  if (twice.kind === 'activity') {
+    assert.equal(twice.failed.length, 2);
+    assert.equal(cancelledOf(twice), 0, 'interrupted children mark a crash, not a Stop');
+  }
+  const separated = presentThread([wrapper, text('boundary'), child], false);
+  assert.equal(separated[0].kind, 'activity');
+  assert.equal(separated[2].kind, 'activity');
+  if (separated[0].kind === 'activity' && separated[2].kind === 'activity') {
+    assert.equal(cancelledOf(separated[0]), 1);
+    assert.equal(separated[2].failed.length, 1);
+  }
+  const missing = presentThread([wrapper, { ...child, output: undefined, error: false }], false)[0];
+  if (missing.kind === 'activity') {
+    assert.equal(cancelledOf(missing), 1);
+    assert.equal(noResultOf(missing), 1);
+  }
+});
+
+test('unit: crash/resume interruption stays Failed without explicit owner evidence, even next to a cancellation notice', () => {
+  const child = capturedCrash()[1];
+  for (const entries of [[child], [child, { id: 'turn:unknown:cancelled', seq: 2, role: 'system', kind: 'notice', text: 'Turn cancelled' } as ThreadEntry]]) {
+    const row = presentThread(entries, false)[0];
+    assert.equal(row.kind, 'activity');
+    if (row.kind === 'activity') {
+      assert.equal(row.failed.length, 1);
+      assert.equal(cancelledOf(row), 0);
+      assert.equal(row.state, 'failed');
+    }
+  }
+});
+
+test('a filename mentioning cancelled cannot turn a genuine read failure into a cancellation', () => {
+  const rows = presentThread(
+    [
+      tool(
+        'r1',
+        'Read',
+        { file_path: '/tmp/office-clone-qeTy/floors/factory-flow/cancelled.json' },
+        { error: true, output: "Error reading file: ENOENT: no such file or directory, access '/tmp/office-clone-qeTy/floors/factory-flow/cancelled.json'" },
+      ),
+      { id: 'turn:t:cancelled', seq: 2, role: 'system', kind: 'notice', text: 'Turn cancelled' },
+    ],
+    false,
+  );
+  assert.equal(rows[0].kind, 'activity');
+  if (rows[0].kind === 'activity') {
+    assert.equal(rows[0].state, 'failed');
+    assert.equal(actionsOf(rows[0])[0].state, 'failed');
+    assert.equal(cancelledOf(rows[0]), 0);
+  }
+});
+
+test('read counts agree with the visible rows even when the same path was read twice', () => {
+  const rows = presentThread([tool('r1', 'Read', { file_path: '/same' }), tool('r2', 'Read', { file_path: '/same' })], false);
+  assert.equal(rows[0].kind, 'activity');
+  if (rows[0].kind === 'activity') {
+    assert.equal(rows[0].label, 'Read 2 files');
+    assert.equal(actionsOf(rows[0]).length, 2);
+  }
+});
+
+test('Loop management actions do not claim that a read or cancellation scheduled work', () => {
+  for (const [action, title] of [
+    ['list', 'Checked scheduled loops'],
+    ['pause', 'Paused a loop'],
+    ['resume', 'Resumed a loop'],
+    ['cancel', 'Cancelled a loop'],
+    ['create', 'Scheduled a loop'],
+  ]) {
+    assert.equal(threadAction(tool('l1', 'Loop', { action })).title, title);
+  }
+  assert.equal(threadAction(tool('l1', 'Loop', { action: 'cancel' }, { error: true })).title, "Couldn't cancel the loop");
+});
+
+test('task controls have meaningful summaries without claiming missing or failed results succeeded', () => {
+  for (const [name, input, done, pending, failed] of [
+    ['TaskStop', {}, 'Stopped a background task', 'Stopping a background task', "Couldn't stop the background task"],
+    ['Loop', { action: 'create' }, 'Scheduled a loop', 'Scheduling a loop', "Couldn't schedule the loop"],
+    ['Loop', { action: 'cancel' }, 'Cancelled a loop', 'Cancelling a loop', "Couldn't cancel the loop"],
+    ['Loop', { action: 'list' }, 'Checked scheduled loops', 'Checking scheduled loops', "Couldn't read scheduled loops"],
+    ['Loop', { action: 'pause' }, 'Paused a loop', 'Pausing a loop', "Couldn't pause the loop"],
+    ['Loop', { action: 'resume' }, 'Resumed a loop', 'Resuming a loop', "Couldn't resume the loop"],
+  ] as const) {
+    for (const [extra, expected] of [
+      [{}, done],
+      [{ output: undefined }, pending],
+      [{ error: true }, failed],
+    ] as const) {
+      const row = presentThread([tool('t1', name, input, extra)], false)[0];
+      assert.equal(row.kind, 'activity');
+      if (row.kind === 'activity') assert.equal(row.label, expected);
+    }
+  }
+  const row = presentThread([tool('s1', 'TaskStop'), tool('s2', 'TaskStop', {}, { error: true })], false)[0];
+  if (row.kind === 'activity') assert.equal(row.label, '2 attempts to stop background tasks');
+  const cancelled = presentThread([tool('s1', 'TaskStop', {}, { error: true, output: 'Tool execution cancelled by user' }), { id: 'turn:stop:cancelled', seq: 2, role: 'system', kind: 'notice', text: 'Turn cancelled' }], false)[0];
+  if (cancelled.kind === 'activity') assert.equal(cancelled.label, 'Background task stop cancelled');
+});
+
+test('tool failures stay inspectable without failure counts, status badges or hiding current work', () => {
+  const thought: ThreadEntry = { id: 'th', seq: 3, kind: 'thinking', role: 'assistant', text: 'Checking the build' };
+  const rows = presentThread(
+    [
+      tool('r1', 'Read', { file_path: '/missing' }, { error: true, output: '\n  File not found\nmore' }),
+      tool('e2', 'Execute', { summary: 'Build the app' }, { output: undefined }),
+      thought,
+      tool('e4', 'Execute', { summary: 'Run the tests' }, { output: undefined }),
+    ],
+    true,
+  );
+  const row = rows[0];
+  assert.ok(row.kind === 'activity');
+  assert.equal(row.state, 'failed');
+  assert.equal(row.status, '1 no result');
+  assert.equal(row.running, 'Run the tests');
+  assert.deepEqual(row.failed, [{ id: 'r1', title: 'Read missing', preview: 'File not found' }]);
+  assert.deepEqual(
+    actionsOf(row).map((action) => [action.state, action.status, action.result]),
+    [
+      ['failed', '', 'Error'],
+      ['incomplete', 'No result', 'Result'],
+      ['working', 'Running', 'Result'],
+    ],
+  );
+  assert.deepEqual([row.from, row.to, row.sourceIds], [1, 4, ['r1', 'e2', 'th', 'e4']]);
+  const idle = presentThread([tool('e1', 'Execute', {}, { output: undefined })], false)[0];
+  assert.ok(idle.kind === 'activity' && idle.status === '1 no result' && idle.running === undefined);
+});
+
+test('arguments are a reference into the entry, resolved without a second copy on the wire', () => {
+  const cases: [ThreadEntry, string, string][] = [
+    [tool('e1', 'Execute', { command: '  npm test  ' }), 'Command', 'npm test'],
+    [tool('s2', 'Script', { script: 'await tools.Read()' }), 'Script', 'await tools.Read()'],
+    [tool('s3', 'Script', { code: 'text(1)' }), 'Script', 'text(1)'],
+    [tool('p4', 'ApplyPatch', { input: '*** Begin Patch' }), 'Patch', '*** Begin Patch'],
+    [tool('p5', 'ApplyPatch', { patch: '*** Update File: a' }), 'Patch', '*** Update File: a'],
+    [tool('r6', 'Read', { file_path: '/a' }), 'Arguments', JSON.stringify({ file_path: '/a' })],
+    [{ ...tool('s7', 'Script'), input: JSON.stringify('raw source') }, 'Script', 'raw source'],
+    [{ ...tool('x8', 'Custom'), input: 'old format' }, 'Arguments', 'old format'],
+  ];
+  for (const [entry, label, shown] of cases) {
+    const ref = threadArguments(entry);
+    assert.equal(ref?.label, label, entry.id);
+    assert.equal(ref && threadArgumentsText(entry.input, ref), shown, entry.id);
+  }
+  assert.equal(threadArguments(tool('n9', 'Read')), undefined);
+  assert.equal(threadArgumentsText('not json', { label: 'Command', field: 'command' }), 'not json');
+});
+
+test('a page carries the rows standing for its entries, whole, and an earlier page only those before it', () => {
+  const entries = [text('u', 'user'), tool('r1', 'Read'), tool('r2', 'Read'), tool('r3', 'Read'), text('a')].map((entry, seq) => ({ ...entry, seq }));
+  const rows = presentThread(entries, false);
+  assert.deepEqual(
+    pageRows(rows, entries.slice(3)).map((row) => [row.id, row.from, row.to]),
+    [
+      ['activity:r1', 1, 3],
+      ['a', 4, 4],
+    ],
+  );
+  assert.deepEqual(
+    pageRows(rows, entries.slice(0, 2), 2).map((row) => row.id),
+    ['u', 'activity:r1'],
+  );
+  assert.deepEqual(pageRows(rows, []), []);
+});
+
+test('V3 card actions split exploration runs cleanly and carry change, command and delegation metadata', () => {
+  const thought: ThreadEntry = { id: 'th-5', seq: 5, role: 'assistant', kind: 'thinking', text: '**Planning delegation**' };
+  const entries: ThreadEntry[] = [
+    tool('r1', 'Read', { file_path: '/repo/src/a.ts' }, { seq: 1 }),
+    tool('g2', 'Grep', { pattern: 'foo' }, { seq: 2 }),
+    tool('m3', 'memory___recall', { query: 'conventions' }, { seq: 3 }),
+    tool('ed4', 'Edit', { file_path: '/repo/src/a.ts', old_str: 'const x = 1;', new_str: 'const x = 2;' }, { seq: 4 }),
+    thought,
+    tool('ex6', 'functions.Execute', { command: '  npm test -- --watch=false  ', summary: 'Run unit tests' }, { seq: 6 }),
+    tool(
+      'h7',
+      'factory-flow___team_hire',
+      { task: { title: 'Implement Web Thread UI', brief: 'Build cards' } },
+      {
+        seq: 7,
+        output: 'Hired Nibble (325ae2490bc6) [watching], working, desk-2.\nWorktree: /repo/.factory-flow/worktrees/nibble-325a on thread-v3-web from thread-view-phase-a.\nIt is working on the brief.',
+      },
+    ),
+    tool('f8', 'FetchUrl', { url: 'https://docs.factory.ai/llms.txt' }, { seq: 8 }),
+    tool('ms9', 'mcp__memory__save_memory', { text: 'note' }, { seq: 9 }),
+  ];
+
+  const rows = presentThread(entries, false);
+  assert.equal(rows.length, 1);
+  const row = rows[0];
+  assert.equal(row.kind, 'activity');
+  if (row.kind !== 'activity') return;
+
+  assert.deepEqual(
+    row.blocks.map((b) => (b.kind === 'thought' ? 'thought' : `tools:${b.card ?? 'explore'}:${b.actions.length}`)),
+    ['tools:explore:3', 'tools:change:1', 'thought', 'tools:command:1', 'tools:delegate:1', 'tools:explore:2'],
+  );
+
+  const changeBlock = row.blocks[1];
+  assert.ok(changeBlock.kind === 'tools' && changeBlock.card === 'change');
+  assert.equal(changeBlock.id, 'tools:ed4');
+  assert.equal(changeBlock.actions[0].changes?.[0]?.shortPath, '/repo/src/a.ts');
+  assert.equal(changeBlock.actions[0].changes?.[0]?.additions, 1);
+  assert.equal(changeBlock.actions[0].changes?.[0]?.deletions, 1);
+
+  const cmdBlock = row.blocks[3];
+  assert.ok(cmdBlock.kind === 'tools' && cmdBlock.card === 'command');
+  assert.deepEqual(cmdBlock.actions[0].command, {
+    command: 'npm test -- --watch=false',
+    summary: 'Run unit tests',
+  });
+
+  const delegateBlock = row.blocks[4];
+  assert.ok(delegateBlock.kind === 'tools' && delegateBlock.card === 'delegate');
+  assert.deepEqual(delegateBlock.actions[0].delegation, {
+    agent: 'Nibble',
+    summary: 'Implement Web Thread UI',
+    workerName: 'Nibble',
+    workerId: '325ae2490bc6',
+    branch: 'thread-v3-web',
+  });
+
+  const taskDelegate = presentThread([tool('tk1', 'Task', { subagent_type: 'explorer', description: 'Check callers' })], false)[0];
+  assert.ok(taskDelegate.kind === 'activity' && taskDelegate.blocks[0].kind === 'tools');
+  assert.deepEqual(taskDelegate.blocks[0].actions[0].delegation, {
+    agent: 'explorer',
+    role: 'explorer',
+    summary: 'Check callers',
+  });
+});
+
+test('latestThreadPlan tracks active steps and marks completed plans stale after a newer user message', () => {
+  assert.equal(latestThreadPlan([], false), undefined);
+  assert.equal(latestThreadPlan([text('u1', 'user')], false), undefined);
+
+  const inProgressEntries: ThreadEntry[] = [
+    { id: 'u1', seq: 1, role: 'user', kind: 'text', text: 'Build feature' },
+    tool('tw1', 'TodoWrite', { todos: '1. [completed] Read spec\n2. [in_progress] Write diff parser\n3. [pending] Run tests' }, { seq: 2 }),
+  ];
+  const active = latestThreadPlan(inProgressEntries, true);
+  assert.deepEqual(active, {
+    steps: [
+      { done: true, active: false, text: 'Read spec' },
+      { done: false, active: true, text: 'Write diff parser' },
+      { done: false, active: false, text: 'Run tests' },
+    ],
+    done: 1,
+    total: 3,
+    current: 'Write diff parser',
+    allDone: false,
+    stale: false,
+  });
+
+  const completedEntries: ThreadEntry[] = [...inProgressEntries, { id: 'td2', seq: 3, role: 'system', kind: 'todo', text: '1. [completed] Read spec\n2. [completed] Write diff parser\n3. [completed] Run tests' }];
+  const finished = latestThreadPlan(completedEntries, false);
+  assert.ok(finished);
+  assert.equal(finished.allDone, true);
+  assert.equal(finished.stale, false);
+  assert.equal(finished.current, undefined);
+
+  const withFollowUp: ThreadEntry[] = [...completedEntries, { id: 'u2', seq: 4, role: 'user', kind: 'text', text: 'Thanks, what about mobile?' }];
+  assert.equal(latestThreadPlan(withFollowUp, true)?.stale, false, 'not stale while busy');
+  assert.equal(latestThreadPlan(withFollowUp, false)?.stale, true, 'stale once idle after a newer user turn');
+});
+
+// A turn of edits: `n` Edit cards, each changing `lines` lines of its own file.
+const message = (id: string, seq: number, role: 'user' | 'assistant'): ThreadEntry => ({ id, seq, role, kind: 'text', text: 'Next.' });
+const edits = (prefix: string, from: number, n: number, lines = 1): ThreadEntry[] =>
+  Array.from({ length: n }, (_, i) => {
+    const seq = from + i;
+    const old = Array.from({ length: lines }, (_, l) => `old ${l}`).join('\n');
+    return tool(`${prefix}${seq}`, 'Edit', { file_path: `/repo/src/${prefix}${i}.ts`, old_str: old, new_str: old.replaceAll('old', 'new') }, { seq });
+  });
+const changesOf = (rows: ThreadRow[]) => rows.flatMap((row) => actionsOf(row).flatMap((action) => action.changes ?? []));
+
+test('every file diff starts collapsed, including small diffs in the latest turn', () => {
+  const rows = presentThread([message('u1', 1, 'user'), ...edits('a', 2, 2), message('m1', 10, 'assistant'), message('u2', 11, 'user'), ...edits('b', 12, 3), ...edits('c', 15, 1, 30), ...edits('d', 16, 2)], false);
+  const [older, latest] = [rows.slice(0, 3), rows.slice(3)];
+  assert.deepEqual(
+    changesOf(older).map((change) => change.open),
+    [false, false],
+  );
+  assert.deepEqual(
+    changesOf(latest).map((change) => [change.additions + change.deletions, change.open]),
+    [
+      [2, false],
+      [2, false],
+      [2, false],
+      [60, false],
+      [2, false],
+      [2, false],
+    ],
+  );
+});
+
+test('file changes stay individual tool segments instead of folding into card groups', () => {
+  const rows = presentThread([message('u1', 1, 'user'), ...edits('a', 2, 3), message('u2', 10, 'user'), ...edits('b', 11, 4)], false);
+  const activities = rows.filter((row) => row.kind === 'activity');
+  assert.deepEqual(
+    activities.map((row) => row.kind === 'activity' && row.segments?.map((segment) => segment.kind === 'tool' && segment.actionId)),
+    [
+      ['a2', 'a3', 'a4'],
+      ['b11', 'b12', 'b13', 'b14'],
+    ],
+  );
+  assert.equal(
+    activities.every((row) => row.kind === 'activity' && row.groups === undefined),
+    true,
+  );
+});
+
+test('two cards stay ungrouped', () => {
+  const [row] = presentThread(edits('a', 1, 2), false);
+  assert.equal(row.kind === 'activity' && row.groups, undefined);
+});
+
+test("a finished turn ends with what it changed; the latest turn's waits until it finishes", () => {
+  const entries = [
+    message('u1', 1, 'user'),
+    ...edits('a', 2, 2),
+    tool('a4', 'Edit', { file_path: '/repo/src/a0.ts', old_str: 'x', new_str: 'y\nz' }, { seq: 4 }),
+    message('m1', 5, 'assistant'),
+    message('u2', 6, 'user'),
+    ...edits('b', 7, 1),
+  ];
+  const rows = presentThread(entries, true);
+  const summary = rows.find((row) => row.id === 'm1');
+  assert.deepEqual(summary?.kind === 'message' && summary.turnChanges, {
+    count: 2,
+    additions: 4,
+    deletions: 3,
+    files: [
+      { path: '/repo/src/a0.ts', shortPath: '/repo/src/a0.ts', additions: 3, deletions: 2 },
+      { path: '/repo/src/a1.ts', shortPath: '/repo/src/a1.ts', additions: 1, deletions: 1 },
+    ],
+  });
+  assert.equal(rows.filter((row) => row.kind !== 'notice' && row.turnChanges).length, 1);
+  const done = presentThread(entries, false).at(-1);
+  assert.equal(done?.kind === 'activity' && done.turnChanges?.count, 1);
+});
+
+test('a failed edit changed nothing the turn counts', () => {
+  const [row] = presentThread([tool('e1', 'Edit', { file_path: '/repo/a.ts', old_str: 'a', new_str: 'b' }, { seq: 1, error: true, output: 'String not found' })], false);
+  assert.equal(row.kind === 'activity' && row.turnChanges, undefined);
+});

@@ -1,0 +1,111 @@
+name: Bug report
+description: Something in the office isn't working.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Remove passwords, tokens and private repository names from anything you paste.
+
+  - type: input
+    id: version
+    attributes:
+      label: factory-flow version or commit
+      description: For the Mac app, open Factory Flow → About Factory Flow. For a developer checkout, run `git rev-parse --short HEAD`.
+      placeholder: v0.1.68 or 35c4b32
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: The OS of the machine that runs the office. Production installs use the Mac app; other platforms are developer checkouts.
+      placeholder: macOS 26, or the OS of your developer checkout
+    validations:
+      required: true
+
+  - type: input
+    id: node
+    attributes:
+      label: Node version
+      description: For a developer checkout, output of `node --version`. The Mac app includes its own Node.
+      placeholder: v22.12.0
+    validations:
+      required: false
+
+  - type: input
+    id: model
+    attributes:
+      label: Droid model
+      description: The model the affected workers run, if it matters (from ~/.factory/settings.json, or "default").
+      placeholder: claude-sonnet-4-6 or default
+    validations:
+      required: false
+
+  - type: dropdown
+    id: floor
+    attributes:
+      label: Floor type
+      description: Where the affected floor's project is hosted.
+      multiple: true
+      options:
+        - GitHub
+        - GitLab
+        - Not related to a floor
+    validations:
+      required: true
+
+  - type: dropdown
+    id: client
+    attributes:
+      label: Client
+      description: How you were using the office when it happened.
+      multiple: true
+      options:
+        - Mac app
+        - Desktop browser
+        - Android companion
+    validations:
+      required: true
+
+  - type: input
+    id: client-details
+    attributes:
+      label: Browser
+      description: The browser and version.
+      placeholder: Chrome 140
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The smallest set of steps that shows the bug.
+      placeholder: |
+        1. Hire a worker at a desk
+        2. Open its terminal
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead. Screenshots and browser console errors help.
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Office log excerpt
+      description: For the Mac app, use Office → Show Office Log. For a developer checkout, paste the office's terminal output around the bug. For terminal problems, also include `.factory-flow/pty-host.log` from the affected floor's checkout.
+      render: text

@@ -1,0 +1,434 @@
+package ai.factory.droidoffice.core
+
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.int
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import kotlin.random.Random
+
+class WhiteboardTest {
+    private val atlas = """{"kind":"agent","id":"w1","name":"Atlas","color":"#ee6018"}"""
+    private val owner = """{"kind":"owner"}"""
+
+    private val board = """
+        {"rev":12,"selection":{"kind":"card","id":"c2"},"reads":{"owner":{"c1":5,"c2":12}},
+         "tombstones":[{"kind":"thread","id":"t9","card":"c2","rev":4,"author":$atlas,"at":1}],
+         "cards":[
+           {"id":"c1","kind":"html","title":"The plan","author":$atlas,"createdAt":100,"updatedAt":900,
+            "content":{"entry":"index.html"},"link":{"path":"docs/plan.html","dir":false,"status":"broken","reason":"gone"},
+            "threads":[
+              {"id":"t1","anchor":{"kind":"point","point":{"x":40,"y":80}},"resolved":true,
+               "messages":[{"id":"m1","author":$owner,"text":"Why?","at":200,"stamp":{"rev":3,"author":$owner}}],
+               "stamps":{"resolved":{"rev":3,"author":$owner},"anchor":{"rev":3,"author":$owner}}},
+              {"id":"t2","anchor":{"kind":"element","point":{"x":10,"y":20},"wbId":"x"},
+               "messages":[{"id":"m2","author":$atlas,"text":"Done","at":300,"stamp":{"rev":8,"author":$atlas}}],
+               "stamps":{"resolved":{"rev":2,"author":$owner},"anchor":{"rev":2,"author":$owner}}}
+            ],
+            "stickies":[{"id":"s1","text":"Ship it","color":"pink","anchor":{"kind":"point","point":{"x":0,"y":0}},"box":{"x":0,"y":0,"w":200,"h":120},
+              "stamps":{"text":{"rev":4,"author":$owner}}}],
+            "stamps":{"title":{"rev":1,"author":$atlas},"content":{"rev":1,"author":$atlas},"state":{}},"future":true},
+           {"id":"c2","kind":"canvas","title":"","author":$owner,"createdAt":100,"updatedAt":100,
+            "stamps":{"title":{"rev":2,"author":$owner}}}
+         ]}
+    """.trimIndent()
+
+    private fun decodeBoard(): WbBoard = OfficeJson.decodeFromString(WbBoard.serializer(), board)
+
+    private fun obj(s: String): JsonObject = Json.parseToJsonElement(s).jsonObject
+
+    @Test
+    fun readsASnapshotBoard() {
+        val b = decodeBoard()
+        assertEquals(12, b.rev)
+        val c1 = b.card("c1")!!
+        assertEquals("The plan", c1.title)
+        assertEquals(1, c1.openThreads)
+        assertEquals("broken", c1.link?.status)
+        assertEquals("pink", c1.stickies.single().color)
+        assertTrue(b.card("c2")!!.isCanvas)
+        // Same createdAt: the later one in the list comes first.
+        assertEquals(listOf("c2", "c1"), b.newestFirst().map { it.id })
+    }
+
+    @Test
+    fun changedMeansSomeoneElseChangedItSinceTheOwnerLooked() {
+        val b = decodeBoard()
+        // Atlas's reply at rev 8 is past the owner's read point 5.
+        assertTrue(b.changed("c1"))
+        // c2 was read at 12; its tombstone (rev 4) and the owner's own title are older or the owner's.
+        assertFalse(b.changed("c2"))
+        assertEquals(1, b.changedCards())
+        val c1 = b.card("c1")!!
+        assertTrue(b.threadChanged(c1, c1.threads[1]))
+        assertFalse(b.threadChanged(c1, c1.threads[0]))
+        // Held from before the screen moved the read point, it still marks the thread.
+        assertTrue(b.threadChangedSince(c1.threads[1], 5))
+        assertFalse(b.threadChangedSince(c1.threads[1], 8))
+    }
+
+    @Test
+    fun aRemovalBySomeoneElseCounts() {
+        val b = decodeBoard().copy(reads = mapOf(WB_OWNER to mapOf("c1" to 99, "c2" to 3)))
+        assertTrue(b.changed("c2"))
+        assertFalse(b.changed("c1"))
+    }
+
+    @Test
+    fun theViewLabels() {
+        val b = decodeBoard()
+        val c1 = b.card("c1")!!
+        assertEquals("Atlas · 1m ago · Link broken", WhiteboardView.meta(c1, onWall = false, now = 60_900))
+        assertEquals("You", WhiteboardView.author(WbAuthor()))
+        assertEquals("A worker", WhiteboardView.author(WbAuthor(kind = "agent", id = "w1")))
+        assertTrue(WhiteboardView.meta(b.card("c2")!!, onWall = true, now = 100).endsWith("Selected"))
+        assertEquals(listOf("t2", "t1"), WhiteboardView.threads(c1).map { it.id })
+        assertEquals("#ff9fc6", WhiteboardView.stickyColor("pink"))
+        assertEquals("#ffd866", WhiteboardView.stickyColor("plaid"))
+    }
+
+    @Test
+    fun imagePixelsMapToCanonicalPoints() {
+        val html = WbImageInfo(width = 1280, height = 3000)
+        assertEquals(WbPoint(10.0, 20.0), html.toCanonical(10.0, 20.0))
+        val canvas = WbImageInfo(origin = WbPoint(-100.0, 50.0), scale = 2.0)
+        assertEquals(WbPoint(-95.0, 60.0), canvas.toCanonical(10.0, 20.0))
+        assertEquals(WbPoint(10.0, 20.0), canvas.toImage(canvas.toCanonical(10.0, 20.0)))
+    }
+
+    @Test
+    fun opsAreTheOfficesLiterals() {
+        val add = WbOps.commentAdd("c1", "t1", "m1", WbPoint(12.345, 67.891), "Tighten this")
+        assertEquals("comment.add", add["op"]!!.jsonPrimitive.content)
+        assertEquals("point", add["anchor"]!!.jsonObject["kind"]!!.jsonPrimitive.content)
+        assertEquals("12.3", add["anchor"]!!.jsonObject["point"]!!.jsonObject["x"]!!.jsonPrimitive.content)
+        assertEquals("Tighten this", add["text"]!!.jsonPrimitive.content)
+        assertEquals("""{"op":"comment.reply","card":"c1","thread":"t1","message":"m2","text":"ok"}""", WbOps.commentReply("c1", "t1", "m2", "ok").toString())
+        assertEquals("""{"op":"comment.edit","card":"c1","thread":"t1","message":"m1","text":"fixed"}""", WbOps.commentEdit("c1", "t1", "m1", "fixed").toString())
+        assertEquals("""{"op":"comment.resolve","card":"c1","thread":"t1"}""", WbOps.commentResolve("c1", "t1").toString())
+        assertEquals("""{"op":"comment.reopen","card":"c1","thread":"t1"}""", WbOps.commentReopen("c1", "t1").toString())
+        assertEquals("""{"op":"read","cards":["c1"],"rev":12}""", WbOps.read(listOf("c1"), 12).toString())
+        assertEquals("""{"op":"show","selection":{"kind":"grid"}}""", WbOps.show(null).toString())
+        assertEquals("""{"op":"show","selection":{"kind":"card","id":"c1"}}""", WbOps.show("c1").toString())
+        val id = WbOps.newId("t", Random(1))
+        assertTrue(Regex("^[a-z0-9][a-z0-9_-]{0,63}$").matches(id))
+    }
+
+    private class Wire {
+        val sent = mutableListOf<JsonObject>()
+        var open = true
+        val sync = WhiteboardSync { s -> if (open) sent += Json.parseToJsonElement(s).jsonObject; open }
+        fun of(t: String) = sent.filter { it["t"]!!.jsonPrimitive.content == t }
+        fun clear() = sent.clear()
+    }
+
+    private fun snapshot(floor: String, epoch: String, rev: Int = 12) = obj(
+        """{"t":"whiteboard","floor":"$floor","update":{"kind":"snapshot","epoch":"$epoch","board":${board.replace("\"rev\":12,\"selection\"", "\"rev\":$rev,\"selection\"")}},
+            "renderer":{"available":false,"reason":"No browser yet"}}""",
+    )
+
+    private fun update(floor: String, u: String) = obj("""{"t":"whiteboard","floor":"$floor","update":$u}""")
+
+    @Test
+    fun aSnapshotMakesTheFloorLive() {
+        val w = Wire()
+        w.sync.status(true)
+        w.sync.welcome("home")
+        assertTrue(w.sync.handle("whiteboard", snapshot("home", "e1")))
+        val f = w.sync.floor("home")!!
+        assertTrue(f.live)
+        assertEquals(12L, f.board?.rev)
+        assertEquals("No browser yet", f.renderer.reason)
+        assertFalse(w.sync.handle("worker.update", obj("{}")))
+    }
+
+    @Test
+    fun batchesAreNumberedInTheirEpochAndSettledByTheirAck() {
+        val w = Wire()
+        w.sync.status(true)
+        w.sync.welcome("home")
+        w.sync.handle("whiteboard", snapshot("home", "e1"))
+        val results = mutableListOf<WbResult>()
+        w.sync.apply("home", listOf(WbOps.show("c1"))) { results += it }
+        w.sync.apply("home", listOf(WbOps.show(null))) { results += it }
+        val batches = w.of("whiteboard.apply")
+        assertEquals(listOf(1, 2), batches.map { it["envelope"]!!.jsonObject["seq"]!!.jsonPrimitive.int })
+        assertEquals("e1", batches[0]["envelope"]!!.jsonObject["epoch"]!!.jsonPrimitive.content)
+        assertEquals(2, w.sync.floor("home")!!.pending)
+
+        w.sync.handle("whiteboard", update("home", """{"kind":"rejected","epoch":"e1","seq":2,"reason":"invalid","error":{"index":0,"reason":"no such card","message":"x"}}"""))
+        w.sync.handle("whiteboard", update("home", """{"kind":"ack","epoch":"e1","seq":1,"rev":13}"""))
+        assertEquals(listOf(WbResult.Invalid("no such card"), WbResult.Ok(13)), results)
+        assertEquals(0, w.sync.floor("home")!!.pending)
+    }
+
+    @Test
+    fun aBatchNotYetAcknowledgedGoesAgainInItsOwnEpochAfterAReconnect() {
+        val w = Wire()
+        w.sync.status(true)
+        w.sync.welcome("home")
+        w.sync.handle("whiteboard", snapshot("home", "e1"))
+        var result: WbResult? = null
+        w.sync.apply("home", listOf(WbOps.read(listOf("c1"), 12))) { result = it }
+        w.sync.status(false)
+        assertFalse(w.sync.floor("home")!!.live)
+        w.clear()
+
+        w.sync.status(true)
+        w.sync.welcome("home")
+        w.sync.handle("whiteboard", snapshot("home", "e2"))
+        val again = w.of("whiteboard.apply").single()["envelope"]!!.jsonObject
+        assertEquals("e1", again["epoch"]!!.jsonPrimitive.content)
+        assertEquals(1, again["seq"]!!.jsonPrimitive.int)
+
+        w.sync.handle("whiteboard", update("home", """{"kind":"rejected","epoch":"e1","seq":1,"reason":"expired"}"""))
+        assertEquals(WbResult.Expired, result)
+    }
+
+    @Test
+    fun leavingTheOfficeEndsWhatIsStillWaiting() {
+        val w = Wire()
+        w.sync.status(true)
+        w.sync.welcome("home")
+        var result: WbResult? = null
+        w.sync.apply("home", listOf(WbOps.show(null))) { result = it }
+        w.sync.close()
+        assertEquals(WbResult.Expired, result)
+        assertTrue(w.sync.all().isEmpty())
+    }
+
+    @Test
+    fun aBatchMadeBeforeTheSnapshotWaitsForItsEpoch() {
+        val w = Wire()
+        w.sync.status(true)
+        w.sync.welcome("home")
+        w.sync.apply("home", listOf(WbOps.show(null)))
+        assertTrue(w.of("whiteboard.apply").isEmpty())
+        assertEquals("home", w.of("whiteboard.sync").single()["floor"]!!.jsonPrimitive.content)
+        w.sync.handle("whiteboard", snapshot("home", "e7"))
+        val env = w.of("whiteboard.apply").single()["envelope"]!!.jsonObject
+        assertEquals("e7", env["epoch"]!!.jsonPrimitive.content)
+        assertEquals(1, env["seq"]!!.jsonPrimitive.int)
+        assertEquals("show", env["ops"]!!.jsonArray.single().jsonObject["op"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun aCommittedPatchFetchesAFreshSnapshotOnlyWhileWatchedAndOneAtATime() {
+        val w = Wire()
+        w.sync.status(true)
+        w.sync.welcome("home")
+        w.sync.handle("whiteboard", snapshot("home", "e1"))
+        w.clear()
+
+        w.sync.handle("whiteboard", update("home", """{"kind":"patch","patch":{"rev":13,"at":1,"actor":$atlas,"ops":[]}}"""))
+        assertTrue(w.of("whiteboard.sync").isEmpty())
+        w.sync.watching = true
+        assertEquals(1, w.of("whiteboard.sync").size)
+
+        // Two more while that snapshot is on its way: one more request once it lands.
+        w.sync.handle("whiteboard", update("home", """{"kind":"patch","patch":{"rev":14,"at":1,"actor":$atlas,"ops":[]}}"""))
+        w.sync.handle("whiteboard", update("home", """{"kind":"patch","patch":{"rev":15,"at":1,"actor":$atlas,"ops":[]}}"""))
+        assertEquals(1, w.of("whiteboard.sync").size)
+        w.sync.handle("whiteboard", snapshot("home", "e1", rev = 13))
+        assertEquals(2, w.of("whiteboard.sync").size)
+        w.sync.handle("whiteboard", snapshot("home", "e1", rev = 15))
+        assertEquals(2, w.of("whiteboard.sync").size)
+
+        // A patch the snapshot already has asks for nothing.
+        w.sync.handle("whiteboard", update("home", """{"kind":"patch","patch":{"rev":15,"at":1,"actor":$atlas,"ops":[]}}"""))
+        assertEquals(2, w.of("whiteboard.sync").size)
+    }
+
+    @Test
+    fun capabilitiesAndTheCardsAsSentAreKeptForTheLivePage() {
+        val w = Wire()
+        w.sync.status(true)
+        w.sync.welcome("home")
+        val capped = obj(snapshot("home", "e1").toString().removeSuffix("}") + ""","caps":{"c1":"kOne","c2":7}}""")
+        w.sync.handle("whiteboard", capped)
+        var f = w.sync.floor("home")!!
+        assertEquals(mapOf("c1" to "kOne"), f.caps)
+        // Exactly as sent, fields the app doesn't model included.
+        assertEquals("true", f.cards["c1"]!!["future"]!!.jsonPrimitive.content)
+        assertEquals(setOf("c1", "c2"), f.cards.keys)
+        // A patch adds the capabilities of the cards it made.
+        w.sync.handle("whiteboard", obj("""{"t":"whiteboard","floor":"home","update":{"kind":"patch","patch":{"rev":13,"at":1,"actor":$atlas,"ops":[]}},"caps":{"c3":"kThree"}}"""))
+        assertEquals(mapOf("c1" to "kOne", "c3" to "kThree"), w.sync.floor("home")!!.caps)
+        // A snapshot from an office that sends none keeps them.
+        w.sync.handle("whiteboard", snapshot("home", "e1", rev = 13))
+        f = w.sync.floor("home")!!
+        assertEquals("kThree", f.caps["c3"])
+    }
+
+    @Test
+    fun theMarksSomeoneElseChanged() {
+        val b = decodeBoard()
+        val c1 = b.card("c1")!!
+        // Atlas replied in t2 at rev 8; everything else is the owner's.
+        assertEquals(setOf("t2"), b.changedMarks(c1, since = 5))
+        assertEquals(emptySet<String>(), b.changedMarks(c1, since = 8))
+    }
+
+    @Test
+    fun theLivePagesOpsAreTheOfficesLiterals() {
+        val anchor = obj("""{"kind":"element","point":{"x":1,"y":2},"wbId":"x"}""")
+        assertEquals(anchor, WbOps.commentAdd("c1", "t1", "m1", anchor, "Here")["anchor"])
+        assertEquals("""{"kind":"point","point":{"x":1.5,"y":2.0}}""", WbOps.pointAnchor(WbPoint(1.54, 2.0)).toString())
+        assertEquals("""{"op":"sticky.edit","card":"c1","id":"s1","text":"Hi"}""", WbOps.stickyEdit("c1", "s1", text = "Hi").toString())
+        assertEquals("""{"op":"sticky.edit","card":"c1","id":"s1","color":"blue"}""", WbOps.stickyEdit("c1", "s1", color = "blue").toString())
+        assertEquals("""{"op":"sticky.rm","card":"c1","id":"s1"}""", WbOps.stickyRm("c1", "s1").toString())
+    }
+
+    @Test
+    fun rendersAndTheRendererAreKept() {
+        val w = Wire()
+        w.sync.status(true)
+        w.sync.welcome("home")
+        w.sync.handle("whiteboard.rendered", obj("""{"t":"whiteboard.rendered","floor":"home","card":"c1","info":{"rev":12,"at":5000,"current":true}}"""))
+        w.sync.handle("whiteboard.renderer", obj("""{"t":"whiteboard.renderer","status":{"available":true}}"""))
+        val f = w.sync.floor("home")!!
+        assertEquals(5000L, f.renders["c1"]?.at)
+        assertTrue(f.renders["c1"]!!.current)
+        assertTrue(f.renderer.available)
+    }
+
+    @Test
+    fun movingFloorsTakesTheOldOneOffLive() {
+        val w = Wire()
+        w.sync.status(true)
+        w.sync.welcome("home")
+        w.sync.handle("whiteboard", snapshot("home", "e1"))
+        w.sync.enter("api")
+        assertFalse(w.sync.floor("home")!!.live)
+        w.sync.handle("whiteboard", snapshot("api", "e2"))
+        assertTrue(w.sync.floor("api")!!.live)
+    }
+
+    private fun worker(status: String, kind: String = "agent", name: String = "Atlas", extra: String = "") =
+        OfficeJson.decodeFromString(WorkerInfo.serializer(), """{"id":"${name.lowercase()}","kind":"$kind","name":"$name","status":"$status"$extra}""")
+
+    @Test
+    fun pingEligibilityFollowsTheOffice() {
+        assertEquals(PingCheck.Ok("type"), WhiteboardPing.eligibility(worker("idle")))
+        assertEquals(PingCheck.Ok("type"), WhiteboardPing.eligibility(worker("done")))
+        assertEquals(PingCheck.Ok("resume"), WhiteboardPing.eligibility(worker("exited")))
+        assertEquals(PingCheck.Ok("queue"), WhiteboardPing.eligibility(worker("working")))
+        assertTrue((WhiteboardPing.eligibility(worker("needs_input")) as PingCheck.No).reason.contains("waiting on an answer"))
+        assertTrue((WhiteboardPing.eligibility(worker("idle", kind = "shell")) as PingCheck.No).reason.contains("plain shell"))
+        assertTrue((WhiteboardPing.eligibility(worker("idle", extra = ""","lost":{"branch":"droid/atlas"}""")) as PingCheck.No).reason.contains("Rebuild"))
+    }
+
+    @Test
+    fun pingableWorkersComeFirst() {
+        val order = WhiteboardPing.order(listOf(worker("needs_input", name = "Ash"), worker("working", kind = "droid", name = "Bolt"), worker("idle", name = "Cleo")))
+        assertEquals(listOf("Cleo", "Bolt", "Ash"), order.map { it.first.name })
+        assertTrue((order[1].second as PingCheck.No).busy)
+    }
+
+    @Test
+    fun theCardsAuthorComesFirst() {
+        val ws = listOf(worker("needs_input", name = "Ash"), worker("idle", name = "Cleo"))
+        assertEquals(listOf("Ash", "Cleo"), WhiteboardPing.order(ws, "ash").map { it.first.name })
+        assertEquals(listOf("Cleo", "Ash"), WhiteboardPing.order(ws, "gone").map { it.first.name })
+        assertNull(WhiteboardPing.author(null))
+    }
+
+    @Test
+    fun readsWhatThePingDid() {
+        val ok = WbPinged.of(obj("""{"t":"whiteboard.pinged","worker":"w1","ok":true,"how":"queue"}"""))!!
+        assertTrue(ok.ok)
+        assertEquals("Atlas will look at the board after its current turn", WhiteboardPing.outcome("Atlas", ok.how))
+        val no = WbPinged.of(obj("""{"t":"whiteboard.pinged","worker":"w1","ok":false,"error":"Atlas is busy"}"""))!!
+        assertFalse(no.ok)
+        assertNull(no.how)
+        assertEquals("Atlas is busy", no.error)
+        assertEquals("""{"t":"whiteboard.ping","worker":"w1"}""", WbPinged.ping("w1"))
+    }
+
+    private fun page(by: String) =
+        OfficeJson.decodeFromString(WbCard.serializer(), """{"id":"c1","stamps":{"title":{"rev":1,"author":$owner},"content":{"rev":2,"author":$by}}}""")
+
+    @Test
+    fun buttonsTellWhoeverLastEditedThePage() {
+        val atlasPage = page("""{"kind":"worker","id":"atlas","name":"Atlas","color":"#ee6018"}""")
+        assertEquals(ButtonTarget.To("atlas", "Atlas"), WhiteboardPing.buttonTarget(atlasPage, listOf(worker("idle", name = "Bolt"), worker("working"))))
+        assertEquals(ButtonTarget.No("Atlas is no longer on this floor."), WhiteboardPing.buttonTarget(atlasPage, listOf(worker("idle", name = "Bolt"))))
+        assertTrue((WhiteboardPing.buttonTarget(atlasPage, listOf(worker("idle", kind = "shell"))) as ButtonTarget.No).reason.contains("can't take messages"))
+        assertTrue((WhiteboardPing.buttonTarget(atlasPage, listOf(worker("idle", extra = ""","lost":{"branch":"droid/atlas"}"""))) as ButtonTarget.No).reason.contains("Rebuild"))
+        // The owner's own page, or a canvas with no page at all, has nobody to tell.
+        assertTrue((WhiteboardPing.buttonTarget(page(owner), listOf(worker("idle"))) as ButtonTarget.No).reason.startsWith("You made this page"))
+        val canvas = OfficeJson.decodeFromString(WbCard.serializer(), """{"id":"c2","kind":"canvas"}""")
+        assertTrue(WhiteboardPing.buttonTarget(canvas, listOf(worker("idle"))) is ButtonTarget.No)
+    }
+
+    @Test
+    fun saysWhereAButtonPressWent() {
+        val to = ButtonTarget.To("atlas", "Atlas")
+        assertEquals("Sent “Accept” to Atlas.", WhiteboardPing.sent("Accept", to, worker("working")))
+        assertEquals("Sent “Accept” to Atlas, waking it up.", WhiteboardPing.sent("Accept", to, worker("offline")))
+        assertEquals("Sent “Accept” to Atlas. It gets it once you answer the question in its terminal.", WhiteboardPing.sent("Accept", to, worker("needs_input")))
+        assertEquals("Sent “Accept” to Atlas. It gets it once it has started.", WhiteboardPing.sent("Accept", to, worker("starting")))
+        assertEquals("Sent “Accept” to Atlas.", WhiteboardPing.sent("Accept", to, worker("offline", extra = ""","remote":true""")))
+        assertEquals("Sent “Accept”.", WhiteboardPing.sent("Accept", ButtonTarget.No("Gone."), null))
+    }
+
+    @Test
+    fun formatBadgesFiltersNeighborsAndTimecodesMatchTheOffice() {
+        val hash = "a".repeat(64)
+        val multi = OfficeJson.decodeFromString(
+            WbBoard.serializer(),
+            """
+            {"rev":20,"reads":{"owner":{"c1":5,"c2":20,"c3":20,"c4":20}},
+             "cards":[
+               {"id":"c1","kind":"html","title":"Architecture RFC","author":$atlas,"createdAt":100,"updatedAt":900,
+                "content":{"entry":"index.html","format":"markdown","files":{"index.html":{"hash":"$hash","size":10,"mime":"text/html"},"document.md":{"hash":"$hash","size":5,"mime":"text/markdown"}}},
+                "threads":[{"id":"t1","resolved":false,"messages":[{"id":"m1","author":$owner,"text":"Check @01:24 and (@12.5s) or @1:02:03","at":200,"stamp":{"rev":9,"author":$atlas}}]}],
+                "stamps":{"title":{"rev":8,"author":$atlas}}},
+               {"id":"c2","kind":"html","title":"Launch take","author":$owner,"createdAt":200,"updatedAt":200,
+                "content":{"entry":"index.html","files":{"index.html":{"hash":"$hash","size":10,"mime":"text/html"},"video.mp4":{"hash":"$hash","size":50,"mime":"video/mp4"}}}},
+               {"id":"c3","kind":"html","title":"Hero shot","author":$owner,"createdAt":300,"updatedAt":300,
+                "content":{"entry":"index.html","files":{"index.html":{"hash":"$hash","size":10,"mime":"text/html"},"image.png":{"hash":"$hash","size":50,"mime":"image/png"}}}},
+               {"id":"c4","kind":"canvas","title":"Brainstorm","author":$owner,"createdAt":400,"updatedAt":400,
+                "stickies":[{"id":"s1","text":"Pricing notes","color":"yellow"}]}
+             ]}
+            """.trimIndent(),
+        )
+        assertEquals("MD", WhiteboardView.formatBadge(multi.card("c1")!!))
+        assertEquals("VIDEO", WhiteboardView.formatBadge(multi.card("c2")!!))
+        assertEquals("IMG", WhiteboardView.formatBadge(multi.card("c3")!!))
+        assertEquals("CANVAS", WhiteboardView.formatBadge(multi.card("c4")!!))
+
+        val counts = WhiteboardView.filterCounts(multi)
+        assertEquals(4, counts["all"])
+        assertEquals(1, counts["changed"])
+        assertEquals(1, counts["comments"])
+        assertEquals(1, counts["markdown"])
+        assertEquals(1, counts["video"])
+        assertEquals(1, counts["image"])
+        assertEquals(1, counts["canvas"])
+        assertEquals(0, counts["html"])
+
+        assertEquals(listOf("c4", "c3", "c2", "c1"), WhiteboardView.filterCards(multi).map { it.id })
+        assertEquals(listOf("c1"), WhiteboardView.filterCards(multi, filter = "markdown").map { it.id })
+        assertEquals(listOf("c2"), WhiteboardView.filterCards(multi, filter = "video").map { it.id })
+        assertEquals(listOf("c1"), WhiteboardView.filterCards(multi, query = "atlas").map { it.id })
+        assertEquals(listOf("c4"), WhiteboardView.filterCards(multi, query = "pricing").map { it.id })
+        assertEquals(listOf("c1"), WhiteboardView.filterCards(multi, query = "01:24").map { it.id })
+
+        assertEquals(WbNeighbors(prev = null, next = "c3", index = 0, total = 4), WhiteboardView.neighbors(multi, "c4"))
+        assertEquals(WbNeighbors(prev = "c4", next = "c2", index = 1, total = 4), WhiteboardView.neighbors(multi, "c3"))
+        assertEquals(WbNeighbors(prev = "c2", next = null, index = 3, total = 4), WhiteboardView.neighbors(multi, "c1"))
+        assertNull(WhiteboardView.neighbors(multi, "missing"))
+
+        assertEquals(
+            listOf(WbTimecode("@01:24", 84.0), WbTimecode("@12.5s", 12.5), WbTimecode("@1:02:03", 3723.0)),
+            WhiteboardView.timecodes(multi.card("c1")!!.threads.single().messages.single().text),
+        )
+    }
+}

@@ -1,0 +1,482 @@
+import { mkdirSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { app, type BaseWindow, dialog, Menu, type MenuItemConstructorOptions, shell, type WebContents } from 'electron';
+import { downloadBrowser } from './browser.js';
+import { createCompanionWindow } from './companion.js';
+import { companionWindowMenu, sendCompanionCommand } from './companion-commands.js';
+import { editMenu } from './edit-menu.js';
+import { fetchStatus, type Office, probePort, startOffice } from './office.js';
+import { officeRuntime } from './runtime.js';
+import { DEFAULT_PORT, defaultOfficeDir, type DesktopSettings, isolatedPortOk, loadSettings, officeArgs, saveSettings } from './settings.js';
+import { desktopEnv } from './shell-path.js';
+import { enforceRequirements, isStartupCheck, runStartupCheck, StartupAborted } from './startup.js';
+import { OfficeTray } from './tray.js';
+import { parseStatus, type TrayAction, trayTitle, type TrayView } from './tray-model.js';
+import { Updates } from './updates.js';
+import { serveHostUpdates } from './update-ipc.js';
+import { saveUpdateWindows, takeUpdateWindows } from './update-windows.js';
+
+const BACKGROUND = '#050505';
+
+/** How many ports past the chosen one to try when something that isn't an office holds it. */
+const PORT_TRIES = 20;
+/** How often the menu bar icon asks the office what it's doing. */
+const TRAY_REFRESH_MS = 5000;
+
+// Not ~/Library/Application Support/Factory Flow (the product name): the Unity office keeps its
+// own data under that folder. `--user-data-dir=<folder>` (Chromium's switch) moves it and the logs, so a
+// test run never shares the single-instance lock, settings or logs of the app someone is using.
+const userDataSwitch = app.commandLine.getSwitchValue('user-data-dir');
+app.setPath('userData', userDataSwitch || path.join(app.getPath('appData'), 'com.nikships.factory-flow'));
+if (userDataSwitch) app.setPath('logs', path.join(userDataSwitch, 'logs'));
+/** A run with its own userData is a test run: it only shows an office that is already up, and never moves, updates or installs anything. */
+const isolated = Boolean(userDataSwitch);
+function hideDockIfNoWindows() {
+  if (!appWindow()) app.dock?.hide();
+}
+
+const settingsFile = path.join(app.getPath('userData'), 'settings.json');
+const updateWindowsFile = path.join(app.getPath('userData'), 'update-windows.json');
+const logDir = app.getPath('logs');
+const officeLog = path.join(logDir, 'office.log');
+let settings: DesktopSettings = loadSettings(settingsFile);
+/** What the office and its workers run with: the login shell's environment (see desktopEnv). */
+let officeEnv: NodeJS.ProcessEnv = process.env;
+/** The app's ordinary companion window. Closing it leaves the daemon running. */
+let win: { base: BaseWindow; contents: WebContents } | undefined;
+const appWindow = () => (win && !win.base.isDestroyed() ? win : undefined);
+
+/** The page the window shows for the office at `officeUrl`; `hash` is a worker link (see tray-model.ts `workerHash`). */
+function officePage(hash = ''): string {
+  return new URL(`/dashboard${hash}`, officeUrl).toString();
+}
+/** The office this app started, if it started one (it may be using one that was already running). */
+let office: Office | undefined;
+let officeUrl: string | undefined;
+/** Set while the app stops its office on purpose, so its exit isn't reported as a crash. */
+let stopping = false;
+let quitting = false;
+/** Set while the app looks for or starts its office. */
+let opening = false;
+/** Launch activation must not open the office before an update's saved windows are restored. */
+let starting = true;
+/**
+ * Whether the office should have a window. Cleared when the owner closes it: the office, the menu bar
+ * icon and the phones and browsers connected to it keep running, and a restart doesn't open it again.
+ */
+let windowWanted = true;
+/** Set by the menu bar's Quit and Stop Workers: the quit ends the workers instead of keeping them for the next office. */
+let stopWorkersOnQuit = false;
+let tray: OfficeTray | undefined;
+/** The status asked for last: an answer to an older request is dropped. */
+let trayRequest = 0;
+const updates = new Updates({
+  log: path.join(logDir, 'updates.log'),
+  // Squirrel closes the windows before app.quit's before-quit, so the "Leave the office?" guard
+  // has to know now that the app is quitting.
+  beforeInstall: () => {
+    saveUpdateWindows(updateWindowsFile, { open: Boolean(appWindow()) });
+    quitting = true;
+    return stopOffice(true);
+  },
+  parent: () => appWindow()?.base,
+});
+
+function page(title: string, detail = ''): string {
+  const esc = (s: string) => s.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]!);
+  const html = `<!doctype html><meta charset="utf-8"><title>Factory Flow</title>
+<body style="margin:0;height:100vh;display:grid;place-items:center;background:${BACKGROUND};color:#e8e8e8;font:15px -apple-system,system-ui,sans-serif">
+<div style="text-align:center;max-width:720px;padding:24px"><div style="font:600 13px ui-monospace,monospace;letter-spacing:.2em;color:#ef6f2e">FACTORY FLOW</div>
+<p style="font-size:20px;margin:18px 0 10px">${esc(title)}</p><pre style="white-space:pre-wrap;text-align:left;color:#9a9a9a;font:12px ui-monospace,monospace">${esc(detail)}</pre></div></body>`;
+  return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
+}
+
+function show(url: string) {
+  if (!appWindow()) {
+    if (!windowWanted) return;
+    createWindow(false);
+  }
+  // An aborted load (the next page replaced this one first) rejects; that's no error here.
+  void win!.contents.loadURL(url).catch(() => {});
+}
+
+/** `hash` is a worker link (see tray-model.ts `workerHash`) for the office page to open. */
+function createWindow(loadOffice = true, hash = '') {
+  windowWanted = true;
+  void app.dock?.show();
+  const created = openCompanion();
+  win = created;
+  created.base.on('closed', () => {
+    if (win !== created) return;
+    win = undefined;
+    if (quitting) return;
+    // The window is gone, with its page and its GPU work; the office and the menu bar icon stay.
+    windowWanted = false;
+    hideDockIfNoWindows();
+    void refreshTray();
+  });
+  if (loadOffice && officeUrl) void created.contents.loadURL(officePage(hash)).catch(() => {});
+}
+
+function openCompanion(): { base: BaseWindow; contents: WebContents } {
+  const base = createCompanionWindow(() => officeUrl);
+  return { base, contents: base.webContents };
+}
+
+/**
+ * Opened from its disk image or from Downloads, macOS runs the app from a read-only, randomized
+ * copy: it can't update itself, and the terminal host that keeps workers running across restarts
+ * is left pointing at files that go away. Offers the move; true when the app is relaunching moved.
+ */
+async function moveToApplications(): Promise<boolean> {
+  if (!app.isPackaged || process.platform !== 'darwin' || app.isInApplicationsFolder()) return false;
+  const { response } = await dialog.showMessageBox({
+    type: 'question',
+    message: 'Move Factory Flow to your Applications folder?',
+    detail: "It's running from its disk image or from where it was downloaded. From there it can't update itself, and workers' terminals stop working once the disk image is ejected.",
+    buttons: ['Move to Applications', 'Not Now'],
+    defaultId: 0,
+    cancelId: 1,
+  });
+  if (response !== 0) return false;
+  try {
+    return app.moveToApplicationsFolder();
+  } catch (err) {
+    await dialog.showMessageBox({ type: 'warning', message: "Factory Flow couldn't move itself", detail: `${(err as Error).message}\n\nDrag it into Applications from the Finder instead.`, buttons: ['OK'] });
+    return false;
+  }
+}
+
+async function chooseOfficeDir(firstRun: boolean): Promise<string | undefined> {
+  const fallback = defaultOfficeDir();
+  if (firstRun) {
+    const { response } = await dialog.showMessageBox({
+      type: 'question',
+      message: 'Where does your office live?',
+      detail: `Factory Flow keeps its data (floors, workers, Whiteboards) in a folder. Pick a folder an office already ran in to carry on with it, such as the checkout you ran \`npm start\` in. You can change this later from Office → Change Office Folder….`,
+      buttons: [`Use ${fallback.replace(os.homedir(), '~')}`, 'Choose Folder…'],
+      defaultId: 0,
+      cancelId: 0,
+    });
+    if (response === 0) return fallback;
+  }
+  const picked = await dialog.showOpenDialog({
+    title: 'Choose the office folder',
+    defaultPath: settings.officeDir ?? fallback,
+    properties: ['openDirectory', 'createDirectory'],
+  });
+  if (picked.canceled || !picked.filePaths[0]) return firstRun ? fallback : undefined;
+  return picked.filePaths[0];
+}
+
+/** The chosen port, or the first one after it that nothing holds; an office already on one is used as is. */
+async function findPort(): Promise<{ port: number; running: boolean }> {
+  const first = settings.port ?? DEFAULT_PORT;
+  if (isolated) {
+    // Never starts an office and never scans: it shows the one office already on the chosen port, which is not the owner's.
+    if (!isolatedPortOk(first, await probePort(first))) throw new Error(`--user-data-dir is set: start an office on port ${first} first (not ${DEFAULT_PORT}), and put that port in ${settingsFile}.`);
+    return { port: first, running: true };
+  }
+  for (let port = first; port < first + PORT_TRIES && port <= 65535; port++) {
+    const state = await probePort(port);
+    if (state === 'office') return { port, running: true };
+    if (state === 'free') return { port, running: false };
+  }
+  throw new Error(`ports ${first} to ${first + PORT_TRIES - 1} are all in use.`);
+}
+
+async function openOffice() {
+  opening = true;
+  void refreshTray();
+  show(page('Opening the office…'));
+  try {
+    const { port, running } = await findPort();
+    if (running) {
+      // Another office (a terminal's `npm start`, an earlier app) already answers here: use it rather than start a second one.
+      officeUrl = `http://localhost:${port}/`;
+    } else {
+      const dir = settings.officeDir ?? defaultOfficeDir();
+      mkdirSync(logDir, { recursive: true });
+      office = await startOffice({
+        runtime: officeRuntime(process.execPath),
+        cli: path.join(app.getAppPath(), 'bin', 'factory-flow.js'),
+        args: officeArgs(dir, port),
+        port,
+        env: officeEnv,
+        log: officeLog,
+        onSpawn: (child) => serveHostUpdates(child, (command) => updates.controller.remote(command)),
+      });
+      officeUrl = office.url;
+      const mine = office;
+      void mine.exited.then((code) => {
+        if (office !== mine) return;
+        office = undefined;
+        if (!stopping && !quitting) void officeStopped(code);
+      });
+    }
+    opening = false;
+    show(officePage());
+    void refreshTray();
+  } catch (err) {
+    windowWanted = true;
+    officeUrl = undefined;
+    opening = false;
+    void refreshTray();
+    show(page("The office didn't open", (err as Error).message));
+    toFront();
+    const { response } = await dialog.showMessageBox({ type: 'error', message: "The office didn't open", detail: (err as Error).message, buttons: ['Try Again', 'Show Log', 'Quit'], defaultId: 0 });
+    if (response === 0) return openOffice();
+    if (response === 1) shell.showItemInFolder(officeLog);
+    if (response === 2) app.quit();
+  }
+}
+
+async function officeStopped(code: number | null) {
+  officeUrl = undefined;
+  void refreshTray();
+  show(page('The office stopped', `exit ${code ?? 'signal'} — see ${officeLog}`));
+  toFront();
+  const { response } = await dialog.showMessageBox({ type: 'warning', message: 'The office stopped', buttons: ['Restart', 'Show Log', 'Quit'], defaultId: 0 });
+  if (response === 0) await openOffice();
+  if (response === 1) shell.showItemInFolder(officeLog);
+  if (response === 2) app.quit();
+}
+
+async function stopOffice(keepWorkers: boolean) {
+  const running = office;
+  if (!running) return;
+  stopping = true;
+  try {
+    await running.stop(keepWorkers);
+  } finally {
+    if (office === running) office = undefined;
+    stopping = false;
+  }
+}
+
+async function changeOfficeDir() {
+  const dir = await chooseOfficeDir(false);
+  if (!dir || dir === settings.officeDir) return;
+  settings = { ...settings, officeDir: dir };
+  saveSettings(settingsFile, settings);
+  if (!office && officeUrl) {
+    await dialog.showMessageBox({
+      type: 'info',
+      message: 'Saved',
+      detail: `This window shows an office that was already running on ${officeUrl}, which the app didn't start. The app opens ${dir} once that one is stopped.`,
+      buttons: ['OK'],
+    });
+    return;
+  }
+  await stopOffice(false);
+  await openOffice();
+}
+
+/** Brings the app forward for a dialog or window: with only the menu bar icon left, it isn't the active app. */
+function toFront() {
+  app.focus({ steal: true });
+}
+
+/** The office window again, from the menu bar icon, the Dock or a second launch. */
+function openWindow() {
+  toFront();
+  const current = appWindow();
+  if (current) {
+    if (officeUrl && current.contents.isCrashed()) void current.contents.loadURL(officePage()).catch(() => {});
+    current.base.show();
+    current.base.focus();
+    return;
+  }
+  if (officeUrl && !opening) return createWindow(true);
+  createWindow(false);
+  if (opening) show(page('Opening the office…'));
+  else void openOffice();
+}
+
+async function leaveToMenuBar() {
+  const current = appWindow();
+  if (!current) {
+    windowWanted = false;
+    hideDockIfNoWindows();
+    return;
+  }
+  if (!settings.menuBarExplained) {
+    const { response } = await dialog.showMessageBox(current.base, {
+      type: 'info',
+      message: 'Cmd+Q closes the window and keeps the office running',
+      detail: 'Workers keep working, and phones and browsers stay connected. Open the office again from the Factory Flow icon in the menu bar. To stop the office, choose Quit Factory Flow in that menu, or press Option+Cmd+Q.',
+      buttons: ['Keep Running in Menu Bar', 'Stop the Office and Quit'],
+      defaultId: 0,
+      cancelId: 0,
+    });
+    settings = { ...settings, menuBarExplained: true };
+    saveSettings(settingsFile, settings);
+    if (response === 1) return app.quit();
+  }
+  if (current.base.isDestroyed()) return;
+  current.base.close();
+}
+
+async function quitStoppingWorkers() {
+  toFront();
+  const { response } = await dialog.showMessageBox({
+    type: 'warning',
+    message: 'Stop every worker and quit?',
+    detail: "The workers' terminals end with the office, instead of waiting for the next office to take them back.",
+    buttons: ['Stop Workers and Quit', 'Cancel'],
+    defaultId: 1,
+    cancelId: 1,
+  });
+  if (response !== 0) return;
+  stopWorkersOnQuit = true;
+  app.quit();
+}
+
+function trayAction(action: TrayAction) {
+  if (action === 'open') openWindow();
+  else if (action === 'restart') void restartOffice();
+  else if (action === 'updates') {
+    toFront();
+    void updates.check(true);
+  } else if (action === 'quit') app.quit();
+  else void quitStoppingWorkers();
+}
+
+async function refreshTray() {
+  if (!tray) return;
+  const request = ++trayRequest;
+  const url = opening ? undefined : officeUrl;
+  const status = url ? parseStatus(await fetchStatus(url)) : undefined;
+  if (request !== trayRequest || url !== (opening ? undefined : officeUrl)) return;
+  const view: TrayView = {
+    state: opening ? 'starting' : officeUrl ? 'running' : 'stopped',
+    ...(status ? { status } : {}),
+    ownWindows: officeUrl && appWindow() ? 1 : 0,
+    external: Boolean(officeUrl && !office),
+    version: app.getVersion(),
+  };
+  tray.render(view);
+  // The Dock icon counts them too while the window is open (the Dock icon is hidden while it's closed).
+  app.dock?.setBadge(trayTitle(view));
+}
+
+async function restartOffice() {
+  if (!office) return openOffice();
+  await stopOffice(true);
+  await openOffice();
+}
+
+function menu(): Menu {
+  const contents = () => win?.contents;
+  const base = () => win?.base;
+  const template: MenuItemConstructorOptions[] = [
+    {
+      label: app.name,
+      submenu: [
+        { role: 'about' },
+        { label: 'Check for Updates…', click: () => void updates.check(true) },
+        { type: 'separator' },
+        { role: 'services' },
+        { type: 'separator' },
+        { role: 'hide' },
+        { role: 'hideOthers' },
+        { role: 'unhide' },
+        { type: 'separator' },
+        // Cmd+Q leaves the office running behind the menu bar icon; quitting it is a separate item.
+        { label: 'Close to Menu Bar', accelerator: 'CmdOrCtrl+Q', click: () => void leaveToMenuBar() },
+        { label: `Quit ${app.name}`, accelerator: 'Alt+CmdOrCtrl+Q', click: () => app.quit() },
+      ],
+    },
+    // Not Electron's edit roles: the page is offscreen and never the focused web contents, so they would find nothing to act on.
+    editMenu(contents),
+    {
+      label: 'Office',
+      submenu: [
+        { label: 'Restart Office', click: () => void restartOffice() },
+        { label: 'Change Office Folder…', click: () => void changeOfficeDir() },
+        { type: 'separator' },
+        { label: 'Show Office Log', click: () => shell.showItemInFolder(officeLog) },
+      ],
+    },
+    {
+      label: 'View',
+      submenu: [
+        { label: 'Reload', accelerator: 'CmdOrCtrl+R', click: () => contents()?.reload() },
+        { label: 'Force Reload', accelerator: 'Shift+CmdOrCtrl+R', click: () => contents()?.reloadIgnoringCache() },
+        { label: 'Toggle Developer Tools', accelerator: 'Alt+CmdOrCtrl+I', click: () => contents()?.toggleDevTools() },
+        { type: 'separator' },
+        { label: 'Toggle Full Screen', accelerator: 'Ctrl+CmdOrCtrl+F', click: () => base()?.setFullScreen(!base()?.isFullScreen()) },
+      ],
+    },
+    {
+      label: 'Window',
+      role: 'window',
+      submenu: [
+        { label: 'Minimize', accelerator: 'CmdOrCtrl+M', click: () => base()?.minimize() },
+        { label: 'Zoom', click: () => (base()?.isMaximized() ? base()?.unmaximize() : base()?.maximize()) },
+        ...companionWindowMenu(
+          (command) => {
+            if (base()?.isFocused()) sendCompanionCommand(contents(), officeUrl, command);
+          },
+          () => base()?.close(),
+        ),
+        { type: 'separator' },
+        { role: 'front' },
+      ],
+    },
+  ];
+  return Menu.buildFromTemplate(template);
+}
+
+if (!isStartupCheck() && !app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on('second-instance', () => openWindow());
+  app.on('activate', () => {
+    if (starting) return;
+    openWindow();
+  });
+
+  // Closing the window leaves the app, the office and the menu bar icon running until you quit.
+  app.on('window-all-closed', () => {});
+
+  // Every real quit comes here: the menu bar's Quit, Quit Factory Flow in the app menu, the Dock, logging out,
+  // shutting down and installing an update. None of them is turned into a close to the menu bar.
+  app.on('before-quit', (e) => {
+    quitting = true;
+    if (!office) return;
+    e.preventDefault();
+    void stopOffice(!stopWorkersOnQuit).finally(() => app.quit());
+  });
+
+  void app
+    .whenReady()
+    .then(async () => {
+      enforceRequirements();
+      if (isStartupCheck()) return runStartupCheck();
+      const updateWindows = takeUpdateWindows(updateWindowsFile);
+      if (updateWindows) windowWanted = updateWindows.open;
+      Menu.setApplicationMenu(menu());
+      if (!isolated && (await moveToApplications())) return;
+      tray = new OfficeTray(trayAction);
+      void refreshTray();
+      setInterval(() => void refreshTray(), TRAY_REFRESH_MS);
+      show(page('Opening the office…'));
+      officeEnv = await desktopEnv();
+      if (!isolated && !settings.officeDir) {
+        settings = { ...settings, officeDir: await chooseOfficeDir(true) };
+        saveSettings(settingsFile, settings);
+      }
+      await openOffice();
+      starting = false;
+      hideDockIfNoWindows();
+      mkdirSync(logDir, { recursive: true });
+      if (!isolated) downloadBrowser({ runtime: officeRuntime(process.execPath), cli: path.join(app.getAppPath(), 'bin', 'factory-flow.js'), env: officeEnv, log: path.join(logDir, 'browser.log') });
+      if (!isolated) updates.start();
+    })
+    .catch((err: unknown) => {
+      // failStartup has already shown why and asked the app to exit; anything else is a bug that should surface.
+      if (!(err instanceof StartupAborted)) throw err;
+    });
+}

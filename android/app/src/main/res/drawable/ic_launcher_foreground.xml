@@ -1,0 +1,95 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group android:rotation="-32" android:pivotX="54" android:pivotY="54">
+        <group android:scaleX="2.9" android:scaleY="2.9" android:translateX="25.72" android:translateY="27.21">
+        <path
+            android:fillColor="#C2182B"
+            android:fillAlpha="0.019"
+            android:fillType="evenOdd"
+            android:pathData="@string/glyph_path" />
+        </group>
+    </group>
+    <group android:rotation="-28" android:pivotX="54" android:pivotY="54">
+        <group android:scaleX="2.9" android:scaleY="2.9" android:translateX="25.72" android:translateY="27.21">
+        <path
+            android:fillColor="#C82126"
+            android:fillAlpha="0.059"
+            android:fillType="evenOdd"
+            android:pathData="@string/glyph_path" />
+        </group>
+    </group>
+    <group android:rotation="-24" android:pivotX="54" android:pivotY="54">
+        <group android:scaleX="2.9" android:scaleY="2.9" android:translateX="25.72" android:translateY="27.21">
+        <path
+            android:fillColor="#CE2A20"
+            android:fillAlpha="0.111"
+            android:fillType="evenOdd"
+            android:pathData="@string/glyph_path" />
+        </group>
+    </group>
+    <group android:rotation="-20" android:pivotX="54" android:pivotY="54">
+        <group android:scaleX="2.9" android:scaleY="2.9" android:translateX="25.72" android:translateY="27.21">
+        <path
+            android:fillColor="#D3331B"
+            android:fillAlpha="0.174"
+            android:fillType="evenOdd"
+            android:pathData="@string/glyph_path" />
+        </group>
+    </group>
+    <group android:rotation="-16" android:pivotX="54" android:pivotY="54">
+        <group android:scaleX="2.9" android:scaleY="2.9" android:translateX="25.72" android:translateY="27.21">
+        <path
+            android:fillColor="#D93C16"
+            android:fillAlpha="0.245"
+            android:fillType="evenOdd"
+            android:pathData="@string/glyph_path" />
+        </group>
+    </group>
+    <group android:rotation="-12" android:pivotX="54" android:pivotY="54">
+        <group android:scaleX="2.9" android:scaleY="2.9" android:translateX="25.72" android:translateY="27.21">
+        <path
+            android:fillColor="#DF4510"
+            android:fillAlpha="0.324"
+            android:fillType="evenOdd"
+            android:pathData="@string/glyph_path" />
+        </group>
+    </group>
+    <group android:rotation="-8" android:pivotX="54" android:pivotY="54">
+        <group android:scaleX="2.9" android:scaleY="2.9" android:translateX="25.72" android:translateY="27.21">
+        <path
+            android:fillColor="#E44E0B"
+            android:fillAlpha="0.409"
+            android:fillType="evenOdd"
+            android:pathData="@string/glyph_path" />
+        </group>
+    </group>
+    <group android:rotation="-4" android:pivotX="54" android:pivotY="54">
+        <group android:scaleX="2.9" android:scaleY="2.9" android:translateX="25.72" android:translateY="27.21">
+        <path
+            android:fillColor="#EA5705"
+            android:fillAlpha="0.502"
+            android:fillType="evenOdd"
+            android:pathData="@string/glyph_path" />
+        </group>
+    </group>
+    <group android:rotation="-0" android:pivotX="54" android:pivotY="54">
+        <group android:scaleX="2.9" android:scaleY="2.9" android:translateX="25.72" android:translateY="27.21">
+        <path
+            android:fillType="evenOdd"
+            android:pathData="@string/glyph_path">
+            <aapt:attr name="android:fillColor">
+                <gradient android:type="linear" android:startX="-0.55" android:startY="-1.06" android:endX="20.05" android:endY="19.54">
+                    <item android:color="#FFD08A" android:offset="0" />
+                    <item android:color="#FF8F24" android:offset="0.38" />
+                    <item android:color="#F06000" android:offset="0.72" />
+                    <item android:color="#D63A08" android:offset="1" />
+                </gradient>
+            </aapt:attr>
+        </path>
+        </group>
+    </group>
+</vector>

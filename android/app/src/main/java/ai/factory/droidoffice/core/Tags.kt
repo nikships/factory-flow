@@ -1,0 +1,679 @@
+package ai.factory.droidoffice.core
+
+/**
+ * Stable names for every screen and control. The app maps them to `resource-id` in the
+ * accessibility tree, so `adb shell uiautomator dump` and UI Automator's `By.res` find a control by
+ * name instead of by its text or position. A dynamic part (a worker's, floor's, office's or model's
+ * id) follows a `/`.
+ *
+ * Agents script against these names: renaming one breaks them, so add new names rather than
+ * reuse old ones, and keep the table in android/README.md "Drive it with adb" in step.
+ */
+object Tags {
+    object Screen {
+        const val WELCOME = "screen.welcome"
+        const val SCAN = "screen.scan"
+        const val PAIR = "screen.pair"
+        const val HOME = "screen.home"
+        const val WORKERS = "screen.workers"
+        const val WORKER = "screen.worker"
+        const val OFFICES = "screen.offices"
+        const val ASKS = "screen.asks"
+        const val ME = "screen.me"
+        const val BOARD = "screen.board"
+        const val BOARD_CARD = "screen.board_card"
+    }
+
+    object App {
+        const val BANNER = "app.banner"
+        const val BANNER_DISMISS = "app.banner.dismiss"
+        const val SNACKBAR = "app.snackbar"
+    }
+
+    /** The bottom tabs. */
+    object Tab {
+        const val BAR = "tab.bar"
+        const val WORKERS = "tab.workers"
+        const val ASKS = "tab.asks"
+        const val OFFICE = "tab.office"
+        const val BOARD = "tab.board"
+        const val ME = "tab.me"
+    }
+
+    /** The Whiteboard: the floor's grid of cards, and one card with its comment threads. */
+    object Board {
+        const val GRID = "board.grid"
+        const val EMPTY = "board.empty"
+        const val LOADING = "board.loading"
+        const val RENDERER = "board.renderer"
+        const val PING = "board.ping"
+        const val CARD_TITLE = "board.card.title"
+        const val CARD_META = "board.card.meta"
+        const val CARD_CHANGED = "board.card.changed"
+        const val BACK = "board.back"
+        const val TITLE = "board.title"
+        const val META = "board.meta"
+        const val IMAGE = "board.image"
+        const val IMAGE_STATUS = "board.image.status"
+        const val SHOW = "board.show"
+        const val COMMENTS = "board.comments"
+        const val COMMENTS_SHEET = "board.comments_sheet"
+        const val NEW_COMMENT = "board.new_comment"
+        const val COMMENT_INPUT = "board.comment.input"
+        const val COMMENT_SEND = "board.comment.send"
+        const val COMMENT_CANCEL = "board.comment.cancel"
+        const val PING_SHEET = "board.ping_sheet"
+        const val GONE = "board.gone"
+        /** The card live, as the office's window shows it (a WebView: its content isn't in a dump). */
+        const val LIVE = "board.live"
+        const val MODE_USE = "board.mode.use"
+        const val MODE_MARKUP = "board.mode.markup"
+        const val ADD_PICTURE = "board.add_picture"
+        const val HINT = "board.hint"
+        const val STICKY_SHEET = "board.sticky_sheet"
+        const val STICKY_INPUT = "board.sticky.input"
+        const val STICKY_SAVE = "board.sticky.save"
+        const val STICKY_MOVE = "board.sticky.move"
+        const val STICKY_DELETE = "board.sticky.delete"
+        /** Full screen for the live card, and the button that leaves it. */
+        const val FULLSCREEN = "board.fullscreen"
+        /** What the live card itself put in full screen (its video's full-screen button); Back leaves it. */
+        const val VIDEO_FULLSCREEN = "board.video_fullscreen"
+        const val SEARCH = "board.search"
+        const val NO_MATCH = "board.no_match"
+        const val CARD_FORMAT = "board.card.format"
+        const val PREV = "board.prev"
+        const val NEXT = "board.next"
+
+        fun card(id: String) = "board.card/$id"
+        fun filter(id: String) = "board.filter/$id"
+        fun thread(id: String) = "board.thread/$id"
+        fun reply(id: String) = "board.thread.reply/$id"
+        fun replySend(id: String) = "board.thread.reply_send/$id"
+        fun resolve(id: String) = "board.thread.resolve/$id"
+        fun editMessage(id: String) = "board.message.edit/$id"
+        fun editInput(id: String) = "board.message.input/$id"
+        fun editSave(id: String) = "board.message.save/$id"
+        fun editCancel(id: String) = "board.message.cancel/$id"
+        fun seek(label: String) = "board.seek/$label"
+        fun sticky(id: String) = "board.sticky/$id"
+        fun stickyColor(name: String) = "board.sticky.color/$name"
+        fun showThread(id: String) = "board.thread.show/$id"
+        fun moveThread(id: String) = "board.thread.move/$id"
+        fun pingWorker(id: String) = "board.ping/$id"
+        /** On the ping sheet row of the worker that made the open card. */
+        fun pingAuthor(id: String) = "board.ping.author/$id"
+    }
+
+    object Answer {
+        const val OPEN = "answer.open"
+        const val WORKSPACE = "answer.workspace"
+        const val CONTENT = "answer.content"
+        const val CLOSE = "answer.close"
+        const val RAW_TTY = "answer.raw_tty"
+        const val QUESTION = "answer.question"
+        const val REVIEW = "answer.review"
+        const val INSTRUCTION = "answer.instruction"
+        const val TYPE = "answer.type"
+        const val TEXT = "answer.text"
+        const val STATUS = "answer.status"
+        const val SUBMIT = "answer.submit"
+        const val CANCEL = "answer.cancel"
+        fun option(number: Int) = "answer.option/$number"
+    }
+
+    object Asks {
+        const val COUNT = "asks.count"
+        const val CARD = "asks.card"
+        const val WORKER = "asks.card.worker"
+        const val CONTEXT = "asks.card.context"
+        const val QUESTION = "asks.card.question"
+        const val OWN_ANSWER = "asks.card.own_answer"
+        const val OWN_ANSWER_SEND = "asks.card.own_answer.send"
+        const val OPEN_THREAD = "asks.card.open_thread"
+        const val WAITING = "asks.card.waiting"
+        const val SENDING = "asks.sending"
+        const val SENDING_CANCEL = "asks.sending.cancel"
+        const val ANSWERED = "asks.answered"
+        const val EMPTY = "asks.empty"
+        const val EMPTY_HIRE = "asks.empty.hire"
+        fun option(number: Int) = "asks.card.option/$number"
+        fun next(id: String) = "asks.next/$id"
+    }
+
+    /** The cross-floor Workers tab: Needs you cards and the building roster. */
+    object Workers {
+        const val LIST = "workers.list"
+        const val LOADING = "workers.loading"
+        const val EMPTY = "workers.empty"
+        const val EMPTY_HIRE = "workers.empty.hire"
+        const val HIRE = "workers.hire"
+        const val PICK_WORKER = "workers.pick_worker"
+        const val WAITING_COUNT = "workers.waiting_count"
+        const val SUMMARY = "workers.summary"
+        const val NEEDS_YOU = "workers.needs_you"
+        const val ANSWERED = "workers.answered"
+        const val CARD_NAME = "workers.card.name"
+        const val CARD_STATUS = "workers.card.status"
+        const val CARD_FLOOR = "workers.card.floor"
+        const val CARD_REPO = "workers.card.repo"
+        const val CARD_META = "workers.card.meta"
+        const val CARD_TITLE = "workers.card.title"
+        const val CARD_DETAIL = "workers.card.detail"
+        const val CARD_TODOS = "workers.card.todos"
+
+        fun card(id: String) = "workers.card/$id"
+        fun ask(id: String) = "workers.ask/$id"
+    }
+
+    object Update {
+        const val NOTICE_STATUS = "update.notice.status"
+        const val NOTICE_OPEN = "update.notice.open"
+        const val NOTICE_DISMISS = "update.notice.dismiss"
+        const val ROW = "update.row"
+        const val STATUS = "update.status"
+        const val OPEN = "update.open"
+        const val DIALOG = "update.dialog"
+        const val DIALOG_STATUS = "update.dialog.status"
+        const val PROGRESS = "update.progress"
+        const val ERROR = "update.error"
+        const val INSTALL = "update.install"
+        const val CANCEL = "update.cancel"
+        const val CHECK = "update.check"
+        const val DISMISS = "update.dismiss"
+        const val BROWSER = "update.browser"
+        const val DOWNLOAD = "update.download"
+    }
+
+    object Welcome {
+        const val SCAN = "welcome.scan"
+        const val PASTE = "welcome.paste"
+        const val DEEP_LINK = "welcome.deep_link"
+    }
+
+    object Scan {
+        const val BACK = "scan.back"
+        const val PASTE = "scan.paste"
+        const val STATUS = "scan.status"
+        const val TORCH = "scan.torch"
+        const val CAMERA = "scan.camera"
+        const val PASTE_LINK = "scan.paste_link"
+    }
+
+    object Paste {
+        const val SHEET = "paste.sheet"
+        const val INPUT = "paste.input"
+        const val CLIPBOARD = "paste.clipboard"
+        const val SUBMIT = "paste.submit"
+    }
+
+    object Pair {
+        const val STATUS = "pair.status"
+        const val OUTCOME = "pair.outcome"
+        const val OPEN = "pair.open"
+        const val RETRY = "pair.retry"
+        const val RESCAN = "pair.rescan"
+        const val CANCEL = "pair.cancel"
+    }
+
+    object Home {
+        const val OFFICES = "home.offices"
+        const val ROUTE = "home.route"
+        const val CONNECTION = "home.connection"
+        const val RETRY = "home.retry"
+        const val PAIR_AGAIN = "home.pair_again"
+        const val LOADING = "home.loading"
+        const val LIST = "home.list"
+        /** The floors side by side, each page [floorPage]; drag it sideways to slide to the next or previous floor. */
+        const val PAGER = "home.pager"
+        const val EMPTY = "home.empty"
+        const val HIRE = "home.hire"
+        const val HIRE_FIRST = "home.hire_first"
+        const val REPAIR_SCAN = "home.repair.scan"
+        const val REPAIR_FORGET = "home.repair.forget"
+        const val PICK_WORKER = "home.pick_worker"
+        const val FLOOR_ORDER_HINT = "home.floor_order_hint"
+        /** The "+N more" chip after the floor chips that fit, and the menu of the other floors it opens. */
+        const val FLOOR_MORE = "home.floor_more"
+        const val FLOOR_MORE_MENU = "home.floor_more.menu"
+
+        // Inside each worker card; the card itself is [worker].
+        const val CARD_NAME = "home.worker.name"
+        const val CARD_STATUS = "home.worker.status"
+        const val CARD_META = "home.worker.meta"
+        const val CARD_TITLE = "home.worker.title"
+        const val CARD_DETAIL = "home.worker.detail"
+        const val CARD_TODOS = "home.worker.todos"
+
+        fun floor(id: String) = "home.floor/$id"
+        fun floorPage(id: String) = "home.floor_page/$id"
+        fun floorMore(id: String) = "home.floor_more/$id"
+        fun worker(id: String) = "home.worker/$id"
+    }
+
+    /** The pinned Mission Control section at the top of Home: the Orchestrator's card and a row per external bot. */
+    object Mission {
+        const val SECTION = "mission.section"
+        const val TOGGLE = "mission.toggle"
+        const val ORCHESTRATOR = "mission.orchestrator"
+        const val ORCHESTRATOR_STATUS = "mission.orchestrator.status"
+        const val ORCHESTRATOR_META = "mission.orchestrator.meta"
+        const val ORCHESTRATOR_DETAIL = "mission.orchestrator.detail"
+        const val ORCHESTRATOR_BLOCKED = "mission.orchestrator.blocked"
+        /** The Orchestrator's row while it is off; it opens its screen, which can turn it on. */
+        const val ORCHESTRATOR_OFF = "mission.orchestrator_off"
+        fun bot(id: String) = "mission.bot/$id"
+    }
+
+    /** The Orchestrator's screen, beyond the worker screen's own names, and its settings sheet. */
+    object Orchestrator {
+        /** What it is for, with example prompts, before its first prompt or after a new conversation. */
+        const val INTRO = "orchestrator.intro"
+        /** It is off: what that means, and [TURN_ON]. */
+        const val OFF = "orchestrator.off"
+        const val TURN_ON = "orchestrator.turn_on"
+        /** Why it can't start now, in place of the composer. */
+        const val BLOCKED = "orchestrator.blocked"
+        /** The header's overflow button, which opens [SHEET]. */
+        const val MENU = "orchestrator.menu"
+        /** Its team across floors, under the header. */
+        const val TEAM = "orchestrator.team"
+        const val SHEET = "orchestrator.sheet"
+        /** On or off, a toggle row (`checked` is on). */
+        const val SWITCH = "orchestrator.on"
+        const val MODEL_DEFAULT = "orchestrator.model_default"
+        const val NEW_CONVERSATION = "orchestrator.new_conversation"
+        const val NEW_DIALOG = "orchestrator.new_dialog"
+        const val NEW_CONFIRM = "orchestrator.new_confirm"
+        const val NEW_CANCEL = "orchestrator.new_cancel"
+        /** The row under Me that opens [SHEET]. */
+        const val SETTINGS = "settings.orchestrator"
+
+        /** An example prompt in [INTRO], from 1: tapping it fills the composer. */
+        fun example(n: Int) = "orchestrator.example/$n"
+        /** A reasoning choice in [SHEET]; `default` is the office's. */
+        fun effort(wire: String) = "orchestrator.effort/$wire"
+        /** A subagent in [TEAM] or on a bot's screen: opens it on its floor. */
+        fun member(id: String) = "orchestrator.team/$id"
+    }
+
+    /** An external bot's screen: it runs elsewhere, so there is no terminal or thread here. */
+    object Bot {
+        const val SCREEN = "screen.bot"
+        const val NAME = "bot.name"
+        const val STATUS = "bot.status"
+        const val ACTIVITY = "bot.activity"
+        const val LAST_USED = "bot.last_used"
+        const val TEAM = "bot.team"
+    }
+
+    object WorkerActions {
+        const val SHEET = "worker_actions.sheet"
+        const val NAME = "worker_actions.name"
+        const val FORK = "worker_actions.fork"
+        const val FORK_REASON = "worker_actions.fork_reason"
+        const val DISMISS = "worker_actions.dismiss"
+    }
+
+    object Fork {
+        const val DIALOG = "fork.dialog"
+        const val PROMPT = "fork.prompt"
+        const val CONFIRM = "fork.confirm"
+        const val CANCEL = "fork.cancel"
+        const val ERROR = "fork.error"
+    }
+
+    object Hire {
+        const val SHEET = "hire.sheet"
+        /** Closes the hire screen without hiring. */
+        const val CLOSE = "hire.close"
+        const val DROID = "hire.droid"
+        const val SHELL = "hire.shell"
+        const val PROMPT = "hire.prompt"
+        const val MODEL = "hire.model"
+        const val WORKTREE = "hire.worktree"
+        /** "Also work in": other floors' projects a Droid in its own worktree takes on too. */
+        const val REPOS = "hire.repos"
+        fun repo(floorId: String) = "hire.repo/$floorId"
+        const val SUBMIT = "hire.submit"
+        const val MODEL_SHEET = "hire.model_sheet"
+        const val MODEL_SEARCH = "hire.model_search"
+        const val MODEL_CUSTOM = "hire.model_custom"
+        const val MODEL_CLOSE = "hire.model_close"
+        fun modelScope(name: String) = "hire.model_scope/$name"
+
+        fun effort(wire: String) = "hire.effort/$wire"
+        fun model(id: String) = "hire.model/$id"
+
+        /** Why a model in the list can't be chosen, or the quiet note that DroidProxy will be started. */
+        fun modelWhy(id: String) = "hire.model_why/$id"
+
+        /** Where a Droid runs, shown while the office is connected to Factory and has a computer or Environment to offer. */
+        const val RUNS_ON = "hire.runs_on"
+        /** The folder on that computer, and the note under it. */
+        const val FOLDER = "hire.folder"
+        const val FOLDER_NOTE = "hire.folder_note"
+        /** The model picked can't run on a Factory computer. */
+        const val CLOUD_MODEL = "hire.cloud_model"
+
+        /** A "Runs on" choice: `local` for this machine, `env:<environmentId>` or a computer's id. */
+        fun runsOn(key: String) = "hire.runs_on/${key.ifEmpty { "local" }}"
+    }
+
+    object HostUpdate {
+        const val OPEN = "host_update.open"
+        const val SHEET = "host_update.sheet"
+        const val STATUS = "host_update.status"
+        const val ERROR = "host_update.error"
+        const val CLOSE = "host_update.close"
+        const val CHECK = "host_update.check"
+        const val INSTALL = "host_update.install"
+        const val CONFIRM_DIALOG = "host_update.confirm_dialog"
+        const val CONFIRM = "host_update.confirm"
+        const val CANCEL = "host_update.cancel"
+    }
+
+    object Subscriptions {
+        const val OPEN = "subscriptions.open"
+        const val SHEET = "subscriptions.sheet"
+        const val STATUS = "subscriptions.status"
+        const val CLOSE = "subscriptions.close"
+        const val DETAIL = "subscriptions.detail"
+        const val OFF = "subscriptions.off"
+        const val UNCONNECTED = "subscriptions.unconnected"
+        const val FACTORY = "subscriptions.factory"
+        const val FACTORY_STATUS = "subscriptions.factory.status"
+        const val FACTORY_BALANCE = "subscriptions.factory.balance"
+        const val FACTORY_MODE = "subscriptions.factory.mode"
+        const val FACTORY_ERROR = "subscriptions.factory.error"
+        const val FACTORY_RESULT = "subscriptions.factory.result"
+        const val OVERAGE_CONFIRM = "subscriptions.factory.confirm"
+        const val OVERAGE_SAVE = "subscriptions.factory.save"
+        const val OVERAGE_CANCEL = "subscriptions.factory.cancel"
+        fun overage(mode: String) = "subscriptions.factory.overage/$mode"
+        fun factoryWindow(tier: String, name: String) = "subscriptions.factory.window/$tier/$name"
+        fun provider(key: String) = "subscriptions.provider/$key"
+        fun ring(provider: String, account: String) = "subscriptions.ring/$provider/$account"
+    }
+
+    object Worker {
+        /** Reserved: external bots now open [Bot.SCREEN] from Mission Control. */
+        const val REMOTE = "worker.remote"
+        const val BACK = "worker.back"
+        const val NAME = "worker.name"
+        const val META = "worker.meta"
+        const val STATUS = "worker.status"
+        const val RESUME = "worker.resume"
+        const val PR = "worker.pr"
+        const val BRANCH = "worker.branch"
+        const val SEND_HOME = "worker.send_home"
+        const val OFFLINE = "worker.offline"
+        const val NEEDS_YOU = "worker.needs_you"
+        const val QUESTION = "worker.question"
+        const val TERMINAL = "worker.terminal"
+        const val LATEST = "worker.latest"
+        const val ASLEEP = "worker.asleep"
+        const val ASLEEP_RESUME = "worker.asleep.resume"
+        const val CLOUD = "worker.cloud"
+        /** Why a cloud worker can't work right now, above its composer; Send is off while it shows. */
+        const val CLOUD_ERROR = "worker.cloud.error"
+        const val GONE = "worker.gone"
+        const val GONE_BACK = "worker.gone.back"
+        const val KEYS = "worker.keys"
+        const val PHONE = "key.phone"
+        const val DIRECT_INPUT = "worker.input.direct"
+        /** The button at the end of the quick keys that opens [KEYS_SHEET]. */
+        const val KEYS_ARRANGE = "worker.keys.arrange"
+        const val KEYS_SHEET = "worker.keys_sheet"
+        const val KEYS_RESET = "worker.keys_sheet.reset"
+        const val KEYS_DONE = "worker.keys_sheet.done"
+        const val INPUT = "composer.input"
+        const val ATTACH = "composer.attach"
+        const val SEND = "composer.send"
+        /** While Droid is on a turn: sends the draft to Droid's queue, for after the turn (Send steers the turn now). */
+        const val QUEUE_SEND = "composer.queue_send"
+        /** Droid's slash commands matching a draft that starts with `/`, over the composer. */
+        const val SLASH_MENU = "composer.slash_menu"
+        /** The worker's files and folders matching an `@` mention under the cursor, over the Thread's composer. */
+        const val MENTION_MENU = "composer.mention_menu"
+        /** In the Thread view while the worker is on a turn: stops it with Esc, as Droid's own Esc does. */
+        const val STOP = "composer.stop"
+        /** Why Send is off while the office is out of reach: the draft stays and nothing is sent later on its own. */
+        const val COMPOSER_OFFLINE = "composer.offline"
+        /** Why Send held the message back: over the office's 20,000-character prompt limit, pastes expanded. */
+        const val COMPOSER_TOO_LONG = "composer.too_long"
+        /** Large pastes held in the draft as `[Pasted text #N · X lines]` tokens, as chips over the composer. */
+        const val PASTES = "composer.pastes"
+
+        /** A numbered menu choice above the terminal, by the number the menu shows. */
+        fun choice(number: Int) = "worker.choice/$number"
+        const val VIEW_THREAD = "worker.view.thread"
+        const val VIEW_TTY = "worker.view.tty"
+        const val THREAD = "worker.thread"
+        const val THREAD_PROMPT = "worker.thread.prompt"
+        const val THREAD_ACTIVITY = "worker.thread.activity"
+        const val LIVE_LINE = "worker.live_line"
+        /** The conversation, a lazy list: swipe it to scroll. */
+        const val THREAD_LIST = "worker.thread.list"
+        /** Readable state when there are no messages to show: its text says loading, empty, unavailable or why not. */
+        const val THREAD_STATE = "worker.thread.state"
+        const val THREAD_RETRY = "worker.thread.retry"
+        /** Switches to Raw TTY from a state, notice or question the thread can't handle. */
+        const val THREAD_RAW_TTY = "worker.thread.raw_tty"
+        const val THREAD_CODE_HINT = "worker.thread.code.hint"
+        /** The messages waiting in Droid's queue, after the conversation. */
+        const val THREAD_QUEUED = "worker.thread.queued"
+        /** Clears Droid's queue (Ctrl+X), shown while its screen shows one. */
+        const val THREAD_QUEUED_CLEAR = "worker.thread.queued.clear"
+        const val THREAD_EARLIER = "worker.thread.earlier"
+        const val THREAD_START = "worker.thread.start"
+        /** Shown when scrolled up from the newest message: back to the bottom, which follows new ones again. */
+        const val THREAD_JUMP = "worker.thread.jump"
+        /** An error from the office shown over messages already here. */
+        const val THREAD_ERROR = "worker.thread.error"
+        /** In place of the composer while the worker waits on its terminal: prompts aren't sent into a question. */
+        const val THREAD_WAITING = "worker.thread.waiting"
+        /** The Raw TTY button in [THREAD_WAITING]. */
+        const val THREAD_WAITING_TTY = "worker.thread.waiting.raw_tty"
+        /** After Load earlier pushed the newest entries out: loads the newest page again. */
+        const val THREAD_NEWER = "worker.thread.newer"
+        /** In place of the conversation when the office's Thread can't be read here: update the office or the app, or use Raw TTY. */
+        const val THREAD_UPDATE = "worker.thread.update"
+
+        /** The row in the Thread view with the Thread and Raw TTY switch, the PR and the branch. */
+        const val THREAD_BAR = "worker.thread.bar"
+        /** The [THREAD_JUMP] arrow, described as "Jump to latest" or the new-message count. */
+        const val THREAD_JUMP_LABEL = "worker.thread.jump.label"
+        /** A Markdown table in a message: its columns line up and it scrolls sideways as one. */
+        const val THREAD_TABLE = "worker.thread.table"
+        /** Copies a fenced code block's source to the clipboard. */
+        const val THREAD_CODE_COPY = "worker.thread.code.copy"
+        /** Reserved: former `email` draft card identifiers (```email fences render as ordinary code blocks). */
+        const val THREAD_EMAIL = "worker.thread.email"
+        const val THREAD_EMAIL_COPY_BODY = "worker.thread.email.copy_body"
+        const val THREAD_EMAIL_COPY_ALL = "worker.thread.email.copy_all"
+        const val THREAD_EMAIL_OPEN = "worker.thread.email.open"
+        /** A `<json-render>` widget rendered in a message. */
+        const val THREAD_WIDGET = "worker.thread.widget"
+        /** A ```mermaid block drawn as its diagram (its source until it draws, or when it can't). */
+        const val THREAD_DIAGRAM = "worker.thread.diagram"
+        /** Switches a diagram between the drawing and its source (`checked` is the source). */
+        const val THREAD_DIAGRAM_SOURCE = "worker.thread.diagram.source"
+        const val THREAD_DIAGRAM_ZOOM = "worker.thread.diagram.zoom"
+        const val THREAD_DIAGRAM_COPY = "worker.thread.diagram.copy"
+        /** A diagram full screen, opened by [THREAD_DIAGRAM_ZOOM]: pinch to zoom; Back or [THREAD_DIAGRAM_VIEWER_CLOSE] closes it. */
+        const val THREAD_DIAGRAM_VIEWER = "worker.thread.diagram_viewer"
+        const val THREAD_DIAGRAM_VIEWER_CLOSE = "worker.thread.diagram_viewer.close"
+        /** A `$$…$$` display equation on its own line (content-desc is its TeX). */
+        const val THREAD_MATH = "worker.thread.math"
+        /** A workspace file opened from a `path:line` link: its sheet, path, line note, copy buttons and readable state. */
+        const val THREAD_FILE = "worker.thread.file_preview"
+        const val THREAD_FILE_PATH = "worker.thread.file_preview.path"
+        const val THREAD_FILE_COPY_PATH = "worker.thread.file_preview.copy_path"
+        const val THREAD_FILE_COPY = "worker.thread.file_preview.copy_file"
+        /** Loading, an error, a binary or empty file, or the truncation notice. */
+        const val THREAD_FILE_STATUS = "worker.thread.file_preview.status"
+        /** The lines of the file, a lazy list scrolled to the line the link named. */
+        const val THREAD_FILE_LINES = "worker.thread.file_preview.lines"
+        const val THREAD_FILE_META = "worker.thread.file_preview.meta"
+        /** Sticky collapsible TodoWrite plan progress bar above the composer, and its header toggle (`checked` is open). */
+        const val THREAD_PLAN = "worker.thread.plan"
+        const val THREAD_PLAN_TOGGLE = "worker.thread.plan.toggle"
+        /** A picture at full size over the Thread, opened from [threadImage]; tap it or [THREAD_IMAGE_CLOSE] to close. */
+        const val THREAD_IMAGE_VIEWER = "worker.thread.image_viewer"
+        const val THREAD_IMAGE_CLOSE = "worker.thread.image_viewer.close"
+        /** A picture a tool returned or a message carried, by its image id: tapping it opens [THREAD_IMAGE_VIEWER]. */
+        fun threadImage(id: String) = "worker.thread.image/$id"
+        /** An image a reply's Markdown shows on a line of its own; its content-desc is the alt text. */
+        const val THREAD_MD_IMAGE = "worker.thread.md_image"
+
+        /** A slash command in [SLASH_MENU], by its name: `composer.slash/model`. */
+        fun slash(name: String) = "composer.slash/$name"
+        /** A file or folder in [MENTION_MENU], by its workspace path (folders end in `/`): `composer.mention/src/app.ts`. */
+        fun mention(path: String) = "composer.mention/$path"
+        /** A line of the open file in [THREAD_FILE_LINES], by its number from 1; the line the link named is `selected`. */
+        fun threadFileLine(n: Int) = "worker.thread.file_preview.line/$n"
+        /** A message waiting in Droid's queue, by its place in it from 1. */
+        fun threadQueued(n: Int) = "worker.thread.queued/$n"
+        /** A message, tool call, thought or notice in the thread, by its entry id. */
+        fun threadEntry(id: String) = "worker.thread.entry/$id"
+        /** Expands or collapses a tool call's arguments and result, or a thought (`checked` is open). */
+        fun threadToggle(id: String) = "worker.thread.toggle/$id"
+        /** Shows all of a long message from the owner, or only its first lines again (`checked` is all of it). */
+        fun threadMore(id: String) = "worker.thread.more/$id"
+        /** One consecutive run of tool calls, by the id of its first entry. */
+        fun threadGroup(id: String) = "worker.thread.group/$id"
+        /** Opens or closes a run's list of actions (`checked` is open). */
+        fun threadGroupToggle(id: String) = "worker.thread.group.toggle/$id"
+        /** A run's one-line summary: "Read 3 files · Ran 2 commands". */
+        fun threadGroupSummary(id: String) = "worker.thread.group.summary/$id"
+        /** What failed in a run, shown even while it is closed. */
+        fun threadGroupError(id: String) = "worker.thread.group.error/$id"
+        /** The plan as the run left it, inside the open run. Reserved: plans are now under [threadRunPlan]. */
+        fun threadGroupPlan(id: String) = "worker.thread.group.plan/$id"
+        /** What didn't simply finish in an Activity: "2 failed · 1 no result". */
+        fun threadGroupStatus(id: String) = "worker.thread.group.status/$id"
+        /** What a live Activity is running now. */
+        fun threadGroupRunning(id: String) = "worker.thread.group.running/$id"
+        /** One run of tool calls inside an open Activity, by the id of the run's first entry. */
+        fun threadRun(id: String) = "worker.thread.run/$id"
+        /** Opens or closes a run's actions (`checked` is open). */
+        fun threadRunToggle(id: String) = "worker.thread.run.toggle/$id"
+        /** The run's plan, when it changed since the last one shown, inside the open run. */
+        fun threadRunPlan(id: String) = "worker.thread.run.plan/$id"
+        /** In an open call whose entry isn't loaded: Load earlier brings what it was given and returned. */
+        fun threadNotLoaded(id: String) = "worker.thread.not_loaded/$id"
+        /** A top-level File Change card, by the tool action id (or `actionId:index` for multi-file edits). */
+        fun threadChange(id: String) = "worker.thread.change/$id"
+        /** Shows all lines of a clamped inline diff (`> 80` lines), or clamps it again (`checked` is full). */
+        fun threadChangeFull(id: String) = "worker.thread.change.full/$id"
+        /** Copies a top-level Command card's shell command. */
+        fun threadCommandCopy(id: String) = "worker.thread.command.copy/$id"
+        /** Opens the delegated subagent's own worker Thread from a Delegation card. */
+        fun threadDelegateOpen(id: String) = "worker.thread.delegate.open/$id"
+
+        // File Change card actions and turn grouping.
+        /** Opens a File Change card's file in the preview sheet, at its first changed line when the diff is numbered. */
+        fun threadChangeOpen(id: String) = "worker.thread.change.open/$id"
+        fun threadChangePreview(id: String) = "worker.thread.change.preview/$id"
+        fun threadCardGroup(id: String) = "worker.thread.cards/$id"
+        fun threadCardGroupToggle(id: String) = "worker.thread.cards.toggle/$id"
+        fun threadTurnChanges(id: String) = "worker.thread.turn.changes/$id"
+        fun threadTurnFile(id: String, index: Int) = "worker.thread.turn.file/$id/$index"
+
+        // The Factory transcript shell: status line, search, message actions, composer toolbar and queue panel.
+        /** The status line under a live turn; its description is the phrase it shows. */
+        const val THREAD_STATUS = "worker.thread.status"
+        /** The Thread bar's search button, and the search row it opens over the conversation. */
+        const val THREAD_SEARCH = "worker.thread.search"
+        const val THREAD_SEARCH_FIELD = "worker.thread.search.field"
+        /** "2 of 5", or "No results". */
+        const val THREAD_SEARCH_COUNT = "worker.thread.search.count"
+        const val THREAD_SEARCH_PREV = "worker.thread.search.prev"
+        const val THREAD_SEARCH_NEXT = "worker.thread.search.next"
+        const val THREAD_SEARCH_CLOSE = "worker.thread.search.close"
+        /** The compaction divider ("Compacted 120k tokens"). */
+        const val THREAD_COMPACTION = "worker.thread.compaction"
+        /** Factory's queued messages panel at the top of the composer, and its Clear all. */
+        const val COMPOSER_QUEUE = "composer.queue"
+        const val COMPOSER_QUEUE_CLEAR = "composer.queue.clear"
+        /** A message's actions row, opened by tapping the message, and its Copy and Quote. */
+        fun threadMessageActions(id: String) = "worker.thread.message.actions/$id"
+        fun threadMessageCopy(id: String) = "worker.thread.message.copy/$id"
+        fun threadMessageQuote(id: String) = "worker.thread.message.quote/$id"
+        /** A row of the queue panel by its place from 1, and its Send now, Remove and Edit. */
+        fun composerQueued(n: Int) = "composer.queue.item/$n"
+        fun composerQueuedSendNow(n: Int) = "composer.queue.send_now/$n"
+        fun composerQueuedRemove(n: Int) = "composer.queue.remove/$n"
+        fun composerQueuedEdit(n: Int) = "composer.queue.edit/$n"
+        /** A message's Rewind and the time it was sent, in its actions row. */
+        fun threadMessageRewind(id: String) = "worker.thread.message.rewind/$id"
+        fun threadMessageTime(id: String) = "worker.thread.message.time/$id"
+        /** The rewind dialog, its two choices (keep the files as they are, or restore them), Rewind and Cancel. */
+        const val THREAD_REWIND = "worker.thread.rewind"
+        const val THREAD_REWIND_KEEP = "worker.thread.rewind.keep"
+        const val THREAD_REWIND_RESTORE = "worker.thread.rewind.restore"
+        const val THREAD_REWIND_CONFIRM = "worker.thread.rewind.confirm"
+        const val THREAD_REWIND_CANCEL = "worker.thread.rewind.cancel"
+        const val THREAD_REWIND_CHOOSE = "worker.thread.rewind.choose"
+        const val THREAD_SIDE = "worker.thread.side"
+        const val THREAD_SIDE_CLOSE = "worker.thread.side.close"
+        const val THREAD_COPY = "worker.thread.copy"
+        const val THREAD_IMAGE_PREVIOUS = "worker.thread.image_viewer.previous"
+        const val THREAD_IMAGE_NEXT = "worker.thread.image_viewer.next"
+        const val THREAD_IMAGE_COUNT = "worker.thread.image_viewer.count"
+        const val THREAD_IMAGE_DOWNLOAD = "worker.thread.image_viewer.download"
+        const val THREAD_DIAGRAM_DOWNLOAD = "worker.thread.diagram.download"
+        const val THREAD_DIAGRAM_SHARE = "worker.thread.diagram.share"
+
+        /** A quick key, by what TalkBack calls it: "Shift Tab" is `key.shift_tab`. */
+        fun key(spoken: String) = "key." + spoken.lowercase().replace(' ', '_')
+
+        /** A quick key's row in [KEYS_SHEET], and its move buttons, by its id (`control_c`). */
+        fun arrangeKey(id: String) = "worker.keys_sheet.key/$id"
+        fun arrangeUp(id: String) = "worker.keys_sheet.up/$id"
+        fun arrangeDown(id: String) = "worker.keys_sheet.down/$id"
+
+        fun removeImage(number: Int) = "composer.remove_image/$number"
+        fun rewindFile(path: String) = "worker.thread.rewind.file/$path"
+        fun copyChoice(choice: String) = "worker.thread.copy/$choice"
+        /** A chip in [PASTES], by its paste's number: tapping it puts the text back in the draft. */
+        fun paste(number: Int) = "composer.paste/$number"
+        fun removePaste(number: Int) = "composer.remove_paste/$number"
+    }
+
+    object SendHome {
+        const val DIALOG = "send_home.dialog"
+        const val CONFIRM = "send_home.confirm"
+        const val ERROR = "send_home.error"
+        /** For a cloud worker: also delete its Factory session. */
+        const val DELETE_SESSION = "send_home.delete_session"
+        const val CANCEL = "send_home.cancel"
+
+        /** `all`, `worktree` or `keep`: the cleanup the office's `kill` message takes. */
+        fun option(cleanup: String) = "send_home.option/$cleanup"
+    }
+
+    object Offices {
+        const val BACK = "offices.back"
+        const val PAIR_NEW = "offices.pair_new"
+        const val ALLOW_NOTIFICATIONS = "offices.allow_notifications"
+        const val STAY_CONNECTED = "settings.stay_connected"
+        const val NOTIFY_NEEDS_INPUT = "settings.notify_needs_input"
+        const val NOTIFY_DONE = "settings.notify_done"
+        const val HAPTICS = "settings.haptics"
+        const val ANSWER_DELAY = "settings.answer_delay"
+        const val FORGET_DIALOG = "forget.dialog"
+        const val FORGET_CONFIRM = "forget.confirm"
+        const val FORGET_CANCEL = "forget.cancel"
+        const val RENAME_DIALOG = "offices.rename_dialog"
+        const val RENAME_INPUT = "offices.rename.input"
+        const val RENAME_SAVE = "offices.rename.save"
+        const val RENAME_CANCEL = "offices.rename.cancel"
+
+        fun office(id: String) = "offices.office/$id"
+        fun forget(id: String) = "offices.forget/$id"
+        fun rename(id: String) = "offices.rename/$id"
+        fun name(id: String) = "offices.name/$id"
+    }
+}

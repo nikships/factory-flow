@@ -1,0 +1,464 @@
+name: Release
+
+# App changes that land on main are built, tested and published as a GitHub release marked Latest.
+# Only affected platforms are rebuilt; unchanged platform assets retain their original versions
+# on the new release so both apps' existing Latest-release update feeds keep working.
+# The Mac app updates through electron-updater, which reads latest-mac.yml. Every release gets a new
+# version, package.json's major.minor plus the number of commits on main (v0.1.68, v0.1.69, ...),
+# so the app always sees it as newer; bump package.json for a new minor.
+#
+# PRs and pushes use the same path filters for each platform.
+# PRs compile and test, but never version, package, sign or upload release artifacts.
+# Test/docs-only changes publish nothing. Manual runs check everything, releasing only on main.
+#
+# Everything runs on GitHub-hosted runners: ubuntu-latest for the Node checks, Android and publishing,
+# macos-26 (Apple silicon) for the Mac app, which is built, signed, notarized and smoke-tested there.
+# Artifacts move between jobs through GitHub's artifact service.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'bin/**'
+      - 'tests/**'
+      - 'README.md'
+      - 'docs/guide/**'
+      - '.husky/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig*.json'
+      - 'vite.config.ts'
+      - 'biome.jsonc'
+      - '.oxlintrc.json'
+      - '.env.example'
+      - '.gitignore'
+      - 'electron-builder.yml'
+      - 'build/**'
+      - 'android/**'
+      - '.github/workflows/release.yml'
+      - '.github/scripts/release-*.mjs'
+      - '.github/scripts/free-port.mjs'
+      - 'tools/android-terminal.mjs'
+      - 'tools/clean-build.mjs'
+      - 'tools/android-model-icons.mjs'
+      - 'tools/thread-fixture.mjs'
+      - 'tools/orchestration-eval/**'
+      - '.agents/skills/flow-clone/**'
+      - '.agents/skills/verify-factory-flow/**'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'bin/**'
+      - 'tests/**'
+      - 'README.md'
+      - 'docs/guide/**'
+      - '.husky/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig*.json'
+      - 'vite.config.ts'
+      - 'biome.jsonc'
+      - '.oxlintrc.json'
+      - '.env.example'
+      - '.gitignore'
+      - 'electron-builder.yml'
+      - 'build/**'
+      - 'android/**'
+      - '.github/workflows/release.yml'
+      - '.github/scripts/release-*.mjs'
+      - '.github/scripts/free-port.mjs'
+      - 'tools/android-terminal.mjs'
+      - 'tools/clean-build.mjs'
+      - 'tools/android-model-icons.mjs'
+      - 'tools/thread-fixture.mjs'
+      - 'tools/orchestration-eval/**'
+      - '.agents/skills/flow-clone/**'
+      - '.agents/skills/verify-factory-flow/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PUBLISHING: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      node: ${{ steps.paths.outputs.node }}
+      mac: ${{ steps.paths.outputs.mac }}
+      android: ${{ steps.paths.outputs.android }}
+      version: ${{ steps.paths.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Find the checks and platforms this change can affect
+        id: paths
+        run: node .github/scripts/release-changes.mjs
+
+  checks:
+    needs: changes
+    if: needs.changes.outputs.node == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      # Electron is only for the Mac app, which the mac job builds.
+      ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install and build
+        run: npm ci --prefer-offline --no-audit --no-fund # its prepare script builds the client and the server
+
+      - run: npm run lint
+
+      - run: npm run typecheck
+
+      # GitHub's Ubuntu image already has Chromium's shared libraries. Do not run install-deps:
+      # it refreshes apt and downloads extra fonts, making cached-browser checks depend on apt mirrors.
+      # Keep the sandbox profile and prove the actual browser can render before running the suite.
+      - name: Choose the shared Chromium folder
+        run: echo "FACTORY_FLOW_BROWSERS_PATH=$RUNNER_TEMP/browsers" >> "$GITHUB_ENV"
+
+      - name: Cache Chromium
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/browsers
+          key: chromium-${{ runner.os }}-${{ hashFiles('node_modules/playwright-core/package.json') }}
+
+      - name: Install Chromium and its sandbox profile
+        run: |
+          node bin/factory-flow.js browser install
+          if [ -e /etc/apparmor.d/abi/4.0 ]; then
+            node bin/factory-flow.js browser apparmor-profile | sudo tee /etc/apparmor.d/factory-flow-chromium > /dev/null
+            sudo apparmor_parser -r /etc/apparmor.d/factory-flow-chromium
+          fi
+
+      - name: Check sandboxed Chromium rendering
+        timeout-minutes: 1
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { launchBrowser, closeBrowser } from './dist/server/server/whiteboard-browser.js';
+          try {
+            const browser = await launchBrowser();
+            const page = await browser.newPage();
+            await page.setContent('<h1>Chromium rendering check</h1>');
+            assert.equal(await page.locator('h1').textContent(), 'Chromium rendering check');
+            assert.ok((await page.screenshot()).length > 0);
+            console.log('Sandboxed Chromium launched and rendered successfully.');
+          } finally {
+            await closeBrowser();
+          }
+          JS
+
+      - name: Test with coverage
+        run: npm run test:coverage # fails below the line and function thresholds in package.json
+
+      - name: Start the office from the checkout
+        env:
+          FACTORY_FLOW_HOME: ${{ runner.temp }}/office
+          # A CI office never makes Tailscale Serve mappings.
+          FACTORY_FLOW_REMOTE_MCP: 'off'
+        run: |
+          cd "$RUNNER_TEMP"
+          port="$(node "$GITHUB_WORKSPACE/.github/scripts/free-port.mjs")"
+          node "$GITHUB_WORKSPACE/bin/factory-flow.js" --host 127.0.0.1 --port "$port" > office.log 2>&1 &
+          office=$!
+          trap 'kill -INT "$office" 2>/dev/null || true' EXIT
+          for _ in $(seq 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/" || true)
+            [ "$code" = 302 ] && break
+            sleep 1
+          done
+          cat office.log
+          [ "$code" = 302 ] || { echo "the checkout's office didn't answer (last status: $code)"; exit 1; }
+          dash=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/dashboard" || true)
+          [ "$dash" = 200 ] || { echo "the checkout's desktop companion didn't answer (last status: $dash)"; exit 1; }
+
+  mac:
+    needs: changes
+    if: needs.changes.outputs.mac == 'true'
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install and build
+        env:
+          # PRs compile the app without downloading the unused Electron runtime.
+          ELECTRON_SKIP_BINARY_DOWNLOAD: ${{ env.PUBLISHING != 'true' && '1' || '' }}
+        run: npm ci --prefer-offline --no-audit --no-fund # its prepare script builds the client, the server, the app's main process
+
+      - name: Set the release version
+        if: env.PUBLISHING == 'true'
+        id: version
+        run: |
+          version="${{ needs.changes.outputs.version }}"
+          npm version "$version" --no-git-tag-version --allow-same-version
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # electron-builder's own keychain for CSC_LINK fails on macOS 26 (set-key-partition-list can't
+      # unlock it), so the certificate goes into a keychain made here, which it then finds by name.
+      - name: Import the Developer ID certificate
+        if: env.PUBLISHING == 'true'
+        env:
+          MAC_CERTS: ${{ secrets.MAC_CERTS }}
+          CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
+        run: |
+          kc="$RUNNER_TEMP/signing.keychain-db"
+          kc_pass="$(openssl rand -base64 24)"
+          security create-keychain -p "$kc_pass" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$kc_pass" "$kc"
+          echo "$MAC_CERTS" | base64 --decode > "$RUNNER_TEMP/developer-id.p12"
+          security import "$RUNNER_TEMP/developer-id.p12" -k "$kc" -P "$CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security -A
+          rm -f "$RUNNER_TEMP/developer-id.p12"
+          # Lets codesign use the key without a prompt.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kc_pass" "$kc" > /dev/null
+          security list-keychains -d user -s "$kc" login.keychain-db
+          security default-keychain -s "$kc"
+          security find-identity -v -p codesigning "$kc" | grep -q 'Developer ID Application: Nikhil Anand (NW6B3R27LQ)'
+
+      - name: Build, sign and notarize the app
+        if: env.PUBLISHING == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npx electron-builder --mac --arm64 --publish never
+
+      # The macOS 14 floor for electron-updater, which compares it with the Darwin version (23 is macOS 14),
+      # so a Mac on macOS 13 or earlier is never offered a build that refuses to open there.
+      - name: Require macOS 14 in the update metadata
+        if: env.PUBLISHING == 'true'
+        run: |
+          grep -q '^minimumSystemVersion:' release/latest-mac.yml || echo 'minimumSystemVersion: 23.0.0' >> release/latest-mac.yml
+          grep -qx 'minimumSystemVersion: 23.0.0' release/latest-mac.yml
+          app="release/mac-arm64/Factory Flow.app"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app/Contents/Info.plist")" = 14.0
+
+      # Check the supported platform using the signed app without opening a window.
+      - name: Check the app's startup gates
+        if: env.PUBLISHING == 'true'
+        run: |
+          app="release/mac-arm64/Factory Flow.app"
+          bin="$app/Contents/MacOS/Factory Flow"
+          "$bin" --startup-check --user-data-dir="$RUNNER_TEMP/startup-check" | tee startup-check.log
+          grep -q '^startup-check ok' startup-check.log
+
+      # On the Helper binary, as src/desktop/runtime.ts runs it, so this is the signed binary the app uses.
+      - name: Start the office on the app's own Electron
+        if: env.PUBLISHING == 'true'
+        env:
+          FACTORY_FLOW_REMOTE_MCP: 'off'
+        run: |
+          app="release/mac-arm64/Factory Flow.app"
+          port="$(node "$GITHUB_WORKSPACE/.github/scripts/free-port.mjs")"
+          ELECTRON_RUN_AS_NODE=1 "$app/Contents/Frameworks/Factory Flow Helper.app/Contents/MacOS/Factory Flow Helper" "$app/Contents/Resources/app/bin/factory-flow.js" \
+            --home "$RUNNER_TEMP/office" --host 127.0.0.1 --port "$port" > office.log 2>&1 &
+          office=$!
+          trap 'kill -INT "$office" 2>/dev/null || true' EXIT
+          for _ in $(seq 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/" || true)
+            [ "$code" = 302 ] && break
+            sleep 1
+          done
+          cat office.log
+          [ "$code" = 302 ] || { echo "the app's office didn't answer (last status: $code)"; exit 1; }
+          dash=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/dashboard" || true)
+          [ "$dash" = 200 ] || { echo "the app's desktop companion didn't answer (last status: $dash)"; exit 1; }
+          kill -INT "$office"
+          grep -qx "version: ${{ steps.version.outputs.version }}" release/latest-mac.yml
+
+      - name: Check the signature and notarize the disk image
+        if: env.PUBLISHING == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          app="release/mac-arm64/Factory Flow.app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          xcrun stapler validate "$app"
+          spctl --assess --type execute -vv "$app" 2>&1 | tee spctl.log
+          grep -q 'source=Notarized Developer ID' spctl.log
+          # electron-builder notarizes the app inside; the disk image around it gets its own ticket.
+          dmg="release/Factory-Flow-${{ steps.version.outputs.version }}-arm64.dmg"
+          xcrun notarytool submit "$dmg" --apple-id "$APPLE_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" --team-id "$APPLE_TEAM_ID" --wait
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type open --context context:primary-signature -vv "$dmg" 2>&1 | tee spctl-dmg.log
+          grep -q 'source=Notarized Developer ID' spctl-dmg.log
+
+      - name: Upload the Mac assets for publishing
+        if: env.PUBLISHING == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: mac
+          path: |
+            release/*.dmg
+            release/*.zip
+            release/*.blockmap
+            release/latest-mac.yml
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  android:
+    needs: changes
+    if: needs.changes.outputs.android == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: android
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Set the release version
+        if: env.PUBLISHING == 'true'
+        id: version
+        working-directory: .
+        run: |
+          version="${{ needs.changes.outputs.version }}"
+          count="${version##*.}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "code=$count" >> "$GITHUB_OUTPUT"
+
+      - name: Unit tests and lint
+        run: ./gradlew testDebugUnitTest lintDebug
+
+      # Signed with the repository's release keystore (the ANDROID_KEYSTORE_* and ANDROID_KEY_*
+      # secrets), so each release installs over the last. PRs only run debug unit tests and lint.
+      - name: Build the release APK
+        if: env.PUBLISHING == 'true'
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          test -n "$ANDROID_KEYSTORE_BASE64" || { echo "::error::ANDROID_KEYSTORE_BASE64 is not set; a debug-signed APK could never update an installed app"; exit 1; }
+          trap 'rm -f "$RUNNER_TEMP/release.jks"' EXIT
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release.jks"
+          export ANDROID_KEYSTORE_FILE="$RUNNER_TEMP/release.jks"
+          ./gradlew assembleRelease \
+            -PofficeVersion=${{ steps.version.outputs.version }} -PofficeVersionCode=${{ steps.version.outputs.code }}
+          mkdir -p out
+          apk="out/Factory-Flow-${{ steps.version.outputs.version }}.apk"
+          cp app/build/outputs/apk/release/app-release.apk "$apk"
+          build_tools="$(find "$ANDROID_HOME/build-tools" -maxdepth 1 -mindepth 1 -type d -exec basename {} \; | sort -V | tail -n 1)"
+          apksigner="$ANDROID_HOME/build-tools/$build_tools/apksigner"
+          echo "apksigner: $apksigner"
+          certs="$("$apksigner" verify --print-certs "$apk")"
+          echo "$certs" | grep -E 'certificate (DN|SHA-256)'
+          if echo "$certs" | grep -q 'CN=Android Debug'; then
+            echo "::error::The APK is debug-signed even though the release keystore was given"
+            exit 1
+          fi
+
+      - name: Upload the APK for publishing
+        if: env.PUBLISHING == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: android
+          path: android/out/*.apk
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  publish:
+    needs: [changes, checks, mac, android]
+    # always() lets unaffected (skipped) jobs coexist with the platform that actually built.
+    # Never publish after a failure/cancellation, or when no app changed.
+    if: >-
+      always() && !cancelled() &&
+      github.event_name != 'pull_request' && github.ref == 'refs/heads/main' &&
+      needs.changes.result == 'success' &&
+      (needs.checks.result == 'success' || needs.checks.result == 'skipped') &&
+      (needs.mac.result == 'success' || needs.mac.result == 'skipped') &&
+      (needs.android.result == 'success' || needs.android.result == 'skipped') &&
+      (needs.mac.result == 'success' || needs.android.result == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Take the artifacts the platform jobs built
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/assets
+          merge-multiple: true
+
+      - name: Publish
+        working-directory: ${{ runner.temp }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: v${{ needs.changes.outputs.version }}
+          MAC_CHANGED: ${{ needs.changes.outputs.mac }}
+          ANDROID_CHANGED: ${{ needs.changes.outputs.android }}
+        run: |
+          mkdir -p assets
+          # Both installed apps read Latest. Preserve the other app's signed binaries and version
+          # rather than rebuilding it or leaving its update feed without an installable app.
+          latest="$(gh release view --json tagName --jq .tagName 2>/dev/null || true)"
+          if [ -n "$latest" ] && [ "${latest##*.}" -gt "${TAG##*.}" ]; then
+            echo "A newer release is already published; not promoting this older run."
+            exit 0
+          fi
+          if [ "$MAC_CHANGED" != true ]; then
+            [ -n "$latest" ] || { echo "::error::No earlier release to take the Mac assets from"; exit 1; }
+            gh release download "$latest" --dir assets \
+              --pattern '*.dmg' --pattern '*.zip' --pattern '*.blockmap' --pattern 'latest-mac.yml'
+          else
+            grep -qx "version: ${{ needs.changes.outputs.version }}" assets/latest-mac.yml
+          fi
+          if [ "$ANDROID_CHANGED" != true ]; then
+            [ -n "$latest" ] || { echo "::error::No earlier release to take the APK from"; exit 1; }
+            gh release download "$latest" --dir assets --pattern '*.apk'
+          fi
+          test -f assets/latest-mac.yml
+          compgen -G 'assets/*.zip' > /dev/null
+          compgen -G 'assets/*.dmg' > /dev/null
+          compgen -G 'assets/*.apk' > /dev/null
+          printf '%s\n' assets/*
+          notes="Rebuilt platforms: macOS=$MAC_CHANGED, Android=$ANDROID_CHANGED. Other platform assets retain their original versions."
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            # A rerun: replace the assets together, so latest-mac.yml matches the zip it lists.
+            gh release upload "$TAG" assets/* --clobber
+          else
+            # Publish only once all assets are uploaded, so neither updater sees a partial release.
+            gh release create "$TAG" assets/* --draft \
+              --target "$GITHUB_SHA" --title "$TAG" --notes "$notes" --generate-notes
+          fi
+          gh release edit "$TAG" --draft=false --latest

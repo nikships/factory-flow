@@ -1,0 +1,172 @@
+import type { GhReviewComment } from '../../shared/protocol';
+import type { DiffFile } from './diffparse';
+import { h, timeAgo } from './dom';
+import { markdown } from './markdown';
+
+export { parseDiff, type DiffFile, type DiffLine } from './diffparse';
+
+// The Files tab draws a PR's unified diff (parsed in diffparse.ts): each file's lines with inline
+// review comments, the file list/tree, and which files you've reviewed.
+
+// ---- Which files you've reviewed, per PR, kept in this browser --------------------------------
+
+const REVIEWED_KEY = 'factory-flow.reviewed';
+const KEEP_PRS = 60;
+
+type ReviewedStore = Record<string, { at: number; files: Record<string, string> }>;
+
+function loadReviewed(): ReviewedStore {
+  try {
+    const v = JSON.parse(localStorage.getItem(REVIEWED_KEY) ?? '{}');
+    return v && typeof v === 'object' ? v : {};
+  } catch {
+    return {};
+  }
+}
+
+export type ReviewMark = 'none' | 'reviewed' | 'stale';
+
+/** Your review marks for one PR (keyed by its URL): reviewed, or reviewed but changed since. */
+export class Reviewed {
+  private files: Record<string, string>;
+
+  constructor(private pr: string) {
+    this.files = { ...(loadReviewed()[pr]?.files ?? {}) };
+  }
+
+  mark(f: DiffFile): ReviewMark {
+    const h = this.files[f.path];
+    return h === undefined ? 'none' : h === f.hash ? 'reviewed' : 'stale';
+  }
+
+  set(f: DiffFile, on: boolean) {
+    if (on) this.files[f.path] = f.hash;
+    else delete this.files[f.path];
+    const all = loadReviewed();
+    if (Object.keys(this.files).length) all[this.pr] = { at: Date.now(), files: this.files };
+    else delete all[this.pr];
+    // Forget the PRs looked at longest ago.
+    const keys = Object.keys(all).sort((a, b) => all[b].at - all[a].at);
+    for (const k of keys.slice(KEEP_PRS)) delete all[k];
+    try {
+      localStorage.setItem(REVIEWED_KEY, JSON.stringify(all));
+    } catch {
+      // storage blocked or full: the mark lasts until the window closes
+    }
+  }
+}
+
+// ---- Drawing a file's diff ------------------------------------------------------------------------
+
+export const STATUS_WORD: Record<DiffFile['status'], string> = { A: 'added', D: 'deleted', M: 'modified', R: 'renamed' };
+
+/** Lock files and build output: collapsed until asked for, like GitHub does. */
+export { looksGeneratedPath as looksGenerated } from '../../shared/thread-diff';
+
+/** A line comment and its replies. */
+export function renderThread(root: GhReviewComment, replies: Map<number, GhReviewComment[]>, itemUrl: string): HTMLElement {
+  const all = [root, ...(replies.get(root.id) ?? [])];
+  return h(
+    'div.pd-thread',
+    {},
+    ...all.map((c) =>
+      h(
+        'div.pd-comment',
+        {},
+        h('div.pd-comment-head', {}, h('b', {}, c.author), h('a', { href: c.url, target: '_blank', rel: 'noopener noreferrer', title: new Date(c.createdAt).toLocaleString() }, timeAgo(c.createdAt))),
+        markdown(c.body, itemUrl),
+      ),
+    ),
+  );
+}
+
+/** Line comments on this file that are still on a line, keyed "RIGHT:12" / "LEFT:7". */
+function threadsByLine(comments: GhReviewComment[], path: string): Map<string, GhReviewComment[]> {
+  const out = new Map<string, GhReviewComment[]>();
+  for (const c of comments) {
+    if (c.replyTo || c.path !== path || c.line == null) continue;
+    const k = `${c.side}:${c.line}`;
+    out.set(k, [...(out.get(k) ?? []), c]);
+  }
+  return out;
+}
+
+export function repliesOf(comments: GhReviewComment[]): Map<number, GhReviewComment[]> {
+  const out = new Map<number, GhReviewComment[]>();
+  for (const c of comments) if (c.replyTo) out.set(c.replyTo, [...(out.get(c.replyTo) ?? []), c]);
+  return out;
+}
+
+/** The lines of one file's diff, with its line comments under the lines they're on. */
+export function renderFileDiff(f: DiffFile, comments: GhReviewComment[], itemUrl: string): HTMLElement {
+  const out = h('div.pd-lines');
+  if (f.binary) {
+    out.append(h('div.pd-note', {}, 'Binary file — not shown.'));
+    return out;
+  }
+  if (!f.lines.length) {
+    out.append(h('div.pd-note', {}, f.status === 'R' ? 'Renamed without changes.' : 'No changes to show (file mode or empty file).'));
+    return out;
+  }
+  const threads = threadsByLine(comments, f.path);
+  const replies = repliesOf(comments);
+  for (const l of f.lines) {
+    if (l.kind === 'hunk') {
+      out.append(h('div.pd-l.hunk', {}, h('span.pd-n'), h('span.pd-n'), h('span.pd-code', {}, l.text)));
+      continue;
+    }
+    if (l.kind === 'note') {
+      out.append(h('div.pd-l.note', {}, h('span.pd-n'), h('span.pd-n'), h('span.pd-code', {}, l.text)));
+      continue;
+    }
+    const sign = l.kind === 'add' ? '+' : l.kind === 'del' ? '-' : ' ';
+    const row = h('div.pd-l', { class: l.kind }, h('span.pd-n', {}, l.old ?? ''), h('span.pd-n', {}, l.new ?? ''), h('span.pd-code', { 'data-sign': sign }, l.text));
+    if (l.new !== undefined) row.dataset.new = String(l.new);
+    if (l.old !== undefined) row.dataset.old = String(l.old);
+    out.append(row);
+    const here = [...(l.new !== undefined ? (threads.get(`RIGHT:${l.new}`) ?? []) : []), ...(l.old !== undefined && l.kind !== 'ctx' ? (threads.get(`LEFT:${l.old}`) ?? []) : [])];
+    for (const c of here) out.append(renderThread(c, replies, itemUrl));
+  }
+  return out;
+}
+
+// ---- The file list as a folder tree --------------------------------------------------------------
+
+export interface TreeDir {
+  name: string;
+  path: string;
+  dirs: TreeDir[];
+  files: DiffFile[];
+}
+
+/** Folders with their files, single-child folder chains squashed ("src/client/ui"), like GitHub. */
+export function buildTree(files: DiffFile[]): TreeDir {
+  const root: TreeDir = { name: '', path: '', dirs: [], files: [] };
+  for (const f of files) {
+    const parts = f.path.split('/');
+    let d = root;
+    for (const part of parts.slice(0, -1)) {
+      const p = d.path ? `${d.path}/${part}` : part;
+      let next = d.dirs.find((x) => x.name === part && x.path === p);
+      if (!next) d.dirs.push((next = { name: part, path: p, dirs: [], files: [] }));
+      d = next;
+    }
+    d.files.push(f);
+  }
+  const squash = (d: TreeDir): TreeDir => {
+    d.dirs = d.dirs.map(squash);
+    while (d.dirs.length === 1 && !d.files.length && d.path) {
+      const only = d.dirs[0];
+      d = { name: `${d.name}/${only.name}`, path: only.path, dirs: only.dirs, files: only.files };
+    }
+    d.dirs.sort((a, b) => a.name.localeCompare(b.name));
+    d.files.sort((a, b) => a.path.localeCompare(b.path));
+    return d;
+  };
+  return squash(root);
+}
+
+/** Files in the order the tree shows them, so the diff pane matches the sidebar. */
+export function treeOrder(d: TreeDir): DiffFile[] {
+  return [...d.dirs.flatMap(treeOrder), ...d.files];
+}

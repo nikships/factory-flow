@@ -1,0 +1,55 @@
+# The Factory Flow Mac app (src/desktop): `npm run package:mac` builds it into release/.
+# .github/workflows/release.yml builds, signs and notarizes it for every release, and the app
+# updates itself from the newest GitHub release through electron-updater (latest-mac.yml).
+appId: com.nikships.factory-flow
+productName: Factory Flow
+copyright: Copyright © Nikhil Anand
+
+directories:
+  output: release
+  buildResources: build
+
+files:
+  - package.json
+  - bin/**/*
+  - dist/**/*
+  - '!dist/**/*.map'
+# The office runs bin/factory-flow.js, its PTY host and the workers' hook scripts
+# as files on disk with Electron's Node, and node-pty spawns its spawn-helper from disk,
+# so nothing is packed into an asar archive.
+asar: false
+# node-pty ships Node-API prebuilds, which load in Electron as they are.
+npmRebuild: false
+electronLanguages:
+  - en
+
+mac:
+  category: public.app-category.developer-tools
+  icon: build/icon.png
+  identity: Nikhil Anand (NW6B3R27LQ)
+  hardenedRuntime: true
+  # Supported macOS floor. Written into the app's
+  # Info.plist as LSMinimumSystemVersion. src/desktop/requirements.ts (MIN_MACOS) checks it again at startup.
+  minimumSystemVersion: '14.0'
+  gatekeeperAssess: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  # GitHub turns spaces in asset names into dots, which would break the names latest-mac.yml lists.
+  artifactName: Factory-Flow-${version}-${arch}.${ext}
+  target:
+    - target: dmg
+      arch: [arm64]
+    # electron-updater installs updates from the zip.
+    - target: zip
+      arch: [arm64]
+
+dmg:
+  title: Factory Flow
+  # Signed like the app, so Gatekeeper accepts the disk image itself (the release job notarizes it).
+  sign: true
+
+publish:
+  provider: github
+  owner: nikships
+  repo: factory-flow
+  releaseType: release

@@ -1,0 +1,112 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-09-28T17:29:31.000Z",
+  "commit": "27d5da8b9b56ab1b3d9114de361931d2f2779139",
+  "agent": {
+    "harness": "droid",
+    "model": "Opus 5.5",
+    "reasoningEffort": "default"
+  },
+  "verdict": "ready",
+  "score": 100,
+  "grade": "A+",
+  "summary": "typescript, javascript npm package (Node server + Vite client). All 13 criteria pass.",
+  "stack": {
+    "languages": [
+      "typescript",
+      "javascript"
+    ],
+    "monorepo": true,
+    "packages": [
+      "src/client"
+    ]
+  },
+  "criteria": [
+    {
+      "id": "lint_format",
+      "status": "pass",
+      "notes": "Biome lints and formats every .js, .mjs and .ts file outside dist/ (biome.jsonc tracked); package.json has \"lint\" (biome check --error-on-warnings .) and \"format\" scripts. 284 files pass with no suppression comments.",
+      "measurement": {
+        "command": "npm run lint"
+      }
+    },
+    {
+      "id": "typecheck",
+      "status": "pass",
+      "notes": "package.json \"typecheck\" runs tsc --noEmit on tsconfig.server.json and tsconfig.client.json (both extend strict tsconfig.base.json).",
+      "measurement": {
+        "command": "npm run typecheck"
+      }
+    },
+    {
+      "id": "tests",
+      "status": "pass",
+      "notes": "37 test files under tests/*.test.ts (268 tests), run by node:test through tsx.",
+      "measurement": {
+        "command": "npm test"
+      }
+    },
+    {
+      "id": "build",
+      "status": "pass",
+      "notes": "package.json \"build\" runs vite build (client) then tsc -p tsconfig.server.json (server into dist/server).",
+      "measurement": {
+        "command": "npm run build"
+      }
+    },
+    {
+      "id": "setup",
+      "status": "pass",
+      "notes": "AGENTS.md \"Commands\" and docs/guide/development.md document npm ci / npm install, build, lint, typecheck, tests and running bin/factory-flow.js; \"dev\" and \"start\" scripts exist.",
+      "measurement": {
+        "command": "npm ci && npm run dev"
+      }
+    },
+    {
+      "id": "agents_md",
+      "status": "pass",
+      "notes": "Root AGENTS.md plus nested src/server/AGENTS.md, src/client/AGENTS.md and src/shared/AGENTS.md. No CLAUDE.md adapters; Claude Code loads AGENTS.md natively."
+    },
+    {
+      "id": "env_example",
+      "status": "pass",
+      "notes": ".env.example lists every FACTORY_FLOW_* and PORT setting the office and installers read; tests/env-example.test.ts keeps it in sync with the code, and .gitignore ignores .env and .env.* except .env.example."
+    },
+    {
+      "id": "ci_parity",
+      "status": "pass",
+      "notes": ".github/workflows/release.yml runs npm ci (prepare builds), npm run lint, npm run typecheck and npm run test:coverage on pull requests and main, then packs and install-smokes the release. No continue-on-error.",
+      "measurement": {
+        "command": "npm ci && npm run lint && npm run typecheck && npm run test:coverage"
+      }
+    },
+    {
+      "id": "templates",
+      "status": "pass",
+      "notes": ".github/ISSUE_TEMPLATE/ (bug_report.yml, feature_request.yml, config.yml) and .github/pull_request_template.md are tracked."
+    },
+    {
+      "id": "precommit",
+      "status": "pass",
+      "notes": ".husky/pre-commit runs lint-staged (biome check --write on staged files) and npm run typecheck; prepare installs it through .husky/install.mjs, skipped in CI and installs without dev dependencies."
+    },
+    {
+      "id": "coverage",
+      "status": "pass",
+      "notes": "package.json \"test:coverage\" runs node:test with --experimental-test-coverage and --test-coverage-lines=78 / --test-coverage-functions=61; release.yml runs it. Measured on Node 22: 80.22% lines, 71.95% functions.",
+      "measurement": {
+        "command": "npm run test:coverage"
+      }
+    },
+    {
+      "id": "lockfile",
+      "status": "pass",
+      "notes": "package-lock.json is tracked for the root package.json."
+    },
+    {
+      "id": "gitignore_hygiene",
+      "status": "pass",
+      "notes": "Root .gitignore ignores node_modules, dist, runtime office state and .env files."
+    }
+  ]
+}

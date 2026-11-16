@@ -1,0 +1,148 @@
+package ai.factory.droidoffice.ui.theme
+
+import android.content.Context
+import android.graphics.BitmapFactory
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.graphics.vector.PathParser
+import androidx.compose.ui.unit.dp
+
+/**
+ * The app's own line icons, drawn on a 24 grid with a 1.75 stroke so they sit with Geist's weight.
+ * Material's core set covers the rest.
+ */
+object OfficeIcons {
+    private val modelMarks = mutableMapOf<String, ImageBitmap>()
+
+    /** Exact official artwork, including gradients and masks, rendered from the web's bundled SVGs. */
+    fun model(context: Context, brand: String): ImageBitmap = modelMarks.getOrPut(brand) {
+        context.assets.open("model-icons/$brand.png").use { source ->
+            requireNotNull(BitmapFactory.decodeStream(source)) { "Invalid model logo: $brand" }.asImageBitmap()
+        }
+    }
+
+    private fun icon(name: String, vararg strokes: String, fills: List<Pair<String, Float>> = emptyList()): ImageVector {
+        val b = ImageVector.Builder(name = name, defaultWidth = 24.dp, defaultHeight = 24.dp, viewportWidth = 24f, viewportHeight = 24f)
+        for (d in strokes) {
+            b.addPath(
+                pathData = PathParser().parsePathString(d).toNodes(),
+                stroke = SolidColor(Color.Black),
+                strokeLineWidth = 1.75f,
+                strokeLineCap = StrokeCap.Round,
+                strokeLineJoin = StrokeJoin.Round,
+            )
+        }
+        for ((d, alpha) in fills) b.addPath(pathData = PathParser().parsePathString(d).toNodes(), fill = SolidColor(Color.Black), fillAlpha = alpha)
+        return b.build()
+    }
+
+    private fun dot(cx: Float, cy: Float, r: Float) = "M${cx - r},${cy}a$r,$r 0 1,0 ${r * 2},0a$r,$r 0 1,0 ${-r * 2},0z"
+
+    val Scan = icon(
+        "Scan",
+        "M3 8V5.5A2.5 2.5 0 0 1 5.5 3H8", "M16 3h2.5A2.5 2.5 0 0 1 21 5.5V8", "M21 16v2.5a2.5 2.5 0 0 1-2.5 2.5H16", "M8 21H5.5A2.5 2.5 0 0 1 3 18.5V16",
+        "M7.5 7.5h3v3h-3z", "M13.5 13.5h3v3h-3z", "M13.5 7.5h3", "M7.5 13.5v3",
+    )
+    val Terminal = icon("Terminal", "M3.5 5.5a2 2 0 0 1 2-2h13a2 2 0 0 1 2 2v13a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z", "M7.5 9l3 3-3 3", "M12.5 15h4")
+    val Wifi = icon("Wifi", "M2.5 8.8a14 14 0 0 1 19 0", "M5.6 12.2a9.5 9.5 0 0 1 12.8 0", "M8.8 15.6a5 5 0 0 1 6.4 0", fills = listOf(dot(12f, 19f, 1.3f) to 1f))
+    val Tailscale = icon(
+        "Tailscale",
+        fills = listOf(
+            dot(5f, 5f, 2.2f) to 0.35f, dot(12f, 5f, 2.2f) to 0.35f, dot(19f, 5f, 2.2f) to 0.35f,
+            dot(5f, 12f, 2.2f) to 1f, dot(12f, 12f, 2.2f) to 1f, dot(19f, 12f, 2.2f) to 1f,
+            dot(5f, 19f, 2.2f) to 0.35f, dot(12f, 19f, 2.2f) to 1f, dot(19f, 19f, 2.2f) to 0.35f,
+        ),
+    )
+    val Globe = icon("Globe", "M12 3a9 9 0 1 0 0 18a9 9 0 1 0 0-18z", "M3 12h18", "M12 3c2.5 2.6 3.7 5.6 3.7 9s-1.2 6.4-3.7 9c-2.5-2.6-3.7-5.6-3.7-9S9.5 5.6 12 3z")
+    val PullRequest = icon(
+        "PullRequest",
+        "M6 3.8a2.2 2.2 0 1 0 0 4.4a2.2 2.2 0 1 0 0-4.4z", "M6 15.8a2.2 2.2 0 1 0 0 4.4a2.2 2.2 0 1 0 0-4.4z", "M6 8.2v7.6",
+        "M18 15.8a2.2 2.2 0 1 0 0 4.4a2.2 2.2 0 1 0 0-4.4z", "M18 15.8V9a2.5 2.5 0 0 0-2.5-2.5H12", "M14.5 4l-2.5 2.5 2.5 2.5",
+    )
+    val Branch = icon(
+        "Branch",
+        "M6 3.8a2.2 2.2 0 1 0 0 4.4a2.2 2.2 0 1 0 0-4.4z", "M6 15.8a2.2 2.2 0 1 0 0 4.4a2.2 2.2 0 1 0 0-4.4z", "M18 3.8a2.2 2.2 0 1 0 0 4.4a2.2 2.2 0 1 0 0-4.4z",
+        "M6 8.2v7.6", "M18 8.2c0 4.5-3.5 6.3-8.5 7.3",
+    )
+    val Fork = icon(
+        "Fork",
+        "M6 2.8a2.2 2.2 0 1 0 0 4.4a2.2 2.2 0 1 0 0-4.4z", "M18 2.8a2.2 2.2 0 1 0 0 4.4a2.2 2.2 0 1 0 0-4.4z",
+        "M12 16.8a2.2 2.2 0 1 0 0 4.4a2.2 2.2 0 1 0 0-4.4z", "M6 7.2V8a4 4 0 0 0 4 4h4a4 4 0 0 0 4-4v-.8", "M12 12v4.8",
+    )
+    val Trash = icon("Trash", "M3.5 6h17", "M9 6V3.5h6V6", "M5.5 6l1 14h11l1-14", "M10 10v6", "M14 10v6")
+    val Bolt = icon("Bolt", fills = listOf("M13.2 2.5L4.8 13.4h6l-1.1 8.1 8.5-11.1h-6.1z" to 1f))
+    val Paste = icon("Paste", "M8.5 4.5h-2a2 2 0 0 0-2 2v12.5a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V6.5a2 2 0 0 0-2-2h-2", "M9 3h6v3H9z", "M8.5 12h7", "M8.5 15.5h4.5")
+    val Keyboard = icon("Keyboard", "M2.5 7a2 2 0 0 1 2-2h15a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-15a2 2 0 0 1-2-2z", "M6 9.5h.01", "M10 9.5h.01", "M14 9.5h.01", "M18 9.5h.01", "M6 12.5h.01", "M18 12.5h.01", "M8 15.5h8")
+    val Moon = icon("Moon", "M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z")
+    val Laptop = icon("Laptop", "M5 6a1.5 1.5 0 0 1 1.5-1.5h11A1.5 1.5 0 0 1 19 6v9H5z", "M2.5 18.5h19")
+    val Cloud = icon("Cloud", "M7 18.5h10.5a4 4 0 0 0 .4-7.98A6 6 0 0 0 6.3 9.7 4.4 4.4 0 0 0 7 18.5z")
+    val Layers = icon("Layers", "M12 3l9 5-9 5-9-5z", "M3 12.5l9 5 9-5", "M3 16.5l9 5 9-5")
+    val ArrowUp = icon("ArrowUp", "M12 19.5V5", "M5.5 11.5L12 5l6.5 6.5")
+    val ArrowDown = icon("ArrowDown", "M12 4.5V19", "M5.5 12.5L12 19l6.5-6.5")
+    val Download = icon("Download", "M12 3v12", "M7 10l5 5 5-5", "M4 16v5h16v-5")
+    val Chevron = icon("Chevron", "M9.5 6l6 6-6 6")
+    val ChevronLeft = icon("ChevronLeft", "M14.5 6l-6 6 6 6")
+    val Retry = icon("Retry", "M19 12a7 7 0 1 1-2.05-4.95", "M19 4.5V8.5h-4")
+    val Sliders = icon(
+        "Sliders",
+        "M4 7h9", "M19 7h1", "M4 17h3", "M13 17h7",
+        "M16 4.8a2.2 2.2 0 1 0 0 4.4a2.2 2.2 0 1 0 0-4.4z", "M10 14.8a2.2 2.2 0 1 0 0 4.4a2.2 2.2 0 1 0 0-4.4z",
+    )
+    val Grip = icon(
+        "Grip",
+        fills = listOf(
+            dot(9f, 6f, 1.4f) to 1f, dot(15f, 6f, 1.4f) to 1f,
+            dot(9f, 12f, 1.4f) to 1f, dot(15f, 12f, 1.4f) to 1f,
+            dot(9f, 18f, 1.4f) to 1f, dot(15f, 18f, 1.4f) to 1f,
+        ),
+    )
+    val Door = icon("Door", "M6 21V5a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v16", "M3.5 21h17", "M14.5 12h.01")
+    val External = icon("External", "M14 4h6v6", "M20 4l-8.5 8.5", "M18 13.5V19a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5.5")
+    val Copy = icon("Copy", "M9 9h10a1.5 1.5 0 0 1 1.5 1.5v9A1.5 1.5 0 0 1 19 21h-9.5A1.5 1.5 0 0 1 8 19.5V10a1 1 0 0 1 1-1z", "M16 9V5.5A1.5 1.5 0 0 0 14.5 4H5.5A1.5 1.5 0 0 0 4 5.5v9A1.5 1.5 0 0 0 5.5 16H8")
+    val Building = icon("Building", "M4 21V4.5a1 1 0 0 1 1-1h9a1 1 0 0 1 1 1V21", "M15 9h4a1 1 0 0 1 1 1v11", "M2.5 21h19", "M8 7.5h3", "M8 11h3", "M8 14.5h3")
+    val Unplug = icon("Unplug", "M3 3l18 18", "M8.5 8.5L6 11a4.2 4.2 0 0 0 6 6l2.5-2.5", "M15.5 15.5L18 13a4.2 4.2 0 0 0-6-6L9.5 9.5", "M19 5l2-2", "M3 21l2-2")
+    val Sparkle = icon("Sparkle", "M12 3.5l1.8 5.2 5.2 1.8-5.2 1.8L12 17.5l-1.8-5.2L5 10.5l5.2-1.8z", "M18.5 16.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z")
+    val Whiteboard = icon("Whiteboard", "M3.5 5a1.5 1.5 0 0 1 1.5-1.5h14A1.5 1.5 0 0 1 20.5 5v10a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 15z", "M12 16.5v4", "M8.5 20.5h7", "M7.5 12.5l3-3.5 2.5 2 3.5-4")
+    val Comment = icon("Comment", "M4.5 6a2 2 0 0 1 2-2h11a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H11l-4.5 3.5V16h0a2 2 0 0 1-2-2z")
+    val Picture = icon(
+        "Picture",
+        "M4.5 5.5a1 1 0 0 1 1-1h13a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-13a1 1 0 0 1-1-1z",
+        "M4.5 16l4.5-4.5 3.5 3.5 2.5-2.5 4.5 4.5",
+        fills = listOf(dot(15.5f, 8.5f, 1.4f) to 1f),
+    )
+    val Expand = icon("Expand", "M4 9V4h5", "M20 9V4h-5", "M4 15v5h5", "M20 15v5h-5")
+    val Collapse = icon("Collapse", "M9 4v5H4", "M15 4v5h5", "M9 20v-5H4", "M15 20v-5h5")
+    val Bell = icon("Bell", "M6 16.5V11a6 6 0 0 1 12 0v5.5l1.5 2h-15z", "M10 20.5a2 2 0 0 0 4 0")
+    val Link = icon("Link", "M10 14a4.5 4.5 0 0 0 6.4 0l3-3a4.5 4.5 0 0 0-6.4-6.4l-1 1", "M14 10a4.5 4.5 0 0 0-6.4 0l-3 3a4.5 4.5 0 0 0 6.4 6.4l1-1")
+    val Shell = icon("Shell", "M4 17.5l5-5.5-5-5.5", "M11.5 18h8.5")
+    val Plus = icon("Plus", "M12 5v14", "M5 12h14")
+    val Minus = icon("Minus", "M5 12h14")
+    /** The Orchestrator: a ring round the building with one satellite on it. */
+    val Orbit = icon("Orbit", "M12 9.5a2.5 2.5 0 1 0 0 5a2.5 2.5 0 1 0 0-5z", "M3 12a9 4 0 1 0 18 0a9 4 0 1 0-18 0", fills = listOf(dot(18.4f, 8.9f, 1.6f) to 1f))
+    /** An external bot, reaching the office from elsewhere. */
+    val Antenna = icon("Antenna", "M12 12.5v8", "M8.5 20.5h7", "M9.2 9.2a4 4 0 0 1 5.6 0", "M6.4 6.4a8 8 0 0 1 11.2 0", fills = listOf(dot(12f, 12f, 1.4f) to 1f))
+    val Agent = icon("Agent", "M7 7.5a5 5 0 0 1 10 0V12a5 5 0 0 1-10 0z", "M9.8 9.6h.01", "M14.2 9.6h.01", "M9.8 13a3 3 0 0 0 4.4 0", "M4.5 20.5a8.5 8.5 0 0 1 15 0", "M12 2.5v0")
+    val Workers = icon(
+        "Workers",
+        "M9 4.8a3.2 3.2 0 1 0 0 6.4a3.2 3.2 0 1 0 0-6.4z",
+        "M3.2 19.5a5.8 5.8 0 0 1 11.6 0",
+        "M15.2 5.1a3 3 0 0 1 0 5.8",
+        "M16.5 14.1a5.2 5.2 0 0 1 4.3 5.4",
+    )
+    val Search = icon("Search", "M11 4a7 7 0 1 0 0 14a7 7 0 1 0 0-14z", "M16.2 16.2L20.5 20.5")
+    val Lock = icon("Lock", "M6.5 11h11a1 1 0 0 1 1 1v7.5a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1V12a1 1 0 0 1 1-1z", "M8.5 11V8a3.5 3.5 0 0 1 7 0v3")
+    val SquarePen = icon("SquarePen", "M12 4.5H6A1.5 1.5 0 0 0 4.5 6v12A1.5 1.5 0 0 0 6 19.5h12a1.5 1.5 0 0 0 1.5-1.5v-6", "M17.6 3.9a1.8 1.8 0 0 1 2.5 2.5L12.5 14l-3.2.8.8-3.2z")
+    val Quote = icon("Quote", "M5 6.5h5v5H7.5c0 2.5-1 4-2.5 5", "M14 6.5h5v5h-2.5c0 2.5-1 4-2.5 5")
+    /** Lucide undo-2, Factory's rewind. */
+    val Rewind = icon("Rewind", "M9 14L4 9l5-5", "M4 9h10.5a5.5 5.5 0 0 1 0 11H11")
+    val Repo = icon("Repo", "M5 4.5A2 2 0 0 1 7 2.5h12v17H7a2 2 0 0 0-2 2V4.5z", "M5 19.5h14", "M9 6.5h6", "M9 10h4")
+    val Check = icon("Check", "M5 12.5l4.5 4.5L19 7.5")
+    val Mail = icon("Mail", "M3.5 6.5a1.5 1.5 0 0 1 1.5-1.5h14a1.5 1.5 0 0 1 1.5 1.5v11a1.5 1.5 0 0 1-1.5 1.5H5a1.5 1.5 0 0 1-1.5-1.5z", "M4 7l8 5.5L20 7")
+    val Folder = icon("Folder", "M3.5 6.5A1.5 1.5 0 0 1 5 5h4.2l2 2.2H19a1.5 1.5 0 0 1 1.5 1.5v9.3a1.5 1.5 0 0 1-1.5 1.5H5a1.5 1.5 0 0 1-1.5-1.5z")
+    val File = icon("File", "M6.5 3.5h7.5l4.5 4.5V19a1.5 1.5 0 0 1-1.5 1.5H6.5A1.5 1.5 0 0 1 5 19V5a1.5 1.5 0 0 1 1.5-1.5z", "M14 3.5V8h4.5")
+}

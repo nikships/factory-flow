@@ -1,0 +1,255 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { airgappedModelError, createDroidModelCatalogue, customModelCatalogue, listDroidModels, parseDroidModelList, readDroidModels } from '../src/server/droid-models.js';
+
+function scratch(t: { after(fn: () => void): void }): string {
+  const dir = mkdtempSync(path.join(tmpdir(), 'factory-flow-droid-models-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
+
+function settingsFile(t: { after(fn: () => void): void }, body: unknown): string {
+  const file = path.join(scratch(t), 'settings.json');
+  writeFileSync(file, typeof body === 'string' ? body : JSON.stringify(body));
+  return file;
+}
+
+const noLister = () => Promise.reject(new Error('no droid'));
+
+test('airgapped discovery drops hosted models, Router, legacy models and unsafe defaults', () => {
+  const source = {
+    models: [
+      { id: 'custom:droidproxy:gpt-6-sol', displayName: 'GPT 6 Sol', custom: true as const },
+      { id: 'auto', displayName: 'Router' },
+      { id: 'claude-fable-5', displayName: 'Fable 5', legacy: true as const },
+    ],
+    disabledModels: [{ id: 'disabled', displayName: 'Disabled', disabled: true as const }],
+    defaultModel: 'auto',
+    defaultReasoningEffort: 'high' as const,
+  };
+  const result = customModelCatalogue(source);
+  assert.deepEqual(result.models, source.models.slice(0, 1));
+  assert.equal(result.defaultModel, undefined);
+  assert.equal(result.defaultReasoningEffort, undefined);
+  assert.deepEqual(result.disabledModels, []);
+  assert.equal(result.customOnly, true);
+  assert.equal(customModelCatalogue({ ...source, defaultModel: source.models[0].id }).defaultModel, source.models[0].id);
+  assert.equal(airgappedModelError(false, 'auto', source), undefined);
+  assert.match(airgappedModelError(true, 'auto', source)!, /requires a configured custom model/);
+  assert.match(airgappedModelError(true, 'custom:made-up:id', source)!, /requires a configured custom model/);
+  assert.match(airgappedModelError(true, undefined, source)!, /requires a configured custom model/);
+  assert.equal(airgappedModelError(true, source.models[0].id, source), undefined);
+  assert.equal(airgappedModelError(true, undefined, { ...source, defaultModel: source.models[0].id }), undefined);
+});
+
+test('Droid catalogue lists custom models with their display names and efforts', (t) => {
+  const file = settingsFile(t, {
+    customModels: [
+      { id: 'custom:droidproxy:gpt-6-sol', displayName: 'DroidProxy: GPT 6 Sol', defaultReasoningEffort: 'xhigh', supportedReasoningEfforts: ['low', 'xhigh', 'bogus'] },
+      { id: 'custom:droidproxy:gpt-6-sol', displayName: 'duplicate' },
+      { id: 'has a space', displayName: 'bad' },
+      { id: '', displayName: 'empty' },
+      { nope: true },
+    ],
+    sessionDefaultSettings: { model: 'custom:droidproxy:muse-spark-1.3-contributor', reasoningEffort: 'max' },
+    modelFavorites: ['glm-5.3-flash', 'custom:droidproxy:gpt-6-sol'],
+  });
+  const catalogue = readDroidModels(file);
+  assert.deepEqual(catalogue.models, [
+    { id: 'custom:droidproxy:gpt-6-sol', displayName: 'DroidProxy: GPT 6 Sol', custom: true, defaultReasoningEffort: 'xhigh', supportedReasoningEfforts: ['low', 'xhigh'] },
+    { id: 'custom:droidproxy:muse-spark-1.3-contributor', displayName: 'custom:droidproxy:muse-spark-1.3-contributor' },
+    { id: 'glm-5.3-flash', displayName: 'glm-5.3-flash' },
+  ]);
+  assert.equal(catalogue.defaultModel, 'custom:droidproxy:muse-spark-1.3-contributor');
+  assert.equal(catalogue.defaultReasoningEffort, 'max');
+});
+
+test('Droid catalogue tolerates missing, corrupt, or model-less settings', (t) => {
+  const dir = scratch(t);
+  assert.deepEqual(readDroidModels(path.join(dir, 'nope.json')), { models: [] });
+  assert.deepEqual(readDroidModels(settingsFile(t, 'not json{{')), { models: [] });
+  assert.deepEqual(readDroidModels(settingsFile(t, { theme: 'factory-dark' })), { models: [] });
+  const badDefault = readDroidModels(settingsFile(t, { customModels: [], sessionDefaultSettings: { model: 'has a space', reasoningEffort: 'overdrive' } }));
+  assert.deepEqual(badDefault, { models: [] });
+});
+
+test('Droid model list puts custom models first and legacy ones last, without disabled models or unpinnable efforts', () => {
+  const models = parseDroidModelList([
+    { id: 'claude-fable-5', displayName: 'Fable 5', legacy: true, defaultReasoningEffort: 'high', supportedReasoningEfforts: ['off', 'low', 'high'] },
+    { id: 'glm-5.3', displayName: 'GLM-5.3', defaultReasoningEffort: 'max', supportedReasoningEfforts: ['low', 'high', 'max'] },
+    { id: 'auto', displayName: 'Auto Model', defaultReasoningEffort: 'none', supportedReasoningEfforts: ['none'] },
+    { id: 'minimax-m2.7', displayName: 'MiniMax M2.7 [Deprecated]', deprecated: true },
+    { id: 'off-model', displayName: 'Off', disabled: true },
+    { id: 'custom:zen:bunny', displayName: 'Bunny', isCustom: true, defaultReasoningEffort: 'high' },
+    { id: 'glm-5.3', displayName: 'duplicate' },
+    { id: 'bad id', displayName: 'Bad' },
+    'nonsense',
+    null,
+  ]);
+  assert.deepEqual(models, [
+    { id: 'custom:zen:bunny', displayName: 'Bunny', custom: true, defaultReasoningEffort: 'high' },
+    { id: 'glm-5.3', displayName: 'GLM-5.3', defaultReasoningEffort: 'max', supportedReasoningEfforts: ['low', 'high', 'max'], labelReasoningEfforts: ['low', 'high', 'max'] },
+    { id: 'auto', displayName: 'Auto Model', supportedReasoningEfforts: [], labelReasoningEfforts: ['none'] },
+    { id: 'claude-fable-5', displayName: 'Fable 5', legacy: true, defaultReasoningEffort: 'high', supportedReasoningEfforts: ['low', 'high'], labelReasoningEfforts: ['off', 'low', 'high'] },
+    { id: 'minimax-m2.7', displayName: 'MiniMax M2.7 [Deprecated]', legacy: true },
+  ]);
+});
+
+test('Droid model list keeps what a lead weighs: provider, credit multiplier, image support and promo', () => {
+  const [opus, flash, bad] = parseDroidModelList([
+    { id: 'claude-opus-5-5', displayName: 'Opus 5.5', modelProvider: 'anthropic', tokenMultiplier: 1.6 },
+    { id: 'glm-5.3-flash', displayName: 'GLM-5.3-Flash', modelProvider: ' factory\n', tokenMultiplier: 0.06, noImageSupport: true, promoLabel: '50% off, launch discount' },
+    { id: 'odd', modelProvider: '', tokenMultiplier: -1, noImageSupport: 'yes', promoLabel: 7 },
+  ]);
+  assert.deepEqual(opus, { id: 'claude-opus-5-5', displayName: 'Opus 5.5', provider: 'anthropic', tokenMultiplier: 1.6 });
+  assert.deepEqual(flash, { id: 'glm-5.3-flash', displayName: 'GLM-5.3-Flash', provider: 'factory', tokenMultiplier: 0.06, noImages: true, promo: '50% off, launch discount' });
+  assert.deepEqual(bad, { id: 'odd', displayName: 'odd' });
+});
+
+test('the cached discovery catalogue retains Droid-disabled entries without adding them to picker models', async (t) => {
+  const file = settingsFile(t, {});
+  let calls = 0;
+  const catalogue = createDroidModelCatalogue({
+    settingsPath: file,
+    lister: async () => {
+      calls++;
+      return [
+        { id: 'glm-5.3-flash', displayName: 'disabled duplicate', disabled: true },
+        { id: 'glm-5.3-flash', displayName: 'GLM-5.3-Flash' },
+        { id: 'off-model', displayName: 'Off', disabled: true },
+      ];
+    },
+  });
+  const first = await catalogue.get();
+  assert.deepEqual(
+    first.models.map((m) => m.id),
+    ['glm-5.3-flash'],
+  );
+  assert.deepEqual(first.disabledModels, [{ id: 'off-model', displayName: 'Off', disabled: true }]);
+  assert.equal(await catalogue.get(), first);
+  assert.equal(calls, 1);
+  const onlyDisabled = createDroidModelCatalogue({ settingsPath: file, lister: async () => [{ id: 'off-model', displayName: 'Off', disabled: true }] });
+  assert.deepEqual((await onlyDisabled.get()).disabledModels, [{ id: 'off-model', displayName: 'Off', disabled: true }]);
+  assert.deepEqual((await onlyDisabled.get()).models, []);
+});
+
+test("Droid catalogue lists droid's own models and keeps settings-only ids and the settings default", async (t) => {
+  const file = settingsFile(t, {
+    customModels: [{ id: 'custom:a', displayName: 'A' }],
+    sessionDefaultSettings: { model: 'glm-5.3', reasoningEffort: 'high' },
+    modelFavorites: ['custom:gone'],
+  });
+  const asked: string[][] = [];
+  const catalogue = createDroidModelCatalogue({
+    command: '/opt/droid',
+    cwd: '/work',
+    settingsPath: file,
+    lister: (command, cwd) => {
+      asked.push([command, cwd]);
+      return Promise.resolve([
+        { id: 'glm-5.3', displayName: 'GLM-5.3' },
+        { id: 'custom:a', displayName: 'A (droid)', isCustom: true },
+      ]);
+    },
+  });
+  const listed = await catalogue.get();
+  assert.deepEqual(asked, [['/opt/droid', '/work']]);
+  assert.deepEqual(
+    listed.models.map((m) => [m.id, m.displayName]),
+    [
+      ['custom:a', 'A (droid)'],
+      ['custom:gone', 'custom:gone'],
+      ['glm-5.3', 'GLM-5.3'],
+    ],
+  );
+  assert.equal(listed.defaultModel, 'glm-5.3');
+  assert.equal(listed.defaultReasoningEffort, 'high');
+});
+
+test('Droid catalogue falls back to settings when droid cannot list models', async (t) => {
+  const file = settingsFile(t, { customModels: [{ id: 'custom:a', displayName: 'A' }] });
+  const failing = createDroidModelCatalogue({ settingsPath: file, lister: noLister });
+  assert.deepEqual(
+    (await failing.get()).models.map((m) => m.id),
+    ['custom:a'],
+  );
+  const empty = createDroidModelCatalogue({ settingsPath: file, lister: () => Promise.resolve([]) });
+  assert.deepEqual(
+    (await empty.get()).models.map((m) => m.id),
+    ['custom:a'],
+  );
+});
+
+test('Droid catalogue caches briefly and shares one pending lookup', async (t) => {
+  const file = settingsFile(t, { customModels: [{ id: 'custom:a', displayName: 'A' }] });
+  let now = 1000;
+  let asks = 0;
+  const catalogue = createDroidModelCatalogue({
+    settingsPath: file,
+    now: () => now,
+    lister: () => {
+      asks++;
+      return Promise.reject(new Error('no droid'));
+    },
+  });
+  assert.equal(catalogue.peek(), undefined);
+  assert.equal(asks, 0, 'peek never starts a lookup');
+  const [first, second] = await Promise.all([catalogue.get(), catalogue.get()]);
+  assert.equal(catalogue.peek(), first);
+  assert.equal(first, second);
+  assert.equal(asks, 1);
+  assert.deepEqual(
+    first.models.map((m) => m.id),
+    ['custom:a'],
+  );
+  writeFileSync(file, JSON.stringify({ customModels: [{ id: 'custom:b', displayName: 'B' }] }));
+  now += 59_999;
+  assert.deepEqual(
+    (await catalogue.get()).models.map((m) => m.id),
+    ['custom:a'],
+  );
+  now += 2;
+  assert.equal(catalogue.peek(), first, 'expired display names remain usable without a refresh');
+  assert.equal(asks, 1);
+  assert.deepEqual(
+    (await catalogue.get()).models.map((m) => m.id),
+    ['custom:b'],
+  );
+  assert.equal(asks, 2);
+  catalogue.forget();
+  assert.equal(catalogue.peek(), undefined);
+});
+
+test('listDroidModels asks droid over stream-jsonrpc and reads its response', { skip: process.platform === 'win32' }, async (t) => {
+  const dir = scratch(t);
+  const droid = path.join(dir, 'droid');
+  writeFileSync(
+    droid,
+    `#!/usr/bin/env node
+const args = process.argv.slice(2).join(' ');
+if (args !== 'exec --input-format stream-jsonrpc --output-format stream-jsonrpc') process.exit(2);
+let input = '';
+process.stdin.on('data', (chunk) => {
+  input += chunk;
+  if (!input.includes('\\n')) return;
+  const req = JSON.parse(input.split('\\n')[0]);
+  if (req.method !== 'droid.list_models') process.exit(3);
+  process.stdout.write('not json\\n');
+  const envelope = { jsonrpc: '2.0', factoryApiVersion: '1.0.0', factoryProtocolVersion: '1.279.0' };
+  process.stdout.write(JSON.stringify({ ...envelope, type: 'notification', method: 'droid.session_notification', params: { notification: { type: 'droid_working_state_changed', newState: 'idle' } } }) + '\\n');
+  process.stdout.write(JSON.stringify({ ...envelope, type: 'response', id: req.id, result: { models: [{ id: 'glm-5.3', displayName: 'GLM-5.3' }] } }) + '\\n');
+  setInterval(() => {}, 1000);
+});
+`,
+    { mode: 0o700 },
+  );
+  assert.deepEqual(await listDroidModels(droid, dir), [{ id: 'glm-5.3', displayName: 'GLM-5.3' }]);
+
+  const quitter = path.join(dir, 'quitter');
+  writeFileSync(quitter, '#!/bin/sh\nexit 0\n', { mode: 0o700 });
+  await assert.rejects(listDroidModels(quitter, dir), /exited without answering/);
+  await assert.rejects(listDroidModels(path.join(dir, 'missing'), dir));
+});

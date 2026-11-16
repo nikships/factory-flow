@@ -1,0 +1,25 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path android:pathData="M0,0h108v108h-108z">
+        <aapt:attr name="android:fillColor">
+            <gradient android:type="linear" android:startX="54" android:startY="0" android:endX="54" android:endY="108">
+                <item android:color="#1D100A" android:offset="0" />
+                <item android:color="#060302" android:offset="1" />
+            </gradient>
+        </aapt:attr>
+    </path>
+    <!-- An ember behind the mark: the accent orange, fading out before the mask's edge. -->
+    <path android:pathData="M0,0h108v108h-108z">
+        <aapt:attr name="android:fillColor">
+            <gradient android:centerX="54" android:centerY="54" android:gradientRadius="52" android:type="radial">
+                <item android:color="#57F06000" android:offset="0" />
+                <item android:color="#1AF06000" android:offset="0.55" />
+                <item android:color="#00F06000" android:offset="1" />
+            </gradient>
+        </aapt:attr>
+    </path>
+</vector>

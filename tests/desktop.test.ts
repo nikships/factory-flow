@@ -1,0 +1,342 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
+import { linkAction } from '../src/desktop/links.ts';
+import { logTail, probePort, startOffice } from '../src/desktop/office.ts';
+import { officeRuntime } from '../src/desktop/runtime.ts';
+import { DEFAULT_PORT, defaultOfficeDir, isolatedPortOk, loadSettings, officeArgs, saveSettings, startedInProject } from '../src/desktop/settings.ts';
+import { desktopEnv, fencedEnv, knownDirs, loginShellEnv, mergeEnv, mergePath } from '../src/desktop/shell-path.ts';
+import { briefError, type UpdatePhase, updateBusy, updateView } from '../src/desktop/update-view.ts';
+import { serveHostUpdates } from '../src/desktop/update-ipc.js';
+import { runAsNode } from '../src/server/workers.ts';
+
+function tmp(t: { after: (fn: () => void) => void }): string {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'desktop-test-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
+
+function listen(handler: http.RequestListener): Promise<{ port: number; close: () => Promise<void> }> {
+  return new Promise((resolve) => {
+    const server = http.createServer(handler);
+    server.listen(0, '127.0.0.1', () => resolve({ port: (server.address() as AddressInfo).port, close: () => new Promise((r) => server.close(() => r())) }));
+  });
+}
+
+/** A port nothing listens on: one the OS just handed out and took back. */
+async function freePort(): Promise<number> {
+  const s = await listen(() => {});
+  await s.close();
+  return s.port;
+}
+
+test('the login shell environment is read from between the markers, whatever the rc files print', () => {
+  const B = '__FACTORY_FLOW_ENV_BEGIN__';
+  const E = '__FACTORY_FLOW_ENV_END__';
+  assert.deepEqual(fencedEnv(`Last login: today\nwelcome!\n${B}PATH=/a:/b\0NOTE=two\nlines\0EQ=a=b\0${E}\n`), { PATH: '/a:/b', NOTE: 'two\nlines', EQ: 'a=b' });
+  assert.deepEqual(fencedEnv(`${B}OLD=1\0${E} ${B}NEW=2\0${E}`), { NEW: '2' });
+  // Not a variable a shell could have exported: dropped.
+  assert.deepEqual(fencedEnv(`${B}=x\0no-equals\0BAD-NAME=1\0OK=\0${E}`), { OK: '' });
+  assert.equal(fencedEnv('no markers'), undefined);
+  assert.equal(fencedEnv(`${B}PATH=/a:/b`), undefined);
+  assert.equal(fencedEnv(`${B}${E}`), undefined);
+});
+
+test('PATHs merge in order, each folder once', () => {
+  assert.equal(mergePath('/a:/b', undefined, '/b:/c::/a', ''), '/a:/b:/c');
+  assert.ok(knownDirs('/home/me').includes('/opt/homebrew/bin'));
+  assert.ok(knownDirs('/home/me').includes('/home/me/.local/bin'));
+});
+
+test("the office gets the login shell's environment over the app's, with PATH merged and a UTF-8 locale", () => {
+  const app = { PATH: '/usr/bin:/bin', HOME: '/home/me', XPC_SERVICE_NAME: 'app', EDITOR: 'nano' };
+  const login = { PATH: '/opt/homebrew/bin:/usr/bin', HOME: '/home/me', JAVA_HOME: '/jdk', EDITOR: 'vim', PWD: '/tmp', OLDPWD: '/', SHLVL: '2', _: '/usr/bin/env' };
+  const env = mergeEnv(app, login, '/home/me');
+  assert.equal(env.JAVA_HOME, '/jdk');
+  assert.equal(env.EDITOR, 'vim');
+  assert.equal(env.XPC_SERVICE_NAME, 'app');
+  for (const k of ['PWD', 'OLDPWD', 'SHLVL', '_']) assert.equal(env[k], undefined, k);
+  assert.ok(env.PATH?.startsWith('/opt/homebrew/bin:/usr/bin:/bin:/home/me/.local/bin:'), env.PATH);
+  assert.equal(env.LANG, 'en_US.UTF-8');
+  assert.equal(mergeEnv({ ...app, LC_ALL: 'de_DE.UTF-8' }, undefined, '/home/me').LANG, undefined);
+  assert.equal(mergeEnv(app, { LANG: 'fr_FR.UTF-8' }, '/home/me').LANG, 'fr_FR.UTF-8');
+  // No login shell to ask: the app's own, still with the usual folders.
+  assert.ok(mergeEnv(app, undefined, '/home/me').PATH?.split(':').includes('/opt/homebrew/bin'));
+});
+
+test('a login shell answers with its environment, and a missing shell with nothing', async () => {
+  const got = await loginShellEnv('/bin/sh');
+  assert.ok(got?.PATH?.split(':').includes('/bin'), `got ${got?.PATH}`);
+  assert.equal(await loginShellEnv('/no/such/shell'), undefined);
+  const env = await desktopEnv({ SHELL: '/bin/sh', PATH: '/usr/bin:/bin', FACTORY_FLOW_TEST_MARK: 'kept' });
+  assert.equal(env.FACTORY_FLOW_TEST_MARK, 'kept');
+  assert.ok(env.PATH?.split(':').includes('/bin'));
+});
+
+test("the office's own pages stay in the app; other links open in the browser or nowhere", () => {
+  const origin = 'http://localhost:4700';
+  assert.equal(linkAction('http://localhost:4700/?floor=home', origin), 'app');
+  assert.equal(linkAction('https://github.com/example/factory-flow/pull/1', origin), 'browser');
+  assert.equal(linkAction('http://localhost:3000/', origin), 'browser');
+  assert.equal(linkAction('mailto:someone@example.com', origin), 'browser');
+  assert.equal(linkAction('file:///etc/passwd', origin), 'ignore');
+  assert.equal(linkAction('javascript:alert(1)', origin), 'ignore');
+  assert.equal(linkAction('not a url', origin), 'ignore');
+});
+
+test('settings survive a round trip and ignore what makes no sense', (t) => {
+  const dir = tmp(t);
+  const file = path.join(dir, 'nested', 'settings.json');
+  assert.deepEqual(loadSettings(file), {});
+  saveSettings(file, { officeDir: '/x/office', port: 4700, menuBarExplained: true });
+  assert.deepEqual(loadSettings(file), { officeDir: '/x/office', port: 4700, menuBarExplained: true });
+  writeFileSync(file, JSON.stringify({ officeDir: 3, port: 99999, menuBarExplained: 'yes', notify: 'no', mode: 'both' }));
+  assert.deepEqual(loadSettings(file), {});
+  writeFileSync(file, '{not json');
+  assert.deepEqual(loadSettings(file), {});
+  assert.equal(DEFAULT_PORT, 4700);
+  assert.equal(defaultOfficeDir('/home/me'), path.join('/home/me', 'factory-flow'));
+});
+
+test('an office opens the same way on every launch: as its home, unless it was started in it as a project', (t) => {
+  const home = tmp(t);
+  const plain = path.join(home, 'plain');
+  const project = path.join(home, 'project');
+  const takenOff = path.join(home, 'taken-off');
+  const office = defaultOfficeDir(home);
+  for (const d of [plain, project, takenOff, office]) mkdirSync(path.join(d, '.factory-flow'), { recursive: true });
+  // What a --home office writes on its first start: its config and floors that aren't itself.
+  writeFileSync(path.join(plain, '.factory-flow', 'config.json'), '{}\n');
+  writeFileSync(path.join(plain, '.factory-flow', 'floors.json'), JSON.stringify([{ id: 'home', dir: home }]));
+  writeFileSync(path.join(project, '.factory-flow', 'floors.json'), JSON.stringify([{ id: 'project', dir: project }]));
+  writeFileSync(path.join(takenOff, '.factory-flow', 'local-floor.json'), JSON.stringify({ dir: takenOff }));
+  writeFileSync(path.join(office, '.factory-flow', 'floors.json'), JSON.stringify([{ id: 'factory-flow', dir: office }]));
+
+  assert.equal(startedInProject(plain), false);
+  assert.equal(startedInProject(project), true);
+  assert.equal(startedInProject(takenOff), true);
+  assert.equal(startedInProject(path.join(home, 'missing')), false);
+  assert.deepEqual(officeArgs(plain, 4700, home), ['--home', plain, '--port', '4700']);
+  assert.deepEqual(officeArgs(project, 4601, home), [project, '--port', '4601']);
+  assert.deepEqual(officeArgs(takenOff, 4700, home), [takenOff, '--port', '4700']);
+  // ~/factory-flow is what `factory-flow` opens with no folder, even when it lists itself as a floor.
+  assert.deepEqual(officeArgs(office, 4700, home), ['--home', office, '--port', '4700']);
+});
+
+test('a port is free, held by the office, or held by something else', async (t) => {
+  const office = await listen((_req, res) => res.end('<!doctype html><title>Factory Flow</title>'));
+  const other = await listen((_req, res) => res.end('<title>Something else</title>'));
+  t.after(() => Promise.all([office.close(), other.close()]));
+  assert.equal(await probePort(office.port), 'office');
+  assert.equal(await probePort(other.port), 'other');
+  assert.equal(await probePort(await freePort()), 'free');
+});
+
+/** Stands in for bin/factory-flow.js: serves the office's title on --port and logs the signal that stops it. */
+function fakeCli(dir: string, behaviour: 'serve' | 'fail'): string {
+  const file = path.join(dir, `fake-cli-${behaviour}.mjs`);
+  writeFileSync(
+    file,
+    behaviour === 'fail'
+      ? `console.log('port taken'); process.exit(1);\n`
+      : `import http from 'node:http';
+const port = Number(process.argv[process.argv.indexOf('--port') + 1]);
+console.log('args ' + process.argv.slice(2).join(' ') + ' node-mode ' + process.env.ELECTRON_RUN_AS_NODE);
+const server = http.createServer((_q, r) => r.end('<title>Factory Flow</title>')).listen(port, '127.0.0.1');
+for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { console.log('stopped by ' + sig); server.close(); process.exit(0); });
+`,
+  );
+  return file;
+}
+
+test('the app starts the office, waits for its page, and stops it keeping or ending the workers', async (t) => {
+  const dir = tmp(t);
+  for (const [keep, signal] of [
+    [true, 'SIGTERM'],
+    [false, 'SIGINT'],
+  ] as const) {
+    const port = await freePort();
+    const log = path.join(dir, `office-${signal}.log`);
+    const office = await startOffice({ runtime: process.execPath, cli: fakeCli(dir, 'serve'), args: ['--home', dir, '--port', String(port)], port, env: process.env, log });
+    assert.equal(office.url, `http://localhost:${port}/`);
+    assert.equal(await probePort(port), 'office');
+    await office.stop(keep);
+    assert.equal(await office.exited, 0);
+    await office.stop(keep);
+    const out = readFileSync(log, 'utf8');
+    assert.match(out, new RegExp(`args --home ${dir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} --port ${port} node-mode 1`));
+    assert.match(out, new RegExp(`stopped by ${signal}`));
+  }
+});
+
+test('an office that exits as it starts is reported with the end of its log', async (t) => {
+  const dir = tmp(t);
+  const port = await freePort();
+  const log = path.join(dir, 'office.log');
+  await assert.rejects(startOffice({ runtime: process.execPath, cli: fakeCli(dir, 'fail'), args: [], port, env: process.env, log }), /stopped as it started \(exit 1\)[\s\S]*port taken/);
+  assert.equal(logTail(log), 'port taken');
+  assert.equal(logTail(path.join(dir, 'missing.log')), '');
+});
+
+test('the app attaches its private updater channel before the office becomes ready', async (t) => {
+  const dir = tmp(t);
+  const port = await freePort();
+  const file = path.join(dir, 'ipc-office.mjs');
+  writeFileSync(
+    file,
+    `
+import http from 'node:http';
+process.on('message', (reply) => {
+  if (reply.t !== 'host.update.result' || reply.id !== 'startup') return;
+  console.log(JSON.stringify(reply.state));
+  http.createServer((_req, res) => res.end('<title>Factory Flow</title>')).listen(${port}, '127.0.0.1');
+});
+process.send({t: 'host.update', id: 'startup', command: {action: 'status'}});
+`,
+  );
+  const log = path.join(dir, 'ipc.log');
+  const office = await startOffice({
+    runtime: process.execPath,
+    cli: file,
+    args: [],
+    port,
+    env: process.env,
+    log,
+    onSpawn: (child) => serveHostUpdates(child, () => ({ supported: false, currentVersion: '0.1.0', phase: 'unpackaged', title: 'Checkout', busy: false, canInstall: false })),
+  });
+  t.after(() => office.stop(true));
+  assert.match(readFileSync(log, 'utf8'), /"phase":"unpackaged"/);
+  assert.equal(await probePort(port), 'office');
+});
+
+test('an office that never answers is given up on', async (t) => {
+  const dir = tmp(t);
+  const port = await freePort();
+  const silent = path.join(dir, 'silent.mjs');
+  writeFileSync(silent, 'setInterval(() => {}, 1000);\n');
+  await assert.rejects(startOffice({ runtime: process.execPath, cli: silent, args: [], port, env: process.env, log: path.join(dir, 'office.log'), timeoutMs: 500 }), /didn't open on port/);
+});
+
+test('commands written for workers run Electron as Node only under the Mac app', () => {
+  assert.deepEqual(runAsNode({ ...process.versions, electron: '44.5.1' }), { sh: 'ELECTRON_RUN_AS_NODE=1 ', cmd: 'set "ELECTRON_RUN_AS_NODE=1" & ' });
+  const { electron: _, ...plainNode } = process.versions as NodeJS.ProcessVersions & { electron?: string };
+  assert.deepEqual(runAsNode(plainNode as NodeJS.ProcessVersions), { sh: '', cmd: '' });
+});
+
+test('a failed control-channel setup stops the spawned office instead of leaking it', async (t) => {
+  const dir = tmp(t);
+  const port = await freePort();
+  let spawned: import('node:child_process').ChildProcess | undefined;
+  await assert.rejects(
+    startOffice({
+      runtime: process.execPath,
+      cli: fakeCli(dir, 'serve'),
+      args: ['--port', String(port)],
+      port,
+      env: process.env,
+      log: path.join(dir, 'failed-control.log'),
+      onSpawn: (child) => {
+        spawned = child;
+        throw new Error('Control setup failed');
+      },
+    }),
+    /Control setup failed/,
+  );
+  assert.ok(spawned?.killed);
+  assert.equal(await probePort(port), 'free');
+});
+
+test('the Mac app runs its office on the helper binary, which has no Dock icon, and falls back to Electron itself', () => {
+  const main = '/Applications/Factory Flow.app/Contents/MacOS/Factory Flow';
+  const helper = '/Applications/Factory Flow.app/Contents/Frameworks/Factory Flow Helper.app/Contents/MacOS/Factory Flow Helper';
+  assert.equal(
+    officeRuntime(main, 'darwin', (p) => p === helper),
+    helper,
+  );
+  assert.equal(
+    officeRuntime(main, 'darwin', () => false),
+    main,
+  );
+  assert.equal(
+    officeRuntime(main, 'win32', () => true),
+    main,
+  );
+  assert.equal(
+    officeRuntime('/usr/local/bin/node', 'darwin', () => true),
+    '/usr/local/bin/node',
+  );
+});
+
+test('the update window offers an update, then shows its download and the restart, in one flow', () => {
+  const available = updateView({ kind: 'available', version: '0.2.5' }, '0.2.1');
+  assert.equal(available.title, 'Factory Flow 0.2.5 is available');
+  assert.match(available.detail!, /You have 0\.2\.1/);
+  assert.deepEqual(
+    available.buttons.map((b) => [b.action, b.label, Boolean(b.primary)]),
+    [
+      ['later', 'Later', false],
+      ['install', 'Install and Restart', true],
+    ],
+  );
+  assert.equal(available.escape, 'later');
+  assert.equal(available.progress, undefined);
+
+  const starting = updateView({ kind: 'downloading', version: '0.2.5', transferred: 0, total: 0 }, '0.2.1');
+  assert.equal(starting.progress, 0);
+  assert.equal(starting.detail, 'Starting the download…');
+  const halfway = updateView({ kind: 'downloading', version: '0.2.5', transferred: 49_200_000, total: 98_400_000 }, '0.2.1');
+  assert.equal(halfway.progress, 0.5);
+  assert.equal(halfway.detail, '49.2 MB of 98.4 MB (50%)');
+  assert.deepEqual(halfway.buttons, [{ action: 'cancel', label: 'Cancel' }]);
+  assert.equal(halfway.escape, 'cancel');
+  assert.equal(updateView({ kind: 'downloading', version: '0.2.5', transferred: 120, total: 100 }, '0.2.1').progress, 1);
+
+  for (const kind of ['preparing', 'restarting'] as const) {
+    const view = updateView({ kind, version: '0.2.5' }, '0.2.1');
+    assert.equal(view.progress, 'indeterminate', kind);
+    assert.deepEqual(view.buttons, [], kind);
+    assert.equal(view.escape, undefined, kind);
+  }
+});
+
+test('a manual check says what it found in the same window', () => {
+  const checking = updateView({ kind: 'checking' }, '0.2.1');
+  assert.equal(checking.progress, 'indeterminate');
+  assert.equal(checking.escape, 'close');
+  assert.equal(updateView({ kind: 'latest' }, '0.2.1').detail, 'Factory Flow 0.2.1 is the newest version.');
+  assert.equal(updateView({ kind: 'unpackaged' }, '0.2.1').buttons[0]!.action, 'close');
+
+  const checkFailed = updateView({ kind: 'error', during: 'check', message: 'offline' }, '0.2.1');
+  assert.equal(checkFailed.title, "Couldn't check for updates");
+  assert.equal(checkFailed.detail, 'offline');
+  assert.deepEqual(
+    checkFailed.buttons.map((b) => b.action),
+    ['close', 'retry'],
+  );
+  assert.equal(updateView({ kind: 'error', during: 'download', version: '0.2.5', message: 'reset' }, '0.2.1').title, "Factory Flow 0.2.5 didn't install");
+
+  const busy: UpdatePhase[] = [{ kind: 'checking' }, { kind: 'downloading', version: '1', transferred: 0, total: 0 }, { kind: 'preparing', version: '1' }, { kind: 'restarting', version: '1' }];
+  for (const phase of busy) assert.equal(updateBusy(phase), true, phase.kind);
+  assert.equal(updateBusy({ kind: 'available', version: '1' }), false);
+  assert.equal(updateBusy({ kind: 'latest' }), false);
+});
+
+test('update errors are cut to their first line for the window', () => {
+  assert.equal(briefError('HttpError: 404\n"method: GET url: https://example.test"\nHeaders: {…}'), 'HttpError: 404');
+  assert.equal(briefError('\n\n  net::ERR_INTERNET_DISCONNECTED  \n'), 'net::ERR_INTERNET_DISCONNECTED');
+  assert.equal(briefError(''), 'Unknown error');
+  const long = briefError('x'.repeat(500));
+  assert.equal(long.length, 240);
+  assert.ok(long.endsWith('…'));
+});
+
+test('a run with its own userData attaches only to a running office, never on the default port', () => {
+  assert.equal(isolatedPortOk(4677, 'office'), true);
+  assert.equal(isolatedPortOk(4677, 'free'), false);
+  assert.equal(isolatedPortOk(4677, 'other'), false);
+  assert.equal(isolatedPortOk(DEFAULT_PORT, 'office'), false);
+});

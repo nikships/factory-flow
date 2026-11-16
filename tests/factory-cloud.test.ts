@@ -1,0 +1,993 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { CloudWorkers } from '../src/server/cloud-workers.js';
+import { FactoryApi, FactoryError } from '../src/server/factory/api.js';
+import { CloudFeature, cloudRefusal, mountCloud, type CloudFloor } from '../src/server/factory/cloud.js';
+import { HttpError, type FeatureHost } from '../src/server/factory/feature.js';
+import { FactoryRegistry } from '../src/server/factory/registry.js';
+import { toolAction } from '../src/shared/actions.js';
+import { computerOf, type FactoryComputer, type FactoryComputersState } from '../src/shared/factory-computers.js';
+import { emptyEnvironments, environmentOf, type FactoryEnvironmentsState } from '../src/shared/factory-environments.js';
+import { SEND_SETTLE_MS, answeredByAssistant, canHost, cloudBadge, cloudHire, cloudSessionUrl, cloudStatus, computerHome, latestReply, latestTool, officeAutonomy, sessionCwd, toolActivity } from '../src/shared/factory-cloud.js';
+import { DESKS } from '../src/shared/layout.js';
+import type { ClientMsg, WorkerInfo } from '../src/shared/protocol.js';
+
+const KEY = 'fk-test-cloud-1234';
+const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+const DESK = DESKS.filter((d) => !d.beanbag);
+const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from('not really a picture')]);
+const tick = () => new Promise((r) => setTimeout(r, 15));
+
+interface Call {
+  method: string;
+  path: string;
+  body?: unknown;
+}
+
+type Handler = (call: Call) => Response | Promise<Response>;
+
+/** Factory as the feature sees it: an answer per "METHOD /path" (under /api/v0); `calls` is what was asked. */
+function factory(routes: Record<string, Handler>) {
+  const calls: Call[] = [];
+  const fn = (async (input: string | URL | Request, init: RequestInit = {}) => {
+    const url = new URL(String(input));
+    const p = url.pathname.replace(/^\/api\/v0/, '');
+    const call: Call = { method: init.method ?? 'GET', path: p, body: init.body ? JSON.parse(String(init.body)) : undefined };
+    calls.push(call);
+    const r = routes[`${call.method} ${p}`];
+    return r ? r(call) : json(404, { detail: `no ${call.method} ${p}` });
+  }) as typeof fetch;
+  return { api: new FactoryApi(KEY, fn), calls };
+}
+
+const ORB = { id: 'orb-id', name: 'orb', providerType: 'e2b', status: 'active', createdAt: 1, remoteUser: 'factory-user' };
+const MAC = { id: 'mac-id', name: 'macbook', providerType: 'byom', status: 'active', createdAt: 2 };
+const SLEEPY = { id: 'zz-id', name: 'sleepy', providerType: 'e2b', status: 'provisioning', createdAt: 3 };
+
+function computersState(raw = [ORB, MAC, SLEEPY], fetchedAt = 1): FactoryComputersState {
+  return { items: raw.map((c) => computerOf(c)!), instances: [], metrics: {}, providers: [], waking: {}, secrets: [], fetchedAt };
+}
+
+/** A floor's cloud workers in a temp folder, with the feature that drives them, against `f`. */
+function rig(
+  t: test.TestContext,
+  f: ReturnType<typeof factory>,
+  opts: { dir?: string; agentArgs?: string[]; taken?: string[]; computers?: () => FactoryComputersState | undefined; environments?: () => FactoryEnvironmentsState; repo?: string; branch?: string } = {},
+) {
+  const dir = opts.dir ?? mkdtempSync(path.join(os.tmpdir(), 'office-cloud-'));
+  if (!opts.dir) t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const updates: WorkerInfo[] = [];
+  const removed: string[] = [];
+  const toasts: string[] = [];
+  const taken = new Set(opts.taken ?? []);
+  const cloud = new CloudWorkers(dir, { deskTaken: (id) => taken.has(id), names: () => ['Ada'], pool: { names: ['Ada', 'Bea', 'Cy'], colors: ['#123456'] } }, { update: (w) => updates.push(w), remove: (id) => removed.push(id) });
+  const floor: CloudFloor = { id: 'f1', name: 'proj', repo: opts.repo, branch: () => opts.branch, cloud, unstage: (ids) => cloud.drops.unstage(ids) };
+  let polls = 0;
+  let now = 1_000_000;
+  const host: FeatureHost = { changed: () => {}, pollSoon: () => polls++, api: () => f.api, toast: () => {} };
+  const computers = opts.computers ?? (() => computersState());
+  const sleeps: number[] = [];
+  const retry = { sleep: async (ms: number) => void sleeps.push(ms) };
+  const forgotten: string[] = [];
+  const made: FactoryComputer[] = [];
+  const deleted: string[] = [];
+  const feature = new CloudFeature(host, {
+    environments: opts.environments,
+    computerMade: (c) => made.push(c),
+    computerDeleted: (id) => deleted.push(id),
+    instanceWait: { everyMs: 0, maxMs: 60_000 },
+    floors: () => [floor],
+    agentArgs: opts.agentArgs ?? [],
+    computers,
+    toast: (_, text) => toasts.push(text),
+    now: () => now,
+    retry,
+    sessionDeleted: (id) => forgotten.push(id),
+  });
+  return {
+    dir,
+    cloud,
+    floor,
+    feature,
+    updates,
+    removed,
+    toasts,
+    sleeps,
+    forgotten,
+    made,
+    deleted,
+    polls: () => polls,
+    clock: (ms: number) => {
+      now += ms;
+    },
+  };
+}
+
+const hireBody = (extra: Record<string, unknown> = {}) => ({ floor: 'f1', deskId: DESK[0].id, computerId: 'orb-id', cwd: '~/proj', prompt: 'say hi', model: 'claude-opus-4', effort: 'high', ...extra });
+
+const session = (status: string, messageCount: number, updatedAt = messageCount) => json(200, { id: 's1', status, messageCount, updatedAt, title: 'Say hi', sessionSettings: { model: 'claude-opus-4', reasoningEffort: 'high' } });
+
+test('hire: a model substituted in the create response is reported without refusing the hire', async (t) => {
+  const f = factory({ 'POST /sessions': () => json(200, { sessionId: 's1', sessionSettings: { model: 'gpt-6-sol' } }) });
+  const r = rig(t, f);
+  const worker = await r.feature.hire(f.api, hireBody({ prompt: '', model: 'deepseek-v4.1-flash-1017' }), 'Owner');
+  assert.equal((f.calls[0].body as { sessionSettings: { model: string } }).sessionSettings.model, 'deepseek-v4.1-flash-1017');
+  assert.equal(worker.model, 'deepseek-v4.1-flash-1017');
+  assert.equal(worker.activeModel, 'gpt-6-sol');
+  assert.equal(worker.cloud?.modelMismatchWarned, true);
+  assert.match(r.toasts.at(-1)!, /Factory runs .* on gpt-6-sol, not deepseek-v4.1-flash-1017/);
+});
+
+test('shared: autonomy, folders, badge and the session link', () => {
+  assert.equal(officeAutonomy([]), 'high');
+  assert.equal(officeAutonomy(['--auto', 'low']), 'low');
+  assert.equal(officeAutonomy(['--auto=medium']), 'medium');
+  assert.equal(officeAutonomy(['--auto', 'off']), 'high');
+  assert.equal(officeAutonomy(['--skip-permissions-unsafe']), 'high');
+  assert.equal(officeAutonomy(['--auto', 'sideways']), 'high');
+
+  const orb = { name: 'orb', providerType: 'e2b', remoteUser: 'factory-user' };
+  const mac = { name: 'macbook', providerType: 'byom' };
+  assert.equal(computerHome(orb), '/home/factory-user');
+  assert.equal(computerHome(mac), undefined);
+  assert.equal(computerHome({ providerType: 'e2b', remoteUser: '../root' }), undefined);
+  assert.deepEqual(sessionCwd('', orb), {});
+  assert.deepEqual(sessionCwd(' ~ ', orb), {});
+  assert.deepEqual(sessionCwd('~/proj/', orb), { cwd: '/home/factory-user/proj' });
+  assert.deepEqual(sessionCwd('/srv/app', mac), { cwd: '/srv/app' });
+  assert.deepEqual(sessionCwd('C:\\code', mac), { cwd: 'C:\\code' });
+  assert.match(sessionCwd('~/proj', mac) as string, /full path on macbook/);
+  assert.match(sessionCwd('proj', orb) as string, /full path/);
+  assert.match(sessionCwd('/a\nb', orb) as string, /control characters/);
+  assert.match(sessionCwd(`/${'x'.repeat(5000)}`, orb) as string, /too long/);
+
+  assert.equal(canHost({ status: 'active' }), true);
+  assert.equal(canHost({ status: 'provisioning' }), false);
+  assert.equal(cloudBadge({ computerName: 'orb' }), '☁ orb');
+  assert.equal(cloudSessionUrl('a b'), 'https://app.factory.ai/sessions/a%20b');
+});
+
+test('shared: a session’s status, and the turn that tells done from not started yet', () => {
+  const now = 100_000;
+  assert.deepEqual(cloudStatus({ status: 'running' }, {}, now), { status: 'working', turn: { seenBusy: true } });
+  assert.deepEqual(cloudStatus({ status: 'pending' }, { sentAt: 1 }, now).status, 'working');
+  // Idle with nothing sent and nothing seen running: it keeps what it has.
+  assert.deepEqual(cloudStatus({ status: 'idle', messageCount: 0 }, {}, now), { turn: {} });
+  // Just sent: Factory still says idle with the old count, so it's still working.
+  const sent = { sentAt: now - 1000, countAtSend: 2 };
+  assert.deepEqual(cloudStatus({ status: 'idle', messageCount: 2 }, sent, now), { status: 'working', turn: sent });
+  // The count moving is not enough (the sent message itself appends to it): seen running, or long enough, is done.
+  assert.deepEqual(cloudStatus({ status: 'idle', messageCount: 4 }, sent, now), { status: 'working', turn: sent });
+  assert.deepEqual(cloudStatus({ status: 'idle', messageCount: 2 }, { ...sent, seenBusy: true }, now).status, 'done');
+  assert.equal(cloudStatus({ status: 'idle', messageCount: 2 }, sent, now + SEND_SETTLE_MS).status, 'done');
+  // Someone typed to it in Factory's web app: seen running, then idle, is done too.
+  assert.equal(cloudStatus({ status: 'idle' }, { seenBusy: true }, now).status, 'done');
+});
+
+test('shared: what it is doing, from the newest messages', () => {
+  const messages = [
+    {
+      role: 'assistant',
+      content: [
+        { type: 'thinking', text: 'hmm' },
+        { type: 'tool_use', name: 'Read', input: { file_path: '/a.ts' } },
+        { type: 'tool_use', name: 'Execute', input: { command: 'npm   test' } },
+      ],
+    },
+    { role: 'user', content: [{ type: 'text', text: 'run the tests' }] },
+  ];
+  assert.deepEqual(latestTool(messages), { activity: 'Execute: npm test', action: toolAction('Execute', { command: 'npm   test' }) });
+  // Writing its answer: no tool call in the newest assistant message.
+  assert.equal(latestTool([{ role: 'assistant', content: [{ type: 'text', text: 'Done' }] }, ...messages]), undefined);
+  assert.equal(latestTool([null, 'x', { role: 'user', content: [] }]), undefined);
+  assert.equal(toolActivity('Grep', {}), 'Grep');
+  assert.equal(toolActivity('Execute', { command: 'x'.repeat(200) }).length, 80);
+  assert.equal(
+    latestReply([
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: ' Hi \n there ' },
+          { type: 'text', text: '!' },
+        ],
+      },
+    ]),
+    'Hi there !',
+  );
+  assert.equal(latestReply(messages), undefined);
+  assert.equal(
+    answeredByAssistant([
+      { role: 'assistant', content: [] },
+      { role: 'user', content: [] },
+    ]),
+    true,
+  );
+  assert.equal(answeredByAssistant([{ role: 'user', content: [] }]), false);
+  assert.equal(answeredByAssistant([]), false);
+});
+
+test('hire: makes the session on the computer, seats the worker and sends its first prompt with its pictures', async (t) => {
+  const f = factory({
+    'POST /sessions': () => json(201, { sessionId: 's1', status: 'idle', sessionSettings: { model: 'claude-opus-4' } }),
+    'POST /sessions/s1/messages': () => json(200, { messageId: 'm1', status: 'running' }),
+  });
+  const r = rig(t, f, { agentArgs: ['--auto', 'medium'], repo: 'example/factory-flow', branch: 'main' });
+  const pic = r.cloud.drops.stage('shot.png', PNG)!;
+  const w = await r.feature.hire(f.api, hireBody({ images: [pic, 'not-an-id'] }), 'Dev');
+  assert.equal(w.kind, 'cloud');
+  assert.equal(w.name, 'Bea', 'the next free name: Ada is taken by a local worker');
+  assert.equal(w.sessionId, 's1');
+  assert.equal(w.deskId, DESK[0].id);
+  assert.deepEqual(w.cloud, { computerId: 'orb-id', computerName: 'orb', provider: 'e2b', cwd: '/home/factory-user/proj', autonomy: 'medium' });
+  assert.equal(w.task?.name !== undefined, true);
+  const create = f.calls.find((c) => c.path === '/sessions')!;
+  assert.deepEqual(create.body, {
+    computerId: 'orb-id',
+    cwd: '/home/factory-user/proj',
+    sessionSettings: { interactionMode: 'auto', autonomyLevel: 'medium', model: 'claude-opus-4', reasoningEffort: 'high' },
+  });
+  await tick();
+  const sent = f.calls.find((c) => c.path === '/sessions/s1/messages')!;
+  assert.deepEqual(sent.body, {
+    text: [
+      'Factory Flow context: you\'re Bea, a cloud worker on the "proj" floor, running on the Factory computer orb. The owner follows this session from Factory Flow.',
+      'Repository: example/factory-flow on GitHub (https://github.com/example/factory-flow). Use `gh` for its issues and pull requests.',
+      "Your session starts in `/home/factory-user/proj`. If it isn't a clone of example/factory-flow, find the repository's clone on this computer or clone https://github.com/example/factory-flow, and work there.",
+      'Base new work and pull requests on `main`, the floor branch, unless the task names another.',
+      "Factory Flow's tools aren't available on this computer: do the work yourself, and report what changed, checks and links in this session.",
+      '',
+      'say hi',
+    ].join('\n'),
+    images: [{ type: 'base64', data: PNG.toString('base64'), mediaType: 'image/png' }],
+  });
+  assert.equal(r.cloud.get(w.id)?.cloud?.intro, undefined, 'only the first message carries the context');
+  assert.equal(r.cloud.get(w.id)?.prompt, 'say hi', 'what it shows is what the owner typed');
+  assert.equal(r.cloud.drops.stagedPicture(pic), undefined, 'sent pictures are no longer staged');
+  const now = r.cloud.get(w.id)!;
+  assert.equal(now.status, 'working');
+  assert.equal(r.cloud.turn(w.id)?.seenBusy, undefined, "the message's answer saying running isn't a read of the session");
+  assert.ok(r.polls() > 0, 'it asks to be read right away');
+  assert.ok(r.toasts.some((x) => x.includes('hired Bea on ☁ orb')));
+  assert.equal(r.feature.busy(), true);
+  // Its file is the owner's only.
+  assert.equal(statSync(path.join(r.dir, 'cloud-workers.json')).mode & 0o777, 0o600);
+});
+
+test('hire: the context names where to find the repository, and leaves out what the floor does not know', async (t) => {
+  let fail = true;
+  const f = factory({
+    'POST /sessions': () => json(201, { sessionId: 's1' }),
+    'POST /sessions/s1/messages': () => (fail ? json(500, { detail: 'boom' }) : json(200, { status: 'running' })),
+  });
+  const r = rig(t, f, { repo: 'gitlab.example.com/team/app', branch: 'develop' });
+  const w = await r.feature.hire(f.api, hireBody({ cwd: '', prompt: '' }), 'Dev');
+  assert.equal(w.cloud?.intro, true, 'a worker hired without a prompt keeps the context for its first message');
+  assert.match(String(await r.feature.send(w.id, 'first', [])), /boom/);
+  assert.equal(r.cloud.get(w.id)?.cloud?.intro, true, 'a message that never arrived leaves the context for the next');
+  fail = false;
+  assert.equal(await r.feature.send(w.id, 'go', []), undefined);
+  assert.equal(await r.feature.send(w.id, 'and again', []), undefined);
+  const texts = f.calls.filter((c) => c.path === '/sessions/s1/messages').map((c) => (c.body as { text: string }).text);
+  assert.match(texts[1], /^Factory Flow context: you're Bea, a cloud worker on the "proj" floor/);
+  assert.match(texts[1], /\nRepository: gitlab\.example\.com\/team\/app on GitLab \(https:\/\/gitlab\.example\.com\/team\/app\)\. Use `glab` for its issues and merge requests\.\n/);
+  assert.match(texts[1], /\nYour session starts in the computer's home folder, which may not hold the repository: find its clone on this computer, or clone https:\/\/gitlab\.example\.com\/team\/app, and work there\.\n/);
+  assert.match(texts[1], /\nBase new work and merge requests on `develop`, the floor branch/);
+  assert.match(texts[1], /\n\ngo$/);
+  assert.equal(texts[2], 'and again');
+
+  // A floor with no repository or known branch says only where the session starts.
+  const g = factory({ 'POST /sessions': () => json(201, { sessionId: 's1' }), 'POST /sessions/s1/messages': () => json(200, { status: 'running' }) });
+  const plain = rig(t, g);
+  await plain.feature.hire(g.api, hireBody(), 'Dev');
+  await tick();
+  const only = (g.calls.find((c) => c.path === '/sessions/s1/messages')!.body as { text: string }).text;
+  assert.doesNotMatch(only, /Repository:|floor branch/);
+  assert.match(only, /\nYour session starts in `\/home\/factory-user\/proj`\.\n/);
+  assert.match(only, /\n\nsay hi$/);
+});
+
+test('hire: a read right after the first message that still says idle from before it keeps the worker working', async (t) => {
+  const f = factory({
+    'POST /sessions': () => json(201, { sessionId: 's1' }),
+    'POST /sessions/s1/messages': () => json(200, { messageId: 'm1', status: 'running' }),
+    'GET /sessions/s1': () => session('idle', 0),
+    'GET /sessions/s1/messages': () => json(200, { messages: [{ role: 'user', content: [{ type: 'text', text: 'say hi' }] }] }),
+  });
+  const r = rig(t, f);
+  const w = await r.feature.hire(f.api, hireBody(), 'Dev');
+  await tick();
+  await r.feature.poll(f.api);
+  assert.equal(r.cloud.get(w.id)?.status, 'working');
+});
+
+test('hire: a failed create hires nobody, gives the desk back and says what Factory said', async (t) => {
+  let fail = true;
+  const f = factory({
+    'POST /sessions': () => (fail ? json(422, { detail: 'Computer is not reachable' }) : json(201, { sessionId: 's2' })),
+  });
+  const r = rig(t, f);
+  const pic = r.cloud.drops.stage('shot.png', PNG)!;
+  await assert.rejects(r.feature.hire(f.api, hireBody({ images: [pic], prompt: '' }), 'Dev'), (err: Error) => err instanceof FactoryError && /not reachable/.test(err.message));
+  assert.equal(r.cloud.list().length, 0);
+  assert.ok(r.cloud.drops.stagedPicture(pic), 'the dialog keeps its pictures to try again');
+  // The desk is free again, and with no prompt the worker waits for one.
+  fail = false;
+  const w = await r.feature.hire(f.api, hireBody({ prompt: '' }), 'Dev');
+  assert.equal(w.status, 'idle');
+  assert.equal(w.activity, 'Ready for a first prompt');
+  assert.equal(f.calls.filter((c) => c.path.endsWith('/messages')).length, 0);
+  // A session that comes back without an id hires nobody either.
+  const g = factory({ 'POST /sessions': () => json(201, {}) });
+  const r2 = rig(t, g);
+  await assert.rejects(r2.feature.hire(g.api, hireBody(), 'Dev'), (err: Error) => err instanceof HttpError && err.status === 502);
+  assert.equal(r2.cloud.deskTaken(DESK[0].id), false);
+});
+
+for (const action of ['replace', 'disconnect'] as const) {
+  for (const succeeds of [true, false]) {
+    test(`hire: ${action} during session creation still ${succeeds ? 'seats the worker' : 'releases the failed hire’s desk'}`, async (t) => {
+      let release!: (r: Response) => void;
+      let started!: () => void;
+      const creating = new Promise<void>((r) => (started = r));
+      const held = new Promise<Response>((r) => (release = r));
+      t.after(() => release(json(422, {})));
+      const f = factory({
+        'POST /sessions': () => {
+          started();
+          return held;
+        },
+      });
+      const r = rig(t, f);
+      let connected = true;
+      let api = f.api;
+      const reg = new FactoryRegistry({
+        link: { connection: () => ({ connected, capabilities: [] }), client: () => (connected ? api : undefined), rejected: () => {} },
+        broadcast: () => {},
+        toast: () => {},
+      });
+      t.after(() => reg.stop());
+      reg.register((host) => new CloudFeature(host, { floors: () => [r.floor], agentArgs: [], computers: () => computersState(), toast: () => {} }));
+      const hiring = reg.http('POST', '/cloud/hire', new URLSearchParams(), async () => JSON.stringify(hireBody({ prompt: '' })), { trusted: true });
+      await creating;
+      assert.equal(r.cloud.deskTaken(DESK[0].id), true);
+      if (action === 'replace') {
+        api = new FactoryApi('fk-test-new-2222', (async () => json(404, {})) as typeof fetch);
+        reg.keyReplaced();
+      } else {
+        connected = false;
+        reg.connectionChanged();
+      }
+      release(succeeds ? json(201, { sessionId: 's1' }) : json(422, { detail: 'Computer is not reachable' }));
+      // Drain ready promise callbacks, not a wall-clock timeout. A scoped API never reaches the cleanup.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(r.cloud.list().length, succeeds ? 1 : 0);
+      if (succeeds) r.cloud.remove(r.cloud.list()[0].id);
+      assert.equal(r.cloud.deskTaken(DESK[0].id), false, 'no invisible reservation survives the response');
+      assert.equal(r.cloud.hold(DESK[0].id), undefined, 'another hire can reserve the same desk');
+      r.cloud.release(DESK[0].id);
+      assert.equal((await hiring).status, succeeds ? 200 : 422);
+    });
+  }
+}
+
+test('hire: refuses what can’t run on a Factory computer before asking Factory', async (t) => {
+  const f = factory({});
+  const r = rig(t, f, { taken: [DESK[1].id] });
+  const refused = async (body: Record<string, unknown>, why: RegExp) => assert.rejects(r.feature.hire(f.api, hireBody(body), 'Dev'), (err: Error) => err instanceof HttpError && why.test(err.message));
+  await refused({ floor: 'gone' }, /no longer in the building/);
+  await refused({ computerId: 'nope' }, /isn't on Factory/);
+  await refused({ computerId: 'zz-id' }, /provisioning/);
+  await refused({ computerId: 'mac-id', cwd: '~/x' }, /full path/);
+  await refused({ model: 'custom:my-byok' }, /only run on this machine/);
+  await refused({ model: 'bad model' }, /not valid/);
+  await refused({ deskId: DESK[1].id }, /taken/);
+  await refused({ deskId: 'nowhere' }, /Unknown desk/);
+  await refused({ deskId: 'station-issues' }, /Unknown desk/);
+  assert.equal(f.calls.length, 0);
+});
+
+// GET /environments and POST/GET /computers answers from the owner's account, trimmed.
+const ENV_ID = 'cf248f8e-05ce-4fa4-9769-84d85d19792e';
+const REAL_ENV = {
+  id: ENV_ID,
+  name: 'factory-flow-default',
+  scope: 'organization',
+  repositories: [{ url: 'https://github.com/example/factory-flow', script: 'npm ci --no-audit --no-fund\n' }],
+  setupScript: '',
+  latestBuild: { id: '25128393-78d5-4841-a8db-2c2c442f9bc0', status: 'succeeded', trigger: 'edit', truncated: true, withheld: false, createdAt: 1791868403886 },
+  lastSuccessfulBuildAt: 1791868529007,
+  status: 'ready',
+  isDefault: true,
+  createdAt: 1791867364265,
+  updatedAt: 1791868529007,
+};
+const INSTANCE = {
+  id: 'a3283d44-f68a-4fdb-b7b6-a8ec87ff0ceb',
+  name: 'factory-flow-default-probe01',
+  isListed: false,
+  providerType: 'e2b',
+  status: 'provisioning',
+  createdAt: 1791871271173,
+  remoteUser: 'factory-user',
+  clonedRepoDirectories: ['/home/factory-user/repos/factory-flow'],
+  computerSource: { kind: 'template', templateId: ENV_ID },
+  provisioningSteps: [{ id: 'create-computer', name: 'Create computer', status: 'running' }],
+};
+const envs = (raw: Record<string, unknown>[] = [REAL_ENV]): FactoryEnvironmentsState => ({ ...emptyEnvironments(), items: raw.map((e) => environmentOf(e)!), fetchedAt: 1 });
+const envHire = (extra: Record<string, unknown> = {}) => hireBody({ computerId: undefined, environmentId: ENV_ID, cwd: '', ...extra });
+
+test('hire on an Environment: a computer of its own, waited for, the session in the floor’s clone; home deletes the computer', async (t) => {
+  let polls = 0;
+  const f = factory({
+    'POST /computers': () => json(201, INSTANCE),
+    [`GET /computers/${INSTANCE.id}`]: () => json(200, ++polls < 3 ? INSTANCE : { ...INSTANCE, status: 'active', provisioningSteps: [{ id: 'create-computer', name: 'Create computer', status: 'completed' }] }),
+    'POST /sessions': () => json(201, { sessionId: 's1', status: 'idle' }),
+    'POST /sessions/s1/messages': () => json(200, { status: 'running' }),
+    [`DELETE /computers/${INSTANCE.id}`]: () => new Response(null, { status: 204 }),
+  });
+  const r = rig(t, f, { environments: () => envs(), repo: 'example/factory-flow' });
+  const w = await r.feature.hire(f.api, envHire(), 'Dev');
+  const create = f.calls.find((c) => c.method === 'POST' && c.path === '/computers')!;
+  assert.match((create.body as { name: string }).name, /^factory-flow-default-[0-9a-f]{8}$/);
+  assert.deepEqual((create.body as { source: unknown }).source, { kind: 'environment', environmentId: ENV_ID, isListed: false });
+  assert.equal(polls, 3, 'it waited for the computer to be active');
+  assert.deepEqual(f.calls.find((c) => c.path === '/sessions')!.body, {
+    computerId: INSTANCE.id,
+    cwd: '/home/factory-user/repos/factory-flow',
+    sessionSettings: { interactionMode: 'auto', autonomyLevel: 'high', model: 'claude-opus-4', reasoningEffort: 'high' },
+  });
+  assert.deepEqual(w.cloud, {
+    computerId: INSTANCE.id,
+    computerName: 'factory-flow-default-probe01',
+    provider: 'e2b',
+    cwd: '/home/factory-user/repos/factory-flow',
+    autonomy: 'high',
+    environmentId: ENV_ID,
+    environmentName: 'factory-flow-default',
+    instance: true,
+  });
+  assert.equal(cloudBadge(w.cloud!), '☁ factory-flow-default');
+  assert.ok(r.toasts.some((x) => x.includes('hired Bea on ☁ factory-flow-default')));
+  assert.ok(r.made.length >= 2 && r.made.every((c) => c.unlisted && c.environmentId === ENV_ID), 'the computers slice hears of it while it starts');
+
+  // It's still there after a restart, an instance still.
+  const again = new CloudWorkers(r.dir, { deskTaken: () => false, names: () => [], pool: { names: ['Ada'], colors: ['#000'] } }, { update: () => {}, remove: () => {} });
+  assert.equal(again.get(w.id)?.cloud?.instance, true);
+  assert.equal(again.get(w.id)?.cloud?.environmentName, 'factory-flow-default');
+
+  // The clone is the Environment's build's: the first message says to bring it up to date first, the next ones don't.
+  await tick();
+  const texts = () => f.calls.filter((c) => c.method === 'POST' && c.path === '/sessions/s1/messages').map((c) => (c.body as { text: string }).text);
+  assert.match(texts()[0], /^Factory Flow context: you're Bea, a cloud worker on the "proj" floor, running on the Factory computer factory-flow-default-probe01\./);
+  assert.match(texts()[0], /\nYour session starts in `\/home\/factory-user\/repos\/factory-flow`, the repository's clone on this computer\.\n/);
+  assert.match(texts()[0], /\n\nFactory Flow environment: factory-flow-default\n`\/home\/factory-user\/repos\/factory-flow` contains/);
+  assert.match(texts()[0], /git fetch origin && git pull --ff-only[\s\S]*Task:\n\nsay hi$/);
+  assert.equal(r.feature.find(w.id)?.info.cloud?.catchUp, undefined);
+  assert.equal(await r.feature.send(w.id, 'and again', []), undefined);
+  assert.equal(texts()[1], 'and again');
+  assert.equal(r.feature.find(w.id)?.info.prompt, 'say hi', 'what it shows is what the owner typed');
+
+  const home = await r.feature.sendHome(w.id, false);
+  assert.match(home.note!, /computer factory-flow-default-probe01 was deleted; its session stays archived/);
+  assert.ok(!f.calls.some((c) => c.path === '/sessions/s1/interrupt'), 'deleting the computer stops the session anyway');
+  assert.ok(f.calls.some((c) => c.method === 'DELETE' && c.path === `/computers/${INSTANCE.id}`));
+  assert.deepEqual(r.deleted, [INSTANCE.id]);
+});
+
+test('hire on an Environment: a typed folder wins, a failure deletes the computer, and one not built yet is refused', async (t) => {
+  let session = json(201, { sessionId: 's2' });
+  let deletes = 0;
+  const f = factory({
+    'POST /computers': () => json(201, { ...INSTANCE, status: 'active' }),
+    'POST /sessions': () => session,
+    [`DELETE /computers/${INSTANCE.id}`]: () => (deletes++ ? json(404, { status: 404, title: 'Not Found', detail: 'Computer not found' }) : new Response(null, { status: 204 })),
+    'DELETE /sessions/s2': () => new Response(null, { status: 204 }),
+  });
+  const r = rig(t, f, {
+    environments: () => envs([REAL_ENV, { ...REAL_ENV, id: 'fresh', name: 'fresh', lastSuccessfulBuildAt: undefined, status: 'building', latestBuild: { ...REAL_ENV.latestBuild, status: 'building' } }]),
+    repo: 'example/other',
+  });
+  const w = await r.feature.hire(f.api, envHire({ cwd: '~/scratch', prompt: '' }), 'Dev');
+  assert.equal(w.cloud?.cwd, '/home/factory-user/scratch');
+  // A second floor repository that isn't on it: the session starts in its only clone.
+  const home = await r.feature.sendHome(w.id, true);
+  assert.match(home.note!, /computer factory-flow-default-probe01 and its session were deleted/);
+  assert.deepEqual(r.forgotten, ['s2']);
+
+  session = json(422, { detail: 'Computer is not reachable' });
+  await assert.rejects(r.feature.hire(f.api, envHire(), 'Dev'), /not reachable/);
+  assert.equal(deletes, 2, 'the computer made for the failed hire is deleted (a 404 counts as gone)');
+  assert.equal(r.cloud.deskTaken(DESK[0].id), false);
+
+  await assert.rejects(r.feature.hire(f.api, envHire({ environmentId: 'fresh' }), 'Dev'), /fresh is building: a computer starts from an Environment once it has built/);
+  await assert.rejects(r.feature.hire(f.api, envHire({ environmentId: 'gone' }), 'Dev'), /isn't on Factory any more/);
+  const before = f.calls.length;
+  await assert.rejects(r.feature.hire(f.api, envHire({ cwd: 'relative' }), 'Dev'), /full path/);
+  assert.equal(f.calls.length, before, 'a folder no computer can use is refused before one is started');
+});
+
+test('hire on an Environment: send home deletes its computer even when the session cleanup fails', async (t) => {
+  let computerDelete = new Response(null, { status: 204 });
+  const f = factory({
+    'POST /computers': () => json(201, { ...INSTANCE, status: 'active' }),
+    'POST /sessions': () => json(201, { sessionId: 's3' }),
+    'POST /sessions/s3/messages': () => json(200, { status: 'running' }),
+    'POST /sessions/s3/interrupt': () => json(200, { status: 'idle' }),
+    'DELETE /sessions/s3': () => json(500, { detail: 'boom' }),
+    [`DELETE /computers/${INSTANCE.id}`]: () => computerDelete,
+  });
+  const r = rig(t, f, { environments: () => envs() });
+  const w = await r.feature.hire(f.api, envHire({ prompt: '' }), 'Dev');
+  const home = await r.feature.sendHome(w.id, true);
+  assert.match(home.error ?? '', /computer factory-flow-default-probe01 was deleted, but its session wasn't: boom/);
+  assert.deepEqual(r.deleted, [INSTANCE.id]);
+  assert.deepEqual(r.forgotten, [], 'a session that wasn’t deleted stays in the Sessions list');
+
+  // A computer that stays keeps its session running there: it's stopped instead.
+  computerDelete = json(500, { detail: 'no' });
+  const busy = await r.feature.hire(f.api, envHire(), 'Dev');
+  await tick();
+  const again = await r.feature.sendHome(busy.id, false);
+  assert.match(again.error ?? '', /Couldn't delete .+'s computer factory-flow-default-probe01: delete it in the Computers window$/);
+  assert.ok(f.calls.some((c) => c.path === '/sessions/s3/interrupt'));
+});
+
+test('hire on an Environment: the catch-up note goes with exactly one message, and comes back if that one fails', async (t) => {
+  let fail = true;
+  const f = factory({
+    'POST /computers': () => json(201, { ...INSTANCE, status: 'active' }),
+    'POST /sessions': () => json(201, { sessionId: 's4' }),
+    'POST /sessions/s4/messages': () => (fail ? json(500, { detail: 'boom' }) : json(200, { status: 'running' })),
+  });
+  const r = rig(t, f, { environments: () => envs(), repo: 'example/factory-flow' });
+  const w = await r.feature.hire(f.api, envHire({ prompt: '' }), 'Dev');
+  assert.match(String(await r.feature.send(w.id, 'first', [])), /boom/);
+  assert.equal(r.feature.find(w.id)?.info.cloud?.catchUp, true, 'a message that never arrived leaves the note for the next');
+  fail = false;
+  const sent = await Promise.all([r.feature.send(w.id, 'one', []), r.feature.send(w.id, 'two', [])]);
+  assert.deepEqual(sent, [undefined, undefined]);
+  const texts = f.calls.filter((c) => c.method === 'POST' && c.path === '/sessions/s4/messages').map((c) => (c.body as { text: string }).text);
+  assert.equal(texts.length, 3);
+  assert.equal(texts.slice(1).filter((x) => x.includes('git pull --ff-only')).length, 1, 'two sent at once: only one carries the note');
+  assert.equal(r.feature.find(w.id)?.info.cloud?.catchUp, undefined);
+});
+
+test('hire on an Environment: a computer that never comes up is given up on and deleted', async (t) => {
+  const f = factory({
+    'POST /computers': () => json(201, INSTANCE),
+    [`GET /computers/${INSTANCE.id}`]: () => json(200, { ...INSTANCE, status: 'error' }),
+    [`DELETE /computers/${INSTANCE.id}`]: () => json(500, { detail: 'boom' }),
+  });
+  const r = rig(t, f, { environments: () => envs() });
+  await assert.rejects(r.feature.hire(f.api, envHire(), 'Dev'), /didn't start from factory-flow-default/);
+  assert.equal(r.cloud.list().length, 0);
+  assert.deepEqual(r.deleted, [], 'a delete that failed is not counted as gone');
+  const slow = factory({ 'POST /computers': () => json(201, INSTANCE), [`GET /computers/${INSTANCE.id}`]: () => json(200, INSTANCE), [`DELETE /computers/${INSTANCE.id}`]: () => new Response(null, { status: 204 }) });
+  const r2 = rig(t, slow, { environments: () => envs() });
+  const never = new CloudFeature(
+    { changed: () => {}, pollSoon: () => {}, api: () => slow.api, toast: () => {} },
+    { floors: () => [r2.floor], agentArgs: [], computers: () => computersState(), environments: () => envs(), toast: () => {}, instanceWait: { everyMs: 0, maxMs: 0 } },
+  );
+  await assert.rejects(never.hire(slow.api, envHire(), 'Dev'), /within 0 minutes/);
+  assert.equal(r2.cloud.deskTaken(DESK[0].id), false);
+});
+
+test('poll: working with its latest tool call acted out, then done with its reply, and the session’s model', async (t) => {
+  let s = () => session('running', 3);
+  let tail: unknown[] = [{ role: 'assistant', content: [{ type: 'tool_use', name: 'Execute', input: { command: 'pwd' } }] }];
+  const f = factory({
+    'POST /sessions': () => json(201, { sessionId: 's1' }),
+    'POST /sessions/s1/messages': () => json(200, { status: 'pending' }),
+    'GET /sessions/s1': () => s(),
+    'GET /sessions/s1/messages': () => json(200, { messages: tail }),
+  });
+  const r = rig(t, f);
+  const w = await r.feature.hire(f.api, hireBody(), 'Dev');
+  await tick();
+  await r.feature.poll(f.api);
+  let now = r.cloud.get(w.id)!;
+  assert.equal(now.status, 'working');
+  assert.equal(now.activity, 'Execute: pwd');
+  assert.equal(now.action, toolAction('Execute', { command: 'pwd' }));
+  assert.equal(now.activeModel, 'claude-opus-4');
+  assert.equal(now.activeEffort, 'high');
+  assert.equal(now.title, 'Say hi');
+  assert.ok(r.feature.state().fetchedAt > 0);
+
+  // The count needn't move between the last working read and the idle one: the reply is read anyway.
+  s = () => session('idle', 3);
+  tail = [{ role: 'assistant', content: [{ type: 'text', text: 'Hi there! All done.' }] }];
+  r.clock(5000);
+  await r.feature.poll(f.api);
+  now = r.cloud.get(w.id)!;
+  assert.equal(now.status, 'done');
+  assert.equal(now.acked, false, 'its flag is up: nobody has its window open');
+  assert.equal(now.action, undefined);
+  assert.equal(now.activity, 'Hi there! All done.');
+  assert.equal(now.task?.summary, 'Hi there! All done.');
+  assert.equal(r.feature.busy(), false);
+
+  // At rest it's read again only on the slow clock, unless asked.
+  const reads = () => f.calls.filter((c) => c.method === 'GET' && c.path === '/sessions/s1').length;
+  const before = reads();
+  r.clock(5000);
+  await r.feature.poll(f.api);
+  assert.equal(reads(), before);
+  r.feature.recheck(w.id);
+  await r.feature.poll(f.api);
+  assert.equal(reads(), before + 1);
+  // The transcript is read only when the session moved.
+  const tails = () => f.calls.filter((c) => c.path === '/sessions/s1/messages' && c.method === 'GET').length;
+  const t0 = tails();
+  r.feature.recheck(w.id);
+  await r.feature.poll(f.api);
+  assert.equal(tails(), t0);
+});
+
+test('poll: a turn that ends before its reply is in the messages looks for the reply a while longer', async (t) => {
+  let s = () => session('running', 3);
+  let tail: unknown[] = [{ role: 'user', content: [{ type: 'text', text: 'say hi' }] }];
+  let posted = 'pending';
+  const f = factory({
+    'POST /sessions': () => json(201, { sessionId: 's1' }),
+    'POST /sessions/s1/messages': () => json(200, { status: posted }),
+    'GET /sessions/s1': () => s(),
+    'GET /sessions/s1/messages': () => json(200, { messages: tail }),
+  });
+  const r = rig(t, f);
+  const w = await r.feature.hire(f.api, hireBody(), 'Dev');
+  await tick();
+  await r.feature.poll(f.api);
+  assert.equal(r.cloud.get(w.id)!.status, 'working');
+
+  // Idle, and Factory has no reply yet: done, saying what it was asked, and still watched closely.
+  s = () => session('idle', 3);
+  r.clock(4000);
+  await r.feature.poll(f.api);
+  assert.equal(r.cloud.get(w.id)!.status, 'done');
+  assert.equal(r.cloud.get(w.id)!.activity, 'say hi');
+  assert.equal(r.feature.busy(), true, 'polled fast while it looks for the reply');
+
+  // The reply lands without the session moving: the next poll reads it anyway.
+  tail = [{ role: 'assistant', content: [{ type: 'text', text: 'hi' }] }, ...tail];
+  r.clock(4000);
+  await r.feature.poll(f.api);
+  assert.equal(r.cloud.get(w.id)!.status, 'done');
+  assert.equal(r.cloud.get(w.id)!.activity, 'hi');
+  assert.equal(r.feature.busy(), false);
+
+  // Factory lists the new prompt and its reply late: the newest listed is still the last turn's reply,
+  // which doesn't end this one.
+  r.clock(60_000);
+  const sent = 1_000_000 + 8000 + 60_000;
+  posted = 'idle';
+  await r.feature.send(w.id, 'say hello', []);
+  s = () => session('idle', 3);
+  tail = [{ role: 'assistant', createdAt: sent - 30_000, content: [{ type: 'text', text: 'hi' }] }];
+  r.clock(4000);
+  await r.feature.poll(f.api);
+  assert.equal(r.cloud.get(w.id)!.status, 'working', 'an old reply is not the answer');
+  tail = [{ role: 'assistant', createdAt: sent + 3000, content: [{ type: 'text', text: 'hello' }] }, ...tail];
+  r.clock(4000);
+  await r.feature.poll(f.api);
+  assert.equal(r.cloud.get(w.id)!.status, 'done');
+  assert.equal(r.cloud.get(w.id)!.activity, 'hello');
+
+  // One whose reply never comes stops looking after a while.
+  const tails = () => f.calls.filter((c) => c.path === '/sessions/s1/messages').length;
+  r.cloud.update(w.id, (_, x) => {
+    x.turn = { replyBy: 1 };
+  });
+  const before = tails();
+  r.clock(4000);
+  r.feature.recheck(w.id);
+  await r.feature.poll(f.api);
+  assert.equal(tails(), before, 'past replyBy: the tail is read only when the session moves');
+  assert.equal(r.feature.busy(), false);
+});
+
+test('poll: a deleted session or computer is a clear error at the desk, and a failed read keeps the last status', async (t) => {
+  let gone = false;
+  let down = false;
+  const f = factory({
+    'POST /sessions': () => json(201, { sessionId: 's1' }),
+    'GET /sessions/s1': () => (down ? json(503, { detail: 'down' }) : gone ? json(404, { detail: 'Session not found' }) : session('idle', 0)),
+  });
+  let computers = computersState();
+  const r = rig(t, f, { computers: () => computers });
+  const w = await r.feature.hire(f.api, hireBody({ prompt: '' }), 'Dev');
+
+  // Factory 404s a session for a moment right after it was made: not broken yet, just a failed read.
+  gone = true;
+  r.feature.recheck(w.id);
+  await assert.rejects(r.feature.poll(f.api), /not found/i);
+  assert.equal(r.cloud.get(w.id)!.status, 'idle');
+  assert.equal(r.cloud.get(w.id)!.cloud?.error, undefined);
+  gone = false;
+
+  await r.feature.poll(f.api);
+  assert.equal(r.cloud.get(w.id)!.status, 'idle');
+
+  down = true;
+  r.feature.recheck(w.id);
+  await assert.rejects(r.feature.poll(f.api), /down/);
+  assert.equal(r.cloud.get(w.id)!.status, 'idle');
+
+  down = false;
+  gone = true;
+  r.feature.recheck(w.id);
+  await r.feature.poll(f.api);
+  let now = r.cloud.get(w.id)!;
+  assert.equal(now.status, 'exited');
+  assert.equal(now.cloud?.error, 'its session is gone from Factory');
+  assert.match(now.activity ?? '', /^☁ Its session is gone/);
+
+  // It comes back when the session does.
+  gone = false;
+  r.feature.recheck(w.id);
+  await r.feature.poll(f.api);
+  now = r.cloud.get(w.id)!;
+  assert.equal(now.status, 'idle');
+  assert.equal(now.cloud?.error, undefined);
+  assert.equal(now.activity?.startsWith('☁ '), false, 'the error line on its card goes with the error');
+
+  computers = computersState([MAC]);
+  r.feature.recheck(w.id);
+  await r.feature.poll(f.api);
+  assert.equal(r.cloud.get(w.id)!.cloud?.error, 'its computer orb is no longer on Factory');
+  computers = computersState([{ ...ORB, name: 'orb2', status: 'error' }]);
+  r.feature.recheck(w.id);
+  await r.feature.poll(f.api);
+  assert.equal(r.cloud.get(w.id)!.cloud?.error, 'its computer orb2 has a problem on Factory');
+
+  // A rejected key stops the whole poll, so the registry hears it.
+  const k = factory({ 'GET /sessions/s1': () => json(401, { detail: 'bad key' }) });
+  r.feature.recheck(w.id);
+  computers = computersState();
+  await assert.rejects(r.feature.poll(k.api), (err: Error) => err instanceof FactoryError && err.status === 401);
+});
+
+test('poll: its laptop shows the tail of its transcript, sent once per change and to whoever walks in', async (t) => {
+  const tail = [
+    { id: 'm2', role: 'assistant', seq: 2, createdAt: 2, content: [{ type: 'tool_use', id: 't1', name: 'Execute', input: { command: 'npm test' } }] },
+    { id: 'm1', role: 'user', seq: 1, createdAt: 1, content: [{ type: 'text', text: 'say hi' }] },
+  ];
+  const f = factory({
+    'POST /sessions': () => json(201, { sessionId: 's1' }),
+    'POST /sessions/s1/messages': () => json(200, { status: 'running' }),
+    'GET /sessions/s1': () => session('running', 2),
+    'GET /sessions/s1/messages': () => json(200, { messages: tail }),
+  });
+  const r = rig(t, f);
+  const screens: string[][] = [];
+  Reflect.set(r.cloud, 'events', {
+    update: () => {},
+    remove: () => {},
+    screen: (_: string, frame: { lines: Record<number, [string][]> }) => screens.push(Object.values(frame.lines).map((runs) => runs.map((x) => x[0]).join(''))),
+  });
+  const w = await r.feature.hire(f.api, hireBody(), 'Dev');
+  await tick();
+  await r.feature.poll(f.api);
+  assert.equal(screens.length, 1);
+  assert.deepEqual(
+    screens[0].filter((l) => l),
+    ['> say hi', '● Execute npm test', '  ⎿  Running…'],
+  );
+  r.clock(1000);
+  r.cloud.polled(w.id, undefined, r.cloud.turn(w.id) ?? {}, 0);
+  Reflect.set(r.cloud.seen(w.id)!, 'count', 0);
+  await r.feature.poll(f.api);
+  assert.equal(screens.length, 1, 'the same tail paints nothing new');
+  assert.deepEqual(
+    r.cloud.fullScreens().map((s) => s.workerId),
+    [w.id],
+  );
+  r.cloud.remove(w.id);
+  assert.deepEqual(r.cloud.fullScreens(), []);
+});
+
+test('restart: a cloud worker is back at its desk and picks its session up again by id', async (t) => {
+  const f = factory({
+    'POST /sessions': () => json(201, { sessionId: 's1' }),
+    'POST /sessions/s1/messages': () => json(200, { status: 'idle' }),
+    'GET /sessions/s1': () => session('idle', 2),
+    'GET /sessions/s1/messages': () => json(200, { messages: [{ role: 'assistant', content: [{ type: 'text', text: 'hi' }] }] }),
+  });
+  const r = rig(t, f);
+  const w = await r.feature.hire(f.api, hireBody(), 'Dev');
+  await tick();
+  r.cloud.attach(w.id, 'c1');
+  const saved = JSON.parse(readFileSync(path.join(r.dir, 'cloud-workers.json'), 'utf8'));
+  assert.equal(saved[0].info.open, undefined, 'whose window is open is not saved');
+  assert.equal(saved[0].turn.sentAt !== undefined, true);
+
+  const again = rig(t, f, { dir: r.dir });
+  const back = again.cloud.get(w.id)!;
+  assert.equal(back.kind, 'cloud');
+  assert.equal(back.sessionId, 's1');
+  assert.equal(back.open, false);
+  assert.equal(back.status, 'working');
+  assert.equal(again.cloud.deskTaken(w.deskId), true);
+  await again.feature.poll(f.api);
+  assert.equal(again.cloud.get(w.id)!.status, 'done', 'the turn it was on when the office stopped ended meanwhile');
+  assert.equal(again.cloud.get(w.id)!.activity, 'hi');
+
+  // A worker caught mid-hire comes back at rest, and a broken file is skipped.
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'office-cloud-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const raw = [
+    { info: { ...back, id: 'w2', deskId: DESK[2].id, status: 'starting' } },
+    { info: { ...back, id: 'w3', deskId: DESK[3].id, kind: 'agent' } },
+    { info: { ...back, id: 'w4', deskId: 'nowhere' } },
+    { info: { ...back, id: 'w5', deskId: DESK[4].id, cloud: undefined } },
+    { info: { ...back, id: 'w6', deskId: DESK[2].id } },
+    null,
+  ];
+  const { writeFileSync } = await import('node:fs');
+  writeFileSync(path.join(dir, 'cloud-workers.json'), JSON.stringify(raw));
+  const third = rig(t, f, { dir });
+  assert.deepEqual(
+    third.cloud.list().map((x) => [x.id, x.status]),
+    [['w2', 'idle']],
+  );
+  writeFileSync(path.join(dir, 'cloud-workers.json'), '{not json');
+  assert.equal(rig(t, f, { dir }).cloud.list().length, 0);
+});
+
+test('send home: interrupts it when it works, deletes the session only when asked', async (t) => {
+  const f = factory({
+    'POST /sessions': () => json(201, { sessionId: 's1' }),
+    'POST /sessions/s1/messages': () => json(200, { status: 'running' }),
+    'POST /sessions/s1/interrupt': () => json(200, { status: 'idle' }),
+    'DELETE /sessions/s1': () => new Response(null, { status: 204 }),
+  });
+  const r = rig(t, f);
+  const busy = await r.feature.hire(f.api, hireBody(), 'Dev');
+  await tick();
+  assert.deepEqual(await r.feature.sendHome(busy.id, false), { note: `☁ ${busy.name}'s session was stopped; it stays in Factory's sessions` });
+  assert.deepEqual(r.removed, [busy.id]);
+  assert.deepEqual(
+    f.calls.filter((c) => c.path.startsWith('/sessions/s1') && c.method !== 'GET').map((c) => `${c.method} ${c.path}`),
+    ['POST /sessions/s1/messages', 'POST /sessions/s1/interrupt'],
+  );
+
+  const idle = await r.feature.hire(f.api, hireBody({ prompt: '' }), 'Dev');
+  const before = f.calls.length;
+  assert.deepEqual(await r.feature.sendHome(idle.id, false), {});
+  assert.equal(f.calls.length, before, 'an idle one that keeps its session needs nothing from Factory');
+
+  const doomed = await r.feature.hire(f.api, hireBody({ prompt: '' }), 'Dev');
+  assert.deepEqual(await r.feature.sendHome(doomed.id, true), { note: `🗑️ ${doomed.name}'s Factory session was deleted` });
+  assert.equal(f.calls.at(-1)?.method, 'DELETE');
+  assert.deepEqual(r.forgotten, ['s1'], 'the Sessions feature drops it, and only once it was deleted');
+  assert.equal(r.cloud.list().length, 0);
+  assert.deepEqual(await r.feature.sendHome('nobody', true), {});
+
+  // Already gone on Factory: nothing to say but that it's deleted.
+  const g = factory({ 'POST /sessions': () => json(201, { sessionId: 's9' }), 'DELETE /sessions/s9': () => json(404, { detail: 'gone' }) });
+  const r2 = rig(t, g);
+  const w = await r2.feature.hire(g.api, hireBody({ prompt: '' }), 'Dev');
+  r2.cloud.update(w.id, (i) => {
+    i.createdAt = 1;
+  });
+  assert.match((await r2.feature.sendHome(w.id, true)).note ?? '', /deleted/);
+  assert.equal(g.calls.filter((c) => c.method === 'DELETE').length, 1, 'an old session that 404s is not asked again');
+  assert.deepEqual(r2.sleeps, []);
+
+  // Just made: Factory can't find it for a few seconds, so the delete is tried again until it can.
+  let misses = 2;
+  const y = factory({ 'POST /sessions': () => json(201, { sessionId: 's7' }), 'DELETE /sessions/s7': () => (misses-- > 0 ? json(404, { detail: 'not yet' }) : new Response(null, { status: 204 })) });
+  const r4 = rig(t, y);
+  const young = await r4.feature.hire(y.api, hireBody({ prompt: '' }), 'Dev');
+  // The rig's clock starts at 1_000_000: the worker was made just now by it.
+  r4.cloud.update(young.id, (i) => {
+    i.createdAt = 1_000_000;
+  });
+  assert.match((await r4.feature.sendHome(young.id, true)).note ?? '', /deleted/);
+  assert.equal(y.calls.filter((c) => c.method === 'DELETE').length, 3);
+  assert.equal(r4.sleeps.length, 2);
+  // One that never turns up isn't called deleted.
+  const never = factory({ 'POST /sessions': () => json(201, { sessionId: 's6' }), 'DELETE /sessions/s6': () => json(404, { detail: 'not yet' }) });
+  const r5 = rig(t, never);
+  const lost = await r5.feature.hire(never.api, hireBody({ prompt: '' }), 'Dev');
+  r5.cloud.update(lost.id, (i) => {
+    i.createdAt = 1_000_000;
+  });
+  assert.match((await r5.feature.sendHome(lost.id, true)).error ?? '', /not yet/);
+  assert.deepEqual(r5.forgotten, [], 'still listed: it may yet turn up');
+  const h = factory({ 'POST /sessions': () => json(201, { sessionId: 's8' }), 'DELETE /sessions/s8': () => json(500, { detail: 'boom' }) });
+  const r3 = rig(t, h);
+  const w3 = await r3.feature.hire(h.api, hireBody({ prompt: '' }), 'Dev');
+  assert.match((await r3.feature.sendHome(w3.id, true)).error ?? '', /session/);
+});
+
+test('messages: a cloud worker takes prompts, opens and closes its window, and skips every terminal and worktree path', async (t) => {
+  const f = factory({
+    'POST /sessions': () => json(201, { sessionId: 's1' }),
+    'POST /sessions/s1/messages': () => json(200, { status: 'running' }),
+    'POST /sessions/s1/interrupt': () => json(200, { status: 'idle' }),
+    'DELETE /sessions/s1': () => new Response(null, { status: 204 }),
+  });
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'office-cloud-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const cloud = new CloudWorkers(dir, { deskTaken: () => false, names: () => [], pool: { names: ['Ada'], colors: ['#fff'] } }, { update: () => {}, remove: () => {} });
+  const floor: CloudFloor = { id: 'f1', name: 'proj', cloud, unstage: (ids) => cloud.drops.unstage(ids) };
+  const toasts: string[] = [];
+  let feature: CloudFeature | undefined;
+  const registry = {
+    register: (make: (host: FeatureHost) => CloudFeature) => {
+      feature = make({ changed: () => {}, pollSoon: () => {}, api: () => f.api, toast: () => {} });
+      return feature;
+    },
+    feature: (key: string) => (key === 'sessions' ? { forget: (id: string) => forgotten.push(id) } : { state: () => computersState() }),
+  } as unknown as FactoryRegistry;
+  const forgotten: string[] = [];
+  const mounted = mountCloud(registry, { floors: () => [floor], agentArgs: [], toast: (_, text) => toasts.push(text) });
+  assert.equal(mounted.feature, feature);
+  const w = await mounted.feature.hire(f.api, hireBody({ prompt: '' }), 'Dev');
+  const warned: string[] = [];
+  const issues: number[] = [];
+  const ctx = { who: 'Dev', client: 'c1', warn: (x: string) => warned.push(x), takeIssue: (n: number) => issues.push(n) };
+  const send = (msg: Record<string, unknown>) => mounted.message({ workerId: w.id, ...msg } as Extract<ClientMsg, { workerId: string }>, ctx);
+
+  assert.equal(mounted.message({ t: 'worker.attach', workerId: 'local-1' }, ctx), false, 'a local worker is not the cloud’s');
+  assert.equal(send({ t: 'worker.attach' }), true);
+  assert.equal(cloud.get(w.id)!.open, true);
+  send({ t: 'worker.detach' });
+  assert.equal(cloud.get(w.id)!.open, false);
+  send({ t: 'term.input', data: 'rm -rf /\r' });
+  send({ t: 'term.resize', cols: 10, rows: 10 });
+  send({ t: 'changes.unwatch' });
+  assert.deepEqual(warned, []);
+
+  for (const t of ['worker.pr', 'worker.worktree', 'worker.rebuild', 'changes.watch', 'changes.commit']) send({ t });
+  assert.equal(warned.length, 5);
+  assert.match(warned[0], /open the pull request itself/);
+  assert.match(warned[1], /only works for a worker on this machine/);
+  assert.equal(cloudRefusal({ ...w, cloud: undefined }, 'worker.pr').includes('a Factory computer'), true);
+
+  send({ t: 'worker.prompt', prompt: 'look at issue 7', issue: 7 });
+  await tick();
+  assert.equal(f.calls.filter((c) => c.path === '/sessions/s1/messages').length, 1);
+  assert.deepEqual(issues, [7]);
+  assert.equal(cloud.get(w.id)!.status, 'working');
+  warned.length = 0;
+  send({ t: 'worker.prompt', prompt: '   ' });
+  await tick();
+  assert.deepEqual(warned, ['Type something to send']);
+  send({ t: 'worker.resume' });
+  assert.match(warned[1], /Checking/);
+
+  // The routes: a message, and Interrupt.
+  const route = (p: string) => mounted.feature.routes.find((x) => x.path === p)!;
+  const req = (params: Record<string, string>, body: unknown) => ({ method: 'POST', path: '', params, query: new URLSearchParams(), json: async () => body, api: f.api, by: 'Dev' }) as never;
+  assert.deepEqual(await route('/:id/interrupt').handle(req({ id: w.id }, {})), { ok: true });
+  assert.deepEqual(await route('/:id/message').handle(req({ id: w.id }, { text: 'again' })), { ok: true });
+  await assert.rejects(Promise.resolve(route('/:id/message').handle(req({ id: 'nobody' }, { text: 'x' }))), /gone home/);
+  await assert.rejects(Promise.resolve(route('/:id/interrupt').handle(req({ id: 'nobody' }, {}))), /No such cloud worker/);
+  const hired = (await route('/hire').handle(req({}, hireBody({ prompt: '', deskId: DESK[5].id })))) as { worker: WorkerInfo };
+  assert.equal(hired.worker.kind, 'cloud');
+
+  send({ t: 'worker.kill', deleteSession: false });
+  await tick();
+  assert.equal(cloud.get(w.id), undefined);
+  assert.ok(toasts.some((x) => x === `Dev sent ${w.name} home`));
+  assert.deepEqual(forgotten, []);
+
+  // Sent home with its session deleted: the Sessions feature stops showing that session.
+  mounted.message({ t: 'worker.kill', workerId: hired.worker.id, deleteSession: true } as Extract<ClientMsg, { workerId: string }>, ctx);
+  await tick();
+  assert.deepEqual(forgotten, [hired.worker.sessionId]);
+});
+
+test('a hire dialog’s pick becomes the cloud of a worker.spawn', () => {
+  const mac = 'd284b509-0803-4971-bca3-7a56532fb548';
+  assert.deepEqual(cloudHire({ computerId: mac, cwd: '  ~/factory-flow ' }), { computerId: mac, cwd: '~/factory-flow' });
+  // An empty folder is the computer's home folder, which the office picks when none is sent.
+  assert.deepEqual(cloudHire({ computerId: mac, cwd: ' ' }), { computerId: mac });
+  // On an Environment the office starts the computer: the pick has no computer id of its own.
+  assert.deepEqual(cloudHire({ computerId: '', environmentId: 'env-1', cwd: '' }), { environmentId: 'env-1' });
+});

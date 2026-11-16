@@ -1,0 +1,12 @@
+# Gradle and Kotlin caches, build output, and the SDK path Android Studio writes for this machine.
+.gradle/
+.kotlin/
+build/
+# CMake and Ninja output from the native build (app/.cxx).
+.cxx/
+local.properties
+*.iml
+.idea/
+captures/
+*.jks
+*.keystore

@@ -1,0 +1,177 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { buildingRoster } from '../src/client/dashboard-building.js';
+import { buildTriageFloors, filterSwitcherFloors, floorChord, nextUrgentTarget, rankTriageFloors, unackedDoneBuildingCount } from '../src/client/dashboard-triage.js';
+import { ORCHESTRATOR_ID } from '../src/shared/mission-control.js';
+import type { FloorInfo, FloorRoster, GhPull, WorkerInfo } from '../src/shared/protocol.js';
+
+function makeFloor(index: number, overrides: Partial<FloorInfo> = {}): FloorInfo {
+  const id = overrides.id ?? `f-${index + 1}`;
+  const name = overrides.name ?? `repo-${index + 1}`;
+  return {
+    id,
+    name,
+    repo: `example/${name}`,
+    dir: `/tmp/${name}`,
+    branch: 'main',
+    palette: index,
+    addedBy: 'Owner',
+    addedAt: index + 1,
+    workers: 0,
+    busy: 0,
+    waiting: 0,
+    ...overrides,
+  };
+}
+
+function makeWorker(id: string, status: WorkerInfo['status'], overrides: Partial<WorkerInfo> = {}): WorkerInfo {
+  return {
+    id,
+    kind: 'agent',
+    name: id,
+    color: '#ee6018',
+    deskId: `desk-${id}`,
+    status,
+    acked: false,
+    createdBy: 'Owner',
+    createdAt: 1,
+    cols: 120,
+    rows: 36,
+    open: false,
+    ...overrides,
+  };
+}
+
+function makePull(number: number, state: GhPull['state'] = 'OPEN'): GhPull {
+  return {
+    number,
+    title: `PR ${number}`,
+    url: `https://github.com/example/repo/pull/${number}`,
+    state,
+    isDraft: state === 'DRAFT',
+    headRefName: `feat-${number}`,
+    baseRefName: 'main',
+    author: 'dev',
+    updatedAt: '2026-04-20T00:00:00Z',
+  };
+}
+
+test('floor chords map floors 1–9 and 10 (0) and omit 11+', () => {
+  assert.equal(floorChord(0), '⇧ ⌘ 1');
+  assert.equal(floorChord(8), '⇧ ⌘ 9');
+  assert.equal(floorChord(9), '⇧ ⌘ 0');
+  assert.equal(floorChord(10), undefined);
+  assert.equal(floorChord(-1), undefined);
+});
+
+test('10-floor triage ranks floors by relevance for the floor strip', () => {
+  const floors = [
+    makeFloor(0, { id: 'factory-flow', name: 'factory-flow', workers: 3, busy: 3, waiting: 1 }),
+    makeFloor(1, { id: 'droid-proxy', name: 'droid-proxy', workers: 2, busy: 2, waiting: 1 }),
+    makeFloor(2, { id: 'factory-cli', name: 'factory-cli', branch: 'release/2.4', workers: 3, busy: 3, waiting: 0 }),
+    makeFloor(3, { id: 'orca', name: 'orca', workers: 2, busy: 0, waiting: 1 }),
+    makeFloor(4, { id: 'screenplay', name: 'screenplay', workers: 2, busy: 2, waiting: 0 }),
+    makeFloor(5, { id: 'hyperframes', name: 'hyperframes', branch: 'feat/timeline', workers: 2, busy: 2, waiting: 1 }),
+    makeFloor(6, { id: 'browse-mcp', name: 'browse-mcp', workers: 1, busy: 0, waiting: 0 }),
+    makeFloor(7, { id: 'muse-agent', name: 'muse-agent', workers: 2, busy: 1, waiting: 1 }),
+    makeFloor(8, { id: 'gemdex', name: 'gemdex', workers: 1, busy: 0, waiting: 0 }),
+    makeFloor(9, { id: 'home', name: 'Home', repo: undefined, branch: undefined, home: true, plain: true }),
+  ];
+
+  const building = new Map<string, FloorRoster>([
+    ['droid-proxy', { floor: 'droid-proxy', workers: [makeWorker('sprocket', 'needs_input'), makeWorker('widget', 'working')], pulls: [makePull(12)] }],
+    ['factory-cli', { floor: 'factory-cli', workers: [makeWorker('bolt', 'working'), makeWorker('rivet', 'starting'), makeWorker('sub', 'done', { lead: 'bolt' })], pulls: [] }],
+    ['orca', { floor: 'orca', workers: [makeWorker('claw', 'done', { acked: false }), makeWorker('fuse', 'idle')], pulls: [] }],
+    ['screenplay', { floor: 'screenplay', workers: [makeWorker('frame', 'working'), makeWorker('lens', 'working')], pulls: [] }],
+    ['hyperframes', { floor: 'hyperframes', workers: [makeWorker('keyframe', 'needs_input'), makeWorker('spline', 'working')], pulls: [] }],
+    ['browse-mcp', { floor: 'browse-mcp', workers: [makeWorker('tab', 'idle'), makeWorker('acked-done', 'done', { acked: true })], pulls: [] }],
+    ['muse-agent', { floor: 'muse-agent', workers: [makeWorker('echo', 'done', { acked: false }), makeWorker('pulse', 'working')], pulls: [] }],
+    ['gemdex', { floor: 'gemdex', workers: [makeWorker('index', 'offline')], pulls: [] }],
+    ['home', { floor: 'home', workers: [], pulls: [] }],
+  ]);
+
+  const currentWorkers = [makeWorker('pixel', 'needs_input'), makeWorker('byte', 'working'), makeWorker('nibble', 'working'), makeWorker(ORCHESTRATOR_ID, 'needs_input'), makeWorker('ext-bot', 'needs_input', { remote: true })];
+  const pulls = [makePull(431, 'OPEN'), makePull(432, 'DRAFT'), makePull(400, 'MERGED')];
+
+  const items = buildTriageFloors({
+    floors,
+    building,
+    currentFloor: 'factory-flow',
+    workers: currentWorkers,
+    pulls,
+  });
+
+  assert.equal(items[0]?.openPrs, 2);
+  assert.equal(items[0]?.needsInput, 1, 'ignores orchestrator and remote bots in floor-local counts');
+  assert.equal(items[0]?.busy, 2);
+  assert.equal(items[2]?.unackedDone, 0, 'subagent done does not trigger owner attention');
+  assert.equal(items[6]?.unackedDone, 0, 'acked done does not trigger owner attention');
+  assert.equal(items[8]?.idleState, 'asleep');
+  assert.equal(items[9]?.idleState, 'empty');
+  assert.equal(items[9]?.metaLabel, 'plain folder');
+
+  const ranked = rankTriageFloors(items, 1_000_000);
+  // Floors waiting on the owner first; equal scores (droid-proxy and hyperframes, factory-cli's two busy
+  // and muse-agent's one done plus one busy) keep building order; idle and asleep floors, then empty ones, last.
+  assert.deepEqual(ranked, ['factory-flow', 'droid-proxy', 'hyperframes', 'factory-cli', 'muse-agent', 'screenplay', 'orca', 'browse-mcp', 'gemdex', 'home']);
+
+  // History orders floors without workers: a fresh visit, then a recent worker, then lifetime hires.
+  const now = 100 * 3_600_000;
+  const quietItems = buildTriageFloors({
+    floors: [makeFloor(0, { id: 'never' }), makeFloor(1, { id: 'hired', hires: 30 }), makeFloor(2, { id: 'worked', lastWorkerAt: now - 3_600_000 }), makeFloor(3, { id: 'visited', lastVisitedAt: now - 60_000 })],
+    building: new Map(),
+    currentFloor: null,
+    workers: [],
+  });
+  assert.deepEqual(rankTriageFloors(quietItems, now), ['visited', 'worked', 'hired', 'never']);
+
+  // A floor whose roster has not arrived yet still counts its workers from the floor summary.
+  const unloaded = buildTriageFloors({ floors: [makeFloor(0, { id: 'a', workers: 0 }), makeFloor(1, { id: 'b', workers: 2 })], building: new Map(), currentFloor: 'a', workers: [] });
+  assert.deepEqual(rankTriageFloors(unloaded, 0), ['b', 'a']);
+
+  // Switcher search: empty query lists the floors without a tab; non-empty query searches all 10 floors.
+  const hidden = items.filter((i) => ['gemdex', 'home'].includes(i.floor.id));
+  assert.deepEqual(
+    filterSwitcherFloors(items, hidden, '').map((i) => i.floor.id),
+    ['gemdex', 'home'],
+  );
+  assert.deepEqual(
+    filterSwitcherFloors(items, hidden, 'release/2.4').map((i) => i.floor.id),
+    ['factory-cli'],
+  );
+  assert.deepEqual(
+    filterSwitcherFloors(items, hidden, '06 feat').map((i) => i.floor.id),
+    ['hyperframes'],
+    'searches floors with tabs too when query is non-empty',
+  );
+  assert.deepEqual(
+    filterSwitcherFloors(items, [], '').map((i) => i.floor.id),
+    items.map((i) => i.floor.id),
+    'falls back to all floors when every floor has a tab so ⌘ K always opens a populated list',
+  );
+});
+
+test('building pulse helpers count unacked done and cycle urgent needs_input targets across floors', () => {
+  const floors = [makeFloor(0, { id: 'f1', name: 'one', waiting: 1 }), makeFloor(1, { id: 'f2', name: 'two', waiting: 1 })];
+  const building = new Map<string, FloorRoster>([
+    ['f1', { floor: 'f1', workers: [makeWorker('w1', 'needs_input', { waitingSince: 10 }), makeWorker('w-done', 'done', { acked: false })], pulls: [] }],
+    ['f2', { floor: 'f2', workers: [makeWorker('w2', 'needs_input', { waitingSince: 20 }), makeWorker('w-acked', 'done', { acked: true })], pulls: [] }],
+  ]);
+  const rows = buildingRoster({ floors, building, currentFloor: 'f1', workers: building.get('f1')!.workers });
+  assert.equal(unackedDoneBuildingCount(rows), 1);
+
+  const items = buildTriageFloors({ floors, building, currentFloor: 'f1', workers: building.get('f1')!.workers });
+  // When not yet focused on w1, picks w1 on the current floor first.
+  const first = nextUrgentTarget(rows, items, 'f1', undefined);
+  assert.equal(first?.kind, 'worker');
+  if (first?.kind === 'worker') assert.equal(first.row.worker.id, 'w1');
+
+  // Once focused on w1 on f1, clicking NEEDS YOU cycles to w2 on f2.
+  const second = nextUrgentTarget(rows, items, 'f1', 'w1');
+  assert.equal(second?.kind, 'worker');
+  if (second?.kind === 'worker') assert.equal(second.row.worker.id, 'w2');
+
+  // Fallback when building rosters have not arrived yet.
+  const fallbackItems = buildTriageFloors({ floors, building: new Map(), currentFloor: 'f1', workers: [] });
+  assert.deepEqual(nextUrgentTarget([], fallbackItems, 'f1'), { kind: 'floor', floorId: 'f2' });
+});

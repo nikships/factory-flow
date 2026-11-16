@@ -1,0 +1,1202 @@
+// Wire protocol between browser and server. Every WebSocket frame is one JSON object.
+
+import type { Forge } from './floors.js';
+import type { FactoryFeatureId, FactoryState } from './factory.js';
+import type { CloudHire, CloudWorker } from './factory-cloud.js';
+import type { JiraBoardState, JiraFloorState } from './jira.js';
+import type { LinearBoardState, LinearFloorState, LinearPickup } from './linear.js';
+import type { PipelineDetail, PipelinesState } from './pipelines.js';
+import type { PromptId } from './prompts.js';
+import type { WorktreeSetupState } from './worktree-setup.js';
+import type { OpEnvelope, WhiteboardUpdate } from './whiteboard.js';
+import type { PingHow } from './whiteboard-ping.js';
+import type { Menu } from './asks.js';
+import type { MissionControlState, OrchestratorSettings } from './mission-control.js';
+import type { Visit } from './visits.js';
+import type { SetupState } from './setup.js';
+import type { SubscriptionProviderKey, SubscriptionsState } from './subscriptions.js';
+import type { ThreadPresentation } from './thread-presentation.js';
+import type { ThreadLive } from './thread-live.js';
+import type { ThreadEntry } from './worker-thread.js';
+import type { WorkerLabelSettings, WorkerLabelState } from './worker-labels.js';
+import type { GeminiConnectionState } from './gemini-vibes.js';
+
+export type WorkerStatus =
+  | 'starting' // PTY launched, agent booting
+  | 'idle' // waiting for a first prompt
+  | 'working' // agent is busy
+  | 'needs_input' // permission prompt / question open
+  | 'done' // finished its turn
+  | 'exited' // process ended (can be resumed if it had a session)
+  | 'offline'; // restored from disk after a server restart; resumable
+
+export type WorkerKind = 'agent' | 'shell' | 'cloud';
+
+/**
+ * What a working agent's latest tool call looks like from across the room (see shared/actions.ts):
+ * reading files, editing them, running tests or a build, on the web, or tests failing again and again.
+ */
+export type WorkerAction = 'read' | 'edit' | 'test' | 'web' | 'failing';
+
+/** Reasoning effort levels, from fastest/cheapest to most thorough. Droid takes them as `reasoningEffort`. */
+export type AgentEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+export const AGENT_EFFORTS: readonly AgentEffort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
+export function isAgentEffort(value: unknown): value is AgentEffort {
+  return value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh' || value === 'max';
+}
+
+/** Which Droid model and reasoning effort a worker runs on. */
+export interface AgentChoice {
+  /** A Droid model id; unset for Droid's own default. */
+  model?: string;
+  effort?: AgentEffort;
+}
+
+/**
+ * The prompts the office writes for workers by itself (shared/prompts.ts) and the worker a new one
+ * starts on when nobody picks, as set in Settings: the same on every floor.
+ */
+export interface PromptsState {
+  /** Prompts someone rewrote, by id; the rest are the defaults. */
+  custom: Partial<Record<PromptId, { text: string; by: string; at: number }>>;
+  /**
+   * What a worker starts on when whoever starts it picks no model (a hire with no model selected).
+   * Unset: Droid's own default model.
+   */
+  agent?: AgentChoice & { by: string; at: number };
+}
+
+/** What a worker is on, for the card above its head: "Fix Login Redirect" + what it's doing now. */
+export interface WorkerTask {
+  name: string;
+  summary: string;
+  /** Written from visible conversation text, rather than a lead's initial task preview. */
+  generated?: boolean;
+  /** Digest of the bounded visible text, so an Office restart does not re-label unchanged text. */
+  textHash?: string;
+  /** Epoch ms when the generated label was last written. */
+  updatedAt?: number;
+}
+
+export interface WorkerInfo {
+  id: string;
+  /** 'agent' runs Droid; 'shell' is a plain shared login shell; 'cloud' runs its Droid session on a Factory computer (see `cloud`). */
+  kind: WorkerKind;
+  /** External agent with its own desk and MCP inbox, not a local Droid or PTY. */
+  remote?: boolean;
+  /** Droid model requested for this worker, instead of Droid's own default. */
+  model?: string;
+  /** Reasoning effort requested for this worker, when one was chosen. */
+  effort?: AgentEffort;
+  /** The model its session is running now, as the agent reports it (Droid), even when none was requested. Wins over `model` for display. */
+  activeModel?: string;
+  /** The reasoning effort its session is running now, alongside `activeModel`. */
+  activeEffort?: AgentEffort;
+  deskId: string;
+  name: string;
+  color: string;
+  status: WorkerStatus;
+  /** True once someone opened the terminal after the last done / needs_input. */
+  acked: boolean;
+  /** When it last went to done or needs_input (ms), so N goes to whoever has waited longest first. */
+  waitingSince?: number;
+  createdBy: string;
+  createdAt: number;
+  prompt?: string;
+  /**
+   * Set when the worker runs in its own git worktree (path relative to the office dir). `from` is
+   * the branch the office was on when the worktree was cut, which its pull request targets.
+   * `branch` is the branch the worktree is on: the office's own flow/<name>-<id> until the worker
+   * switches to one of its own (`git checkout -b fix-x`), which `made` then remembers.
+   */
+  worktree?: { path: string; branch: string; base: string; from?: string; made?: string };
+  /**
+   * Set while the folder it works in (its worktree, or its workspace across repositories) is gone:
+   * deleted outside the office, so it can't start there until it's rebuilt ('worker.rebuild') or sent
+   * home. `branch` says where its branch still is: in the project, only on origin, or nowhere.
+   */
+  lost?: { branch: LostBranch };
+  /**
+   * Other floors' repositories this worker works in too, each as its own worktree inside the same
+   * workspace folder as `worktree` (see server/workers.ts). Only a worker hired into its own worktree.
+   */
+  repos?: WorkerRepo[];
+  /** The pull request opened from this desk for the worktree branch (see 'worker.pr'). */
+  pr?: { number: number; url: string };
+  /** True while the branch is being pushed and its pull request opened. */
+  prOpening?: boolean;
+  title?: string;
+  sessionId?: string;
+  /** The conversation this worker forked. Independent of subagent teams and kept after the source leaves. */
+  forkedFrom?: { workerId: string; name: string; sessionId: string };
+  exitCode?: number;
+  cols: number;
+  rows: number;
+  /** True while any owner connection has its terminal open. */
+  open: boolean;
+  /** Latest line of meaningful activity (e.g. last prompt or tool). */
+  activity?: string;
+  /**
+   * What it is waiting on the owner for, from its hooks: the whole AskUser questionnaire, or the tool
+   * call a permission prompt is about. Set while it needs input; the answer still goes into its terminal.
+   */
+  ask?: WorkerAsk;
+  /** What its latest tool call is, for the worker to act out while it works. */
+  action?: WorkerAction;
+  /**
+   * Its todo list, from its latest TodoWrite (shared/todos.ts): items done, of how many, and the one
+   * in progress. Cleared with its conversation, and once every item is done and its turn ends.
+   */
+  todos?: TodoProgress;
+  /** Stable subject and current work, generated from visible conversation text (server/worker-labels.ts). */
+  task?: WorkerTask;
+  /** A /clear boundary for the read-only sign writer, including across Office restarts. */
+  taskSince?: number;
+  /** When its terminal last took input (keystrokes or a prompt). */
+  lastInputAt?: number;
+  /**
+   * The worker that hired this one as its subagent with the Office MCP's `team_hire` (see server/team.ts),
+   * while that worker is still on the floor. Subagents report back to it and can't hire their own.
+   */
+  lead?: string;
+  /**
+   * Which team it wears the markings of, and as what (see shared/team.ts). Display only: it outlives
+   * its lead, so a subagent whose lead left still shows whose team it was, but it never says who a
+   * worker reports to or may hire. That is `lead` alone.
+   */
+  team?: TeamBadge;
+  /**
+   * How long it has spent working (ms), over the stretches that have ended, and when the one it's in
+   * now started (while it's working).
+   */
+  workedMs?: number;
+  workingSince?: number;
+  /**
+   * Set for a cloud worker (kind 'cloud'): its Droid session (`sessionId`) runs on one of the
+   * account's Factory computers, driven through Factory's Sessions API (see server/factory/cloud.ts).
+   * It has no terminal, worktree or hooks on this machine.
+   */
+  cloud?: CloudWorker;
+}
+
+/** A worker's todo list as its card shows it (see WorkerInfo.todos). */
+export interface TodoProgress {
+  done: number;
+  total: number;
+  /** The item in progress, when one is. */
+  current?: string;
+}
+
+/** One question of an AskUser questionnaire. */
+export interface AskedQuestion {
+  question: string;
+  topic?: string;
+  options: string[];
+  multiSelect: boolean;
+}
+
+/** A worker's pending ask (see WorkerInfo.ask). `sub` is set when a Task subagent in its terminal asks. */
+export type WorkerAsk = { kind: 'question'; questions: AskedQuestion[]; sub?: true } | { kind: 'permission'; tool: string; command?: string; file?: string; risk?: string; summary?: string; sub?: true };
+
+/** The glyph a team wears beside its accent color, so two teams never differ by color alone. */
+export type TeamEmblem = 'chevron' | 'star' | 'diamond' | 'bolt' | 'ring' | 'cross' | 'hex' | 'triangle';
+
+/** A worker's team markings (see WorkerInfo.team): the crown or comms kit, its shoulder panels and its links. */
+export interface TeamBadge {
+  /** The team: the id of the worker that formed it, kept after that worker leaves. */
+  id: string;
+  /** `lead` wears the crown; `member` the comms kit. */
+  role: 'lead' | 'member';
+  accent: string;
+  emblem: TeamEmblem;
+  /** The lead's name when the team formed, for "Ada's team · Lead has left". */
+  leadName: string;
+}
+
+/** Where the branch of a worker whose worktree was deleted still is (see WorkerInfo.lost). */
+export type LostBranch = 'here' | 'origin' | 'gone';
+
+/**
+ * One other floor's repository a worker works in (see WorkerInfo.repos): a worktree of that floor's
+ * checkout, on the same branch as the worker's own, living in the worker's workspace folder.
+ */
+export interface WorkerRepo {
+  /** The other floor. */
+  floor: string;
+  /** Its folder in the workspace. */
+  name: string;
+  /** owner/name on GitHub, or host/group/…/project on GitLab, when known. */
+  repo?: string;
+  /** That floor's checkout, on the office's machine. */
+  dir: string;
+  /** The worktree, relative to the worker's own floor (the workspace lives there). */
+  path: string;
+  branch: string;
+  /** The commit it was branched from. */
+  base: string;
+  /** The branch its pull request targets: the one that floor's checkout was on. */
+  from?: string;
+  /** Its pull request, once one is open. */
+  pr?: { number: number; url: string };
+}
+
+/** What becomes of a worker's git worktree when it is sent home. */
+export type WorktreeCleanup = 'keep' | 'worktree' | 'all';
+
+/** What a worker's worktree holds, so whoever sends it home knows what deleting it would lose. */
+export interface WorktreeState {
+  /** The worktree folder is still there. */
+  exists: boolean;
+  /** Files with uncommitted changes, new ones included. */
+  dirty: number;
+  /** Commits on its branch since it was made. */
+  ahead: number;
+  /** Commits only its branch (or its worktree's detached HEAD) has: on no remote, and not in the office's own checkout. */
+  unpushed: number;
+  /** Set when git couldn't tell, e.g. the branch is gone. */
+  error?: string;
+  /**
+   * A worker across repositories: each worktree, its own floor's first. The totals above are the sum,
+   * and `error` joins each one's. Absent for a worker in one checkout.
+   */
+  repos?: { name: string; state: WorktreeState }[];
+}
+
+/** The issue on a card carried around the floor. */
+export interface CarriedIssue {
+  issue: number;
+  title: string;
+}
+
+/** A styled run of text on a terminal row: [text, fg, bg, flags]. */
+export type Run = [string, number, number, number];
+/** Color encoding: -1 default, 0..255 palette, >= 0x1000000 means 0x1000000 | rgb. */
+export const RGB_FLAG = 0x1000000;
+export const FLAG_BOLD = 1;
+export const FLAG_INVERSE = 2;
+export const FLAG_DIM = 4;
+
+/** An inline Kitty terminal image carried to terminal previews when visible. */
+export interface ScreenImage {
+  format: 24 | 32 | 100;
+  compression?: 'z';
+  width: number;
+  height: number;
+  cols?: number;
+  rows?: number;
+  data: string;
+}
+
+/** A rectangular Kitty image placement on a terminal preview (`y >= 0` on screen, `y < 0` in `above` rows). */
+export interface ScreenPlacement {
+  id: number;
+  x: number;
+  y: number;
+  cols: number;
+  rows: number;
+  srcCol: number;
+  srcRow: number;
+  totalCols: number;
+  totalRows: number;
+}
+
+/**
+ * How many scrollback rows a `screen` frame carries above the screen. Screen previews paint a terminal at
+ * its cells' natural shape, so one wider than the preview would leave black bands above and
+ * below it; the rows above fill them. A third of a row per column covers the preview, and the
+ * extra rows are never more than the screen itself has.
+ */
+export function screenHistoryRows(cols: number, rows: number): number {
+  return Math.max(0, Math.min(rows, Math.ceil(cols / 3) - rows));
+}
+
+/** A GitHub or GitLab label; `color` is a CSS color ("#d73a4a"). */
+export interface GhLabel {
+  name: string;
+  color: string;
+  /** What it's for, in the repo's list of labels (the label picker's /api/gh/labels). */
+  description?: string;
+}
+
+export interface GhIssue {
+  number: number;
+  title: string;
+  state: string;
+  url: string;
+  author: string;
+  labels: GhLabel[];
+  assignees: string[];
+  createdAt: string;
+  updatedAt: string;
+  body: string;
+  comments: number;
+}
+
+export interface GhPull {
+  number: number;
+  title: string;
+  state: string;
+  isDraft: boolean;
+  url: string;
+  author: string;
+  labels: GhLabel[];
+  reviewDecision: string;
+  headRefName: string;
+  /** The commit its branch is at on the forge (for a merged PR, the last one merged). */
+  headRefOid?: string;
+  baseRefName: string;
+  createdAt: string;
+  updatedAt: string;
+  additions: number;
+  deletions: number;
+  checks: 'pass' | 'fail' | 'pending' | 'none';
+  body: string;
+  /** Issues it closes ("closes #12" in its description), as GitHub links them. */
+  closes: number[];
+}
+
+/**
+ * The office's machine (see server/machine.ts): how busy it is, for a warning
+ * before hiring, and the most workers the office runs at once, across every floor.
+ */
+export interface MachineState {
+  /** Percent of every core busy, 0-100, over the last few seconds. */
+  cpu: number;
+  cores: number;
+  /** Memory in use and in all, bytes. */
+  memUsed: number;
+  memTotal: number;
+  /** The last few minutes, oldest first: [cpu %, memory %] a few seconds apart. */
+  history: [number, number][];
+  /** What makes another worker a strain right now, e.g. "memory is 93% used"; missing when nothing does. */
+  pressure?: string;
+  /** Workers in the office now: every floor's, including shells. */
+  workers: number;
+  /** The most workers the office takes; missing when there's no limit. */
+  limit?: number;
+  /** --max-workers: the limit can't be set any higher from the office. */
+  ceiling?: number;
+  /** The limit someone set in ⚙️ Settings, when there is one. */
+  set?: { limit: number; by: string; at: number };
+}
+
+export interface GhState<T> {
+  items: T[];
+  error?: string;
+  fetchedAt: number;
+  loading: boolean;
+}
+
+export type GhMergeMethod = 'squash' | 'merge' | 'rebase';
+
+/** Why an issue was closed, as GitHub records it. */
+export type GhCloseReason = 'completed' | 'not planned';
+
+/** How the repository lets pull requests be merged. */
+export interface GhRepoInfo {
+  nameWithOwner: string;
+  methods: GhMergeMethod[];
+}
+
+/** A comment on an issue or on a PR's conversation, or a submitted review. */
+export interface GhComment {
+  id: string;
+  author: string;
+  body: string;
+  createdAt: string;
+  url?: string;
+  /** Reviews only: APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED. */
+  state?: string;
+}
+
+/** A comment on a line of a PR's diff. */
+export interface GhReviewComment {
+  id: number;
+  /** The first comment of the thread this one answers. */
+  replyTo?: number;
+  author: string;
+  body: string;
+  createdAt: string;
+  url: string;
+  path: string;
+  /** The line it's on now, or null when the code under it changed since (outdated). */
+  line: number | null;
+  /** LEFT is the old file's line numbers, RIGHT the new file's. */
+  side: 'LEFT' | 'RIGHT';
+}
+
+export interface GhCheck {
+  name: string;
+  state: 'pass' | 'fail' | 'pending' | 'skip';
+  url?: string;
+}
+
+/** Everything the PR window shows beyond the board card: GET /api/gh/pull?number=N */
+export interface GhPullDetail {
+  number: number;
+  body: string;
+  state: string;
+  isDraft: boolean;
+  reviewDecision: string;
+  headRefName: string;
+  baseRefName: string;
+  /** MERGEABLE, CONFLICTING or UNKNOWN (GitHub still working it out). */
+  mergeable: string;
+  /** CLEAN, BLOCKED, BEHIND, DIRTY, UNSTABLE, DRAFT, HAS_HOOKS or UNKNOWN. */
+  mergeStateStatus: string;
+  /** Why it's BLOCKED, when the review decision and checks don't say (GitLab's merge checks). */
+  blocked?: string;
+  commits: number;
+  comments: GhComment[];
+  reviews: GhComment[];
+  reviewComments: GhReviewComment[];
+  checks: GhCheck[];
+  repo: GhRepoInfo;
+  /** Who gh is signed in as on the server, and so who comments from the office appear from ('' if unknown). */
+  viewer: string;
+}
+
+/** GET /api/gh/issue?number=N */
+export interface GhIssueDetail {
+  number: number;
+  /** OPEN or CLOSED. */
+  state: string;
+  body: string;
+  comments: GhComment[];
+  /** See GhPullDetail.viewer. */
+  viewer: string;
+}
+
+/**
+ * The `deskId` of a `worker.spawn` that leaves the seat to the office: the first free desk on the
+ * sender's floor in DESKS order, else the first free bean bag (nextFreeSeat in layout). With none
+ * free, the sender gets a warn toast. Factory Flow for Android hires this way.
+ */
+export const AUTO_DESK = 'auto';
+
+/** GitHub turns away comments longer than this. */
+export const GH_COMMENT_MAX = 65536;
+/** As long as any label name can be: GitHub stops at 50 characters, GitLab at 255. */
+export const GH_LABEL_MAX = 255;
+
+export interface ProjectInfo {
+  name: string;
+  dir: string;
+  branch?: string;
+  remote?: string;
+  /** Where its repository is hosted, and so which CLI its boards and workers use. */
+  forge: Forge;
+  agentCmd: string;
+}
+
+/**
+ * One floor of the building: a project in its own checkout, with its own desks, workers and
+ * boards. You switch between them in the floor switcher.
+ */
+export interface FloorInfo {
+  id: string;
+  /** The repository's name, or the folder's when it isn't on GitHub or GitLab. */
+  name: string;
+  /** owner/name on GitHub, or host/group/…/project on GitLab (see normalizeRepo). */
+  repo?: string;
+  /** Its checkout on the office's machine. */
+  dir: string;
+  /** The branch that checkout is on ('HEAD' when detached): what a worktree cut from it targets. */
+  branch?: string;
+  /** The floor's worker base, defaulting to the repository's default branch. */
+  baseBranch?: string;
+  /** Set only when the owner picked an override. */
+  selectedBranch?: string;
+  /** Which of FLOOR_PALETTES it's painted in. */
+  palette: number;
+  /** The project the office was started in (`factory-flow <dir>`): the office keeps its own data in its checkout. */
+  local?: boolean;
+  /** The home folder's floor: always in the building, so it can't be taken off. */
+  home?: boolean;
+  /** A plain folder, not a git checkout of its own: no worktrees, branches, boards, pipelines or CI. */
+  plain?: boolean;
+  addedBy: string;
+  addedAt: number;
+  /**
+   * For the Add floor window: what's under way there. `workers` counts the ones hired onto
+   * desks and bean bags.
+   */
+  workers: number;
+  busy: number;
+  /** Workers waiting on someone: a question, a permission, or a finished turn nobody looked at. */
+  waiting: number;
+  /** For ranking the companions' floor tabs (src/shared/floor-relevance.ts): when the owner last went there. */
+  lastVisitedAt?: number;
+  /** When the floor last had a worker. */
+  lastWorkerAt?: number;
+  /** Workers ever hired there, counted from when the office first saw the floor. */
+  hires?: number;
+}
+
+/** The workspace folder on the office's machine: where the Add floor window's "add a project" looks for existing checkouts. Nothing is ever cloned. */
+export interface ProjectsDirState {
+  /** For showing people: under the home folder it's ~/…. */
+  dir: string;
+  /** Set from ⚙️ Settings or --projects, rather than the office's default (a code folder in the home folder, else the home folder). */
+  custom: boolean;
+  by?: string;
+  at?: number;
+}
+
+/** A git checkout found in the workspace folder, for the Add floor window's "add a project". */
+export interface RepoChoice {
+  /** owner/name (GitHub) or host/group/…/project (GitLab) from its origin remote, else its folder's name. */
+  name: string;
+  /** Where it is on the office's machine (absolute). */
+  dir: string;
+  /** The GitHub or GitLab repository its origin points at, when it has one. */
+  repo?: string;
+  forge?: Forge;
+  /** ISO time it was last touched (committed to, checked out…). */
+  activeAt?: string;
+}
+
+/** A folder on the office's machine, as the Add floor window's folder browser lists it. */
+export interface FolderChoice {
+  name: string;
+  /** Absolute. */
+  dir: string;
+  /** It has a `.git` of its own: a checkout. */
+  git: boolean;
+}
+
+/** Everything that belongs to the floor you're on: sent when you walk in, and when you change floors. */
+export interface FloorView {
+  /** The floor you're on; null while the building has none. */
+  floor: string | null;
+  project: ProjectInfo | null;
+  workers: WorkerInfo[];
+  issues: GhState<GhIssue>;
+  pulls: GhState<GhPull>;
+  /** The repository's GitHub Actions runs, or the GitLab project's pipelines. */
+  pipelines: PipelinesState;
+  /** The office's Jira connection and this floor's epic. */
+  jira: JiraFloorState;
+  /** The Jira tab of the issue board; null on a floor without an epic. */
+  jiraBoard: JiraBoardState | null;
+  /** The office's Linear workspace, this floor's team and its autopilot. */
+  linear: LinearFloorState;
+  /** The Linear tab of the issue board; null on a floor without a Linear team. */
+  linearBoard: LinearBoardState | null;
+}
+
+/** Every desk and cloud worker on one floor, with its pull requests, for building-wide views. */
+export interface FloorRoster {
+  floor: string;
+  workers: WorkerInfo[];
+  pulls: GhPull[];
+}
+
+export type ChangeStatus = 'M' | 'A' | 'D' | 'R' | 'T' | '?';
+
+/** One file a worker changed, against the base of its branch. */
+export interface ChangedFile {
+  path: string;
+  /** The old path, when the file was renamed. */
+  from?: string;
+  /** M modified, A added, D deleted, R renamed, T type changed, ? untracked (new, never committed). */
+  status: ChangeStatus;
+  additions: number;
+  deletions: number;
+  binary: boolean;
+  /** Not committed yet: staged, unstaged or untracked. */
+  uncommitted: boolean;
+  /** Fingerprint of the working copy (size and mtime); a new value means the diff changed. */
+  sig: string;
+}
+
+/** Changed files the Changes window can show as a picture (GET /api/changes/file), by extension. */
+const CHANGED_IMAGE_TYPES: Record<string, string> = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  gif: 'image/gif',
+  webp: 'image/webp',
+  avif: 'image/avif',
+  bmp: 'image/bmp',
+  ico: 'image/x-icon',
+  svg: 'image/svg+xml',
+};
+
+/** The content type of a changed picture, or undefined when the file isn't one. */
+export function changedImageType(filePath: string): string | undefined {
+  const name = filePath.slice(filePath.lastIndexOf('/') + 1);
+  const dot = name.lastIndexOf('.');
+  if (dot <= 0) return undefined;
+  const ext = name.slice(dot + 1).toLowerCase();
+  return Object.hasOwn(CHANGED_IMAGE_TYPES, ext) ? CHANGED_IMAGE_TYPES[ext] : undefined;
+}
+
+/** What a worker changed in its checkout, against the branch the office was opened on. */
+export interface ChangesState {
+  workerId: string;
+  /** Another floor's repository of a worker across repositories (see WorkerInfo.repos); none for its own. */
+  repo?: string;
+  /** The checkout, relative to the office dir ('' is the project folder itself, shared by everyone). */
+  dir: string;
+  /** Current branch of that checkout ('HEAD' when detached). */
+  branch?: string;
+  /** What the diff is against: the base branch, an upstream, or 'HEAD' (uncommitted changes only). */
+  base: string;
+  /** Commits on the branch since the base. */
+  ahead: number;
+  /** Subject of the newest commit, when ahead > 0. */
+  subject?: string;
+  files: ChangedFile[];
+  /** Files left out because there were more than the office lists. */
+  more: number;
+  /** The branch a pull request would target, when this checkout is on a branch of its own. */
+  prBase?: string;
+  /** An open pull request for the branch. */
+  pr?: { number: number; url: string };
+  /** A commit, discard or pull request in progress. */
+  busy?: string;
+  error?: string;
+  at: number;
+}
+
+export interface VersionInfo {
+  sha: string;
+  subject: string;
+  /** ISO commit date */
+  date: string;
+}
+
+/** Self-upgrade of an office installed from git by deploy/aws.sh (see server/upgrade.ts). */
+export interface UpgradeState {
+  /** False when the office can't upgrade itself (not installed by deploy/aws.sh). */
+  available: boolean;
+  current?: VersionInfo;
+  /** Newest commit upstream, when it differs from current. */
+  latest?: VersionInfo;
+  /** New commits since current, newest first (at most 15). */
+  changes?: { sha: string; subject: string }[];
+  /** How many new commits there are in all ("50" means 50 or more). */
+  behind?: number;
+  checking?: boolean;
+  checkedAt?: number;
+  phase: 'idle' | 'building' | 'restarting' | 'failed';
+  /** Who started the upgrade. */
+  by?: string;
+  error?: string;
+}
+
+/**
+ * Whether a worker whose pull request merged goes home by itself (⚙️ Settings), for every floor:
+ * once it's at rest and nobody has its terminal open, it leaves and its worktree and branch are deleted.
+ */
+export interface LeaveOnMergeState {
+  on: boolean;
+  /** Who set it, and when. Unset for the default (off). */
+  by?: string;
+  at?: number;
+}
+
+/**
+ * Whether a fresh worker starts from the latest of the default branch (⚙️ Settings), for every floor:
+ * a worktree cut from origin's main whatever the checkout is on, and a worker without one in the
+ * checkout brought to the latest main when nobody else's work is in the way. Subagents start where
+ * their lead says either way. On by default.
+ */
+export interface FreshMainState {
+  on: boolean;
+  /** Who set it, and when. Unset for the default (on). */
+  by?: string;
+  at?: number;
+}
+
+/** What ⚙️ Settings → Subagents & visits sets: Office MCP access and how workers hire subagents (see server/team.ts). */
+export interface SubagentSettings {
+  /** Expose the authenticated Office MCP to local Droid workers. */
+  officeMcp: boolean;
+  /** Workers may hire subagents at all. Off: `team_hire` is refused; a team already working carries on. */
+  on: boolean;
+  /** What a subagent runs when its lead doesn't pick. Unset: the office's default worker. */
+  agent?: AgentChoice;
+  /**
+   * The models a lead may give a subagent with --model, each with the owner's note on what it's
+   * good for. Unset: any model droid lists. Limits floor leads, the Orchestrator and external bots
+   * alike (team_hire and office_worker_spawn, including the resolved default when model is omitted),
+   * while leaving the owner's own hires and existing workers' saved models untouched.
+   */
+  models?: SubagentModel[];
+  /** Each subagent gets its own git worktree unless its lead asks for none. */
+  worktree: boolean;
+  /** The most subagents one lead has on the floor at once. */
+  maxPerLead: number;
+  /** A lead at rest is prompted to read what its subagents said once they report or finish. */
+  wakeLead: boolean;
+  /**
+   * Independent workers (no lead) on a floor may visit each other's desks with the Office MCP's visit tools: read
+   * a terminal, tell, ask and hand off work (see server/visits.ts and shared/visits.ts). Off: the
+   * visit tools are hidden and refused.
+   */
+  visits: boolean;
+  /** Droid's built-in Task tool is refused with a pointer to `team_hire`, so workers delegate through the office. */
+  denyTask: boolean;
+}
+
+/** A model a lead may give its subagents, and what the office's owner says it's for. */
+export interface SubagentModel {
+  id: string;
+  /** Shown to the lead next to the model, so it routes work by it ("cheap, fine for tests"). */
+  note?: string;
+}
+
+export const SUBAGENT_DEFAULTS: SubagentSettings = { officeMcp: true, on: true, worktree: true, maxPerLead: 4, wakeLead: true, visits: true, denyTask: true };
+export const SUBAGENT_MAX_PER_LEAD = 8;
+export const SUBAGENT_MODELS_MAX = 100;
+export const SUBAGENT_MODEL_NOTE_MAX = 200;
+
+/** The Subagents settings for every floor, with who set them. */
+export interface SubagentsState extends SubagentSettings {
+  by?: string;
+  at?: number;
+}
+
+/** Whether the office can render Whiteboard cards to images, and why not when it can't. */
+export interface WhiteboardRendererStatus {
+  available: boolean;
+  reason?: string;
+  /** The browser is being downloaded (its first use), with how far along it is. */
+  installing?: { percent?: number; message: string };
+}
+
+/** A card's latest render, as the window knows it: the image's revision and time, or its last error. */
+export interface WhiteboardRenderInfo {
+  /** The board revision the latest good image shows, and when it finished (ms); absent before the first one. */
+  rev?: number;
+  at?: number;
+  /** The image matches the card as it is now. */
+  current: boolean;
+  /** The last render failed, keeping the last good image. */
+  error?: string;
+}
+
+/** A line of a worker's terminal that matched a search. */
+export interface TerminalHit {
+  workerId: string;
+  /** The line, cut down around the match. */
+  text: string;
+  /** Where it is: its row in the worker's terminal, and how many rows that terminal had. */
+  row: number;
+  rows: number;
+}
+
+/** What GET /api/search answers: matching terminal lines, newest first. */
+export interface SearchResults {
+  q: string;
+  terminals: TerminalHit[];
+  /** More lines matched than these. */
+  more: boolean;
+}
+
+export type ClientMsg = ClientMessage & {
+  /** Optional business-action receipt. Never replay non-idempotent actions after an uncertain result. */
+  requestId?: string;
+  /** Refuse a delayed action if its intended floor is no longer valid (this connection's floor, or the worker's floor for cross-floor worker actions). */
+  requestFloor?: string;
+};
+
+type ClientMessage =
+  | { t: 'profile'; name: string; color: string }
+  /**
+   * With `issue`, the worker is there for that GitHub issue: it's assigned on GitHub (so it moves to In progress).
+   * `deskId` is a seat's id, or AUTO_DESK (`"auto"`) for the first free desk on the sender's floor (then the first free bean bag).
+   */
+  | { t: 'worker.spawn'; deskId: string; prompt?: string; worktree?: boolean; kind?: WorkerKind; model?: string; effort?: AgentEffort; issue?: number; linear?: string; repos?: string[]; images?: string[]; cloud?: CloudHire }
+  | { t: 'worker.resume'; workerId: string }
+  /** Stops the turn a worker is in: Escape in a local agent's terminal, an interrupt of a cloud worker's Factory session. */
+  | { t: 'worker.interrupt'; workerId: string }
+  | { t: 'worker.fork'; workerId: string; prompt?: string }
+  /** `deleteSession`: a cloud worker's Factory session is deleted too, not just left on the Factory account. */
+  | { t: 'worker.kill'; workerId: string; cleanup?: WorktreeCleanup; deleteSession?: boolean }
+  /** Asks what the worker's worktree holds; answered with a `worker.worktree` message. */
+  | { t: 'worker.worktree'; workerId: string }
+  /** Puts a lost worker's worktree back and starts it again (see WorkerInfo.lost); `all`: every lost worker on the floor. */
+  | { t: 'worker.rebuild'; workerId: string; all?: boolean }
+  | { t: 'worker.attach'; workerId: string }
+  | { t: 'worker.detach'; workerId: string }
+  /**
+   * With `issue`, the prompt hands the worker that GitHub issue, which is taken as for worker.spawn.
+   * With `queue`, an agent's prompt is submitted with Ctrl+Enter instead of Enter, so Droid queues it
+   * behind what it is doing rather than sending it now (a shell gets Enter either way).
+   */
+  | { t: 'worker.prompt'; workerId: string; prompt: string; issue?: number; linear?: string; images?: string[]; queue?: boolean; urgent?: boolean }
+  /** Rechecks the current worker and screen on the server before answering the menu shown to the owner.
+   * Send exactly one of `choice` or `text`. The server rejects neither and both. */
+  | { t: 'worker.answer'; workerId: string; menu: Menu; choice?: number; choices?: number[]; text?: string }
+  /** Push a worktree worker's branch and open a pull request for it, drafted from its task. */
+  | { t: 'worker.pr'; workerId: string }
+  | { t: 'term.input'; workerId: string; data: string }
+  | { t: 'thread.read'; workerId: string; request: string; before?: number; child?: string }
+  | { t: 'thread.watch'; workerId: string; on: boolean; child?: string }
+  /** Drives Droid's pending-message review: a 1-based index, optionally checked by group and text. */
+  | { t: 'worker.queue'; workerId: string; action: 'promote' | 'delete' | 'clear'; index?: number; group?: 'steering' | 'queued'; text?: string }
+  /**
+   * Rewinds before a user ThreadEntry; restore defaults to conversation only. `choose` restores only
+   * `files` (paths as the Thread knows them) from Droid's "Choose files to restore..." list.
+   */
+  | { t: 'worker.rewind'; workerId: string; entryId: string; restore?: 'files' | 'conversation' | 'choose'; files?: string[] }
+  /** Changes the session's reasoning effort (an effort id) or model (a model id, with an optional effort) through Droid's Tab key and /model picker. */
+  | { t: 'worker.setting'; workerId: string; setting: 'effort' | 'model'; value: string; effort?: string }
+  /** Closes Droid's side chat (/btw) when the terminal shows it. */
+  | { t: 'worker.side'; workerId: string; close: true }
+  | { t: 'term.resize'; workerId: string; cols: number; rows: number }
+  | { t: 'gh.refresh' }
+  /** Merge a pull request; the answer comes back as gh.merged. */
+  | { t: 'gh.merge'; number: number; method: GhMergeMethod; deleteBranch: boolean; auto?: boolean }
+  /** Comment on an issue or a PR's conversation, as the server's gh account; answered with gh.commented. */
+  | { t: 'gh.comment'; kind: 'issue' | 'pull'; number: number; body: string }
+  /** Close an issue, or a pull request without merging it; the answer comes back as gh.closed. */
+  | { t: 'gh.close'; kind: 'issue' | 'pull'; number: number; comment?: string; reason?: GhCloseReason; deleteBranch?: boolean }
+  /** Put labels on an issue or PR and take others off, as the server's gh or glab account; answered with gh.labeled. */
+  | { t: 'gh.labels'; kind: 'issue' | 'pull'; number: number; add: string[]; remove: string[] }
+  /** Look at the floor's GitHub Actions runs or GitLab pipelines again now. */
+  | { t: 'pipelines.refresh' }
+  /** A run's jobs (and their steps, on GitHub); answered with `pipelines.detail`. */
+  | { t: 'pipelines.detail'; id: number }
+  /** Run a finished run again: only its failed jobs, or all of it. Answered with `pipelines.done`. */
+  | { t: 'pipelines.rerun'; id: number; failed: boolean }
+  /** Cancel a run that's waiting or running; answered with `pipelines.done`. */
+  | { t: 'pipelines.cancel'; id: number }
+  /**
+   * Start a workflow by hand on `ref` (GitHub's workflow_dispatch, with its `inputs`), or a new GitLab
+   * pipeline (`workflow` "pipeline", the inputs as its variables). Answered with `pipelines.done`.
+   */
+  | { t: 'pipelines.run'; workflow: string; ref: string; inputs?: Record<string, string> }
+  /** The most workers the office runs at once, across every floor; null takes the limit off. */
+  | { t: 'machine.limit'; limit: number | null }
+  /** Connect the office to Jira Cloud with one account's email and API token (read-only is enough); answered with `jira.setup`. */
+  | { t: 'jira.connect'; site: string; email: string; token: string }
+  /** Forget the office's Jira connection. */
+  | { t: 'jira.disconnect' }
+  /** Show a Jira epic on the floor you're on ('' removes it); answered with `jira.setup`. */
+  | { t: 'jira.epic'; key: string }
+  /** Read the floor's Jira tab again now. */
+  | { t: 'jira.refresh' }
+  /** Connect the office to Linear with a personal API key; answered with `linear.setup`. */
+  | { t: 'linear.connect'; key: string }
+  /** Forget the office's Linear connection. */
+  | { t: 'linear.disconnect' }
+  /** Point the floor you're on at a Linear team (by id or key; '' takes Linear off it) and optionally one of its projects; answered with `linear.setup`. */
+  | { t: 'linear.team'; team: string; project?: string }
+  /** Change the floor's Linear autopilot; answered with `linear.setup`. */
+  | { t: 'linear.autopilot'; on?: boolean; pickup?: LinearPickup[]; max?: number; existing?: boolean; model?: string }
+  /** Read the floor's Linear tab (and the workspace's teams) again now. */
+  | { t: 'linear.refresh' }
+  /** Write a ticket in the floor's team (and project), in Todo unless `state` says Backlog; answered with `linear.setup`. */
+  | { t: 'linear.create'; title: string; description?: string; priority?: number; state?: 'backlog' | 'unstarted' }
+  /** Connect the office to Factory with an API key (replacing the one it has); answered with `factory.setup`. */
+  | { t: 'factory.connect'; key: string }
+  /** Forget the office's Factory key, and everything read with it. */
+  | { t: 'factory.disconnect' }
+  /** Read one Factory feature again now; without one, check the key again ("Check again") and read them all. */
+  | { t: 'factory.refresh'; feature?: FactoryFeatureId }
+  /** A board or window of `feature` opened (`on`) or closed in this tab: it polls fast while one is open. */
+  | { t: 'factory.watch'; feature: FactoryFeatureId; on: boolean }
+  /** Connect the office to Google Gemini Decisions (`gemini-decision-1`); answered with `gemini.setup`. */
+  | { t: 'gemini.connect'; key: string }
+  /** Forget the office's Gemini API key. */
+  | { t: 'gemini.disconnect' }
+  /** Probe the saved Gemini API key against `gemini-decision-1` now. */
+  | { t: 'gemini.check' }
+  /** Turn the Gemini inter-agent noise gate and smart lead wakeup filter on or off (persisted in `gemini.json`). */
+  | { t: 'gemini.wakeFilter'; on: boolean }
+  /** Look at Droid (installed, signed in, newest release) and DroidProxy again now (docs/subscriptions.md). */
+  | { t: 'setup.check' }
+  | { t: 'setup.airgapped'; on: boolean }
+  /** Install Droid, or update it to the newest release. */
+  | { t: 'setup.droid.install' }
+  /** Sign Droid in to Factory: the office runs Droid's own sign-in and shows its code in SetupState.droid.signIn. */
+  | { t: 'setup.droid.signIn' }
+  /** Stop a sign-in that's waiting. */
+  | { t: 'setup.droid.signInCancel' }
+  /** The owner finished the welcome (`done`), or asked to see it again (false). */
+  | { t: 'setup.onboarded'; done: boolean }
+  /** Install or update DroidProxy, start it, or open its own settings window. */
+  | { t: 'subscriptions.proxy'; action: 'install' | 'start' | 'open' }
+  /** Connect an account of a provider (a browser sign-in on the office's Mac, or a device code shown in its state). */
+  | { t: 'subscriptions.connect'; provider: SubscriptionProviderKey }
+  | { t: 'subscriptions.connectCancel'; provider: SubscriptionProviderKey }
+  /** Forget one account of a provider. */
+  | { t: 'subscriptions.disconnect'; provider: SubscriptionProviderKey; account: string }
+  /** Switch a provider's models on or off. */
+  | { t: 'subscriptions.provider'; provider: SubscriptionProviderKey; enabled: boolean }
+  /** Put DroidProxy's models into Droid's settings, replacing the ones it put there before. */
+  | { t: 'subscriptions.models' }
+  /** Ask DroidProxy again now. */
+  | { t: 'subscriptions.refresh' }
+  /**
+   * Follow what a worker changed (the office polls its checkout while anyone watches). `repo` is another
+   * floor's repository of a worker across repositories; none follows its own.
+   */
+  | { t: 'changes.watch'; workerId: string; repo?: string }
+  | { t: 'changes.unwatch'; workerId: string; repo?: string }
+  | { t: 'changes.diff'; workerId: string; path: string; repo?: string }
+  | { t: 'changes.commit'; workerId: string; message: string; repo?: string }
+  /** Without a path, throws away every uncommitted change in that checkout. */
+  | { t: 'changes.discard'; workerId: string; path?: string; repo?: string }
+  | { t: 'changes.pr'; workerId: string; title: string; body: string; repo?: string }
+  | { t: 'upgrade.check' }
+  | { t: 'upgrade.start' }
+  /** Go to another floor; the server answers with `floor.enter`. */
+  | { t: 'floor.go'; floor: string }
+  /** Move this floor before another in numbered order, or to the end with null. Broadcasts `floors`. */
+  | { t: 'floor.reorder'; floor: string; before: string | null }
+  /** List selectable local/origin branches on the current floor, answered with the same request id. */
+  | { t: 'floor.branches'; floor: string; request: string }
+  /** Safely switch this floor's base; null restores the repository default. Answered with `floor.branches`. */
+  | { t: 'floor.branch'; floor: string; request: string; branch: string | null }
+  /** The checkouts in the workspace folder that could become a floor; answered with `floor.repos`. */
+  | { t: 'floor.repos'; refresh?: boolean }
+  /** The folders in `dir` (the workspace folder when unset), for the Add floor window's folder browser; answered with `floor.folders`. */
+  | { t: 'floor.folders'; dir?: string; request?: string }
+  /** Make a folder a new floor, where it is: a checkout in the workspace folder, or a plain folder anywhere; answered with `floor.added`. */
+  | { t: 'floor.add'; dir: string }
+  /** Take a floor off the building. Its folder stays on disk; everyone on it rides to another floor. */
+  | { t: 'floor.remove'; floor: string }
+  /** Workers whose pull request merged go home by themselves (true), or wait to be sent home. */
+  | { t: 'leaveOnMerge.set'; on: boolean }
+  /** Fresh workers start from the latest of the default branch (true), or from the branch the checkout is on. */
+  | { t: 'freshMain.set'; on: boolean }
+  /** How workers hire subagents (⚙️ Settings → Subagents & visits), for every floor. */
+  | { t: 'subagents.set'; settings: SubagentSettings }
+  /** Hide one model from every device's picker, or show all with a null id and hidden=false. */
+  | { t: 'models.hide'; id: string | null; hidden: boolean }
+  | { t: 'workerLabels.set'; settings: WorkerLabelSettings }
+  | { t: 'workerLabels.test'; settings: WorkerLabelSettings }
+  /** Where the office looks for checkouts from now on; '' goes back to the default. */
+  | { t: 'floor.projectsDir'; dir: string }
+  /** Rewrite one of the office's prompts; null puts the default back. */
+  | { t: 'prompts.set'; id: PromptId; text: string | null }
+  /** Pick the worker a new one starts on when nobody picks; null goes back to the office's --agent. */
+  | { t: 'prompts.agent'; choice: AgentChoice | null }
+  /** How new worktrees on the floor you're on are set up (⚙️ Settings → Workers); answered with `worktreeSetup`. */
+  | { t: 'worktreeSetup.get' }
+  /** The floor's own worktree setup, in place of the repository's or the detected one; null goes back to those. */
+  | { t: 'worktreeSetup.set'; setup: { setup: string; copy: string[] } | null }
+  /**
+   * A batch for a floor's Whiteboard, numbered in this connection's epoch for that floor (from its
+   * `whiteboard` snapshot). Answered with an `ack` or a `rejected` update, after the commit.
+   */
+  | { t: 'whiteboard.apply'; floor: string; envelope: OpEnvelope }
+  /** Send this connection a fresh snapshot of a floor's Whiteboard, with its epoch for that floor. */
+  | { t: 'whiteboard.sync'; floor: string }
+  /** Type the Whiteboard line into a worker's terminal (see shared/whiteboard-ping.ts); answered with `whiteboard.pinged`. */
+  | { t: 'whiteboard.ping'; worker: string }
+  /** The answer to an `automation.run`: what the command resolved with, or why it rejected. */
+  /**
+   * The building's Orchestrator (shared/mission-control.ts), from any floor. A prompt starts or wakes its session;
+   * `queue` holds it for after the current turn instead of steering it. Answered with `action.result` when
+   * `requestId` is set. Its terminal, thread and menus use the usual worker messages with ORCHESTRATOR_ID.
+   */
+  | { t: 'orchestrator.prompt'; prompt: string; images?: string[]; queue?: boolean }
+  | { t: 'orchestrator.interrupt' }
+  /** End its conversation: the next prompt starts a fresh session. Its team stays its team. */
+  | { t: 'orchestrator.reset' }
+  | { t: 'orchestrator.set'; settings: OrchestratorSettings }
+  | { t: 'ping'; at: number };
+
+/**
+ * Where the server put this connection: which floor it is on (ROOF, or null out in the empty
+ * lobby) and where to stand on it. The client places the owner from this, never from a peer list.
+ */
+export interface Arrival {
+  floor: string | null;
+  /** Where to stand, when the requested or saved spot is valid on this floor. */
+  /** How the server chose it; the client uses it for fallbacks and notices. */
+  via: 'saved' | 'requested' | 'lobby';
+  /** The remembered floor no longer exists. */
+  removed?: boolean;
+}
+
+export type ServerMsg =
+  /** `presentation` is how the clients show `entries`: the rows for them, built over everything the office has read (src/shared/thread-presentation.ts). */
+  | { t: 'thread.snapshot'; workerId: string; request: string; before?: number; push?: boolean; sessionId?: string; child?: string; entries: ThreadEntry[]; hasMore: boolean; presentation?: ThreadPresentation; error?: string }
+  /** The watched local worker's turn as it happens; replaces its previous live state wholesale. */
+  | { t: 'thread.live'; workerId: string; sessionId?: string; live: ThreadLive }
+  /** The outcome of worker.rewind. text is the rewound prompt, ready for the composer. */
+  | { t: 'worker.rewound'; workerId: string; entryId: string; ok: boolean; sessionId?: string; text?: string; error?: string; note?: string }
+  | { t: 'action.result'; requestId: string; ok: boolean; error?: string; workerId?: string; note?: string }
+  | ({
+      t: 'welcome';
+      /** This connection's transport id; never shown, never a player. */
+      connection: string;
+      /** Where the owner arrives: the floor and how the server chose it. */
+      arrival: Arrival;
+      /** Every floor of the building, for the floor switcher. */
+      floors: FloorInfo[];
+      /** Where the office looks for checkouts to add as floors, on the office's machine. */
+      projectsDir: ProjectsDirState;
+      /** The running server's version; a change after a reconnect means the office was upgraded. */
+      version: string;
+      upgrade: UpgradeState;
+      machine: MachineState;
+      leaveOnMerge: LeaveOnMergeState;
+      freshMain: FreshMainState;
+      subagents: SubagentsState;
+      hiddenModels?: string[];
+      workerLabels?: WorkerLabelState;
+      /** Confirmed worker.answer supports a complete checkbox selection and optional custom text. */
+      workerAnswerMultiSelect?: boolean;
+      /** The office drives worker.rewind, worker.queue, worker.setting and worker.side in a worker's terminal. An older one leaves them unanswered. */
+      threadActions?: boolean;
+      /** The office's prompts, and the worker a new one starts on when nobody picks. */
+      prompts: PromptsState;
+      /** The office's Factory connection and every Factory feature's read state (see docs/factory.md). */
+      factory: FactoryState;
+      /** Google Gemini Decisions (`gemini-decision-1`) connection and wake-filter telemetry. */
+      gemini?: GeminiConnectionState;
+      /** Droid installed and signed in, and whether the owner has been through the welcome (docs/subscriptions.md). */
+      setup: SetupState;
+      /** DroidProxy, the subscriptions it serves, and which of their models can run now. */
+      subscriptions: SubscriptionsState;
+      /** The building's agents: the Orchestrator and external bots. Absent from an office that predates Mission Control. */
+      missionControl?: MissionControlState;
+      /** Every floor's workers and pull requests, so companions can show the whole building at once. */
+      building?: FloorRoster[];
+    } & FloorView)
+  /** You arrived on another floor: everything on it, replacing the last one's. */
+  | ({ t: 'floor.enter'; arrival: Arrival } & FloorView)
+  | { t: 'floors'; floors: FloorInfo[] }
+  /** A building agent changed: sent to every connection, whatever floor it is on. */
+  | { t: 'missionControl'; state: MissionControlState }
+  /** A worker on `floor` changed, sent to every connection so building-wide views stay live. */
+  | { t: 'building.worker'; floor: string; worker: WorkerInfo }
+  /** A worker left `floor`, sent to every connection. */
+  | { t: 'building.remove'; floor: string; workerId: string }
+  /** A floor's pull requests refreshed, sent to every connection so cross-floor PR badges stay current. */
+  | { t: 'building.pulls'; floor: string; pulls: GhPull[] }
+  /** Branch choices and switch result, sent only to whoever asked. */
+  | { t: 'floor.branches'; floor: string; request: string; branches: string[]; defaultBranch?: string; selectedBranch?: string; error?: string }
+  /** Sent to whoever asked. */
+  | { t: 'floor.repos'; repos: RepoChoice[]; error?: string }
+  /** Sent to whoever asked, with their `request`: `dir` (absolute) and `shown` (as ~/…), whether it's a checkout (and why it can't be added, if it can't), its parent, and the folders in it. */
+  | { t: 'floor.folders'; request?: string; dir: string; shown: string; git: boolean; blocked?: string; parent?: string; folders: FolderChoice[]; more?: boolean; error?: string }
+  /** Sent to whoever asked for the floor (or couldn't get it). `dir` is the checkout they asked for. */
+  | { t: 'floor.added'; dir: string; floor?: string; error?: string }
+  /** The projects folder moved (see floor.projectsDir). */
+  | { t: 'projectsDir'; state: ProjectsDirState }
+  | { t: 'worker.update'; worker: WorkerInfo }
+  | { t: 'worker.remove'; workerId: string }
+  | { t: 'worker.open'; workerId: string }
+  | { t: 'worker.worktree'; workerId: string; state: WorktreeState }
+  /** `above`: the scrollback rows just above the screen, oldest first, when they changed (see screenHistoryRows). */
+  | {
+      t: 'screen';
+      workerId: string;
+      cols: number;
+      rows: number;
+      lines: Record<number, Run[]>;
+      full: boolean;
+      cursor: [number, number];
+      above?: Run[][];
+      placements?: ScreenPlacement[];
+      images?: Record<number, ScreenImage>;
+    }
+  /** `shared`: someone already had this terminal open, so the new window takes its size instead of changing it. */
+  | { t: 'term.snapshot'; workerId: string; data: string; cols: number; rows: number; shared?: boolean }
+  | { t: 'term.data'; workerId: string; data: string }
+  | { t: 'gh.issues'; state: GhState<GhIssue> }
+  | { t: 'gh.pulls'; state: GhState<GhPull> }
+  /** Sent to whoever asked for the merge. */
+  | { t: 'gh.merged'; number: number; error?: string }
+  /** Sent to whoever commented: the comment as GitHub saved it, or why it wasn't. */
+  | { t: 'gh.commented'; kind: 'issue' | 'pull'; number: number; comment?: GhComment; error?: string }
+  /** Sent to whoever asked to close it. */
+  | { t: 'gh.closed'; kind: 'issue' | 'pull'; number: number; error?: string }
+  /** Sent to whoever changed them: the labels it has now, or why they didn't change. */
+  | { t: 'gh.labeled'; kind: 'issue' | 'pull'; number: number; labels?: GhLabel[]; error?: string }
+  /**
+   * A line for the toast stack. `workerId` names the worker it is about, when one is: a client
+   * already showing that in its world can leave the text out.
+   */
+  | { t: 'toast'; text: string; level: 'info' | 'warn' | 'error'; workerId?: string }
+  | { t: 'upgrade'; state: UpgradeState }
+  /** The floor's GitHub Actions runs or GitLab pipelines changed: all of them, to everyone on it. */
+  | { t: 'pipelines'; state: PipelinesState }
+  /** To whoever asked: a run's jobs, or why they couldn't be read. */
+  | { t: 'pipelines.detail'; id: number; detail?: PipelineDetail; error?: string }
+  /** To whoever asked to start, re-run or cancel a run: done, or why not. */
+  | { t: 'pipelines.done'; action: 'run' | 'rerun' | 'cancel'; id?: number; error?: string }
+  /** The office's Jira connection or this floor's epic changed. */
+  | { t: 'jira'; state: JiraFloorState }
+  | { t: 'jira.board'; state: JiraBoardState | null }
+  /** To whoever is setting Jira up: done, or why not. */
+  | { t: 'jira.setup'; step: 'connect' | 'epic'; ok?: boolean; error?: string }
+  /** The office's Linear connection, this floor's team or its autopilot changed. */
+  | { t: 'linear'; state: LinearFloorState }
+  | { t: 'linear.board'; state: LinearBoardState | null }
+  /** To whoever is setting Linear up or writing a ticket: done (with the ticket `linear.create` made), or why not. */
+  | { t: 'linear.setup'; step: 'connect' | 'team' | 'autopilot' | 'create'; ok?: boolean; error?: string; identifier?: string }
+  /** The Factory connection or a Factory feature's slice changed: all of it, to everyone. */
+  | { t: 'factory'; state: FactoryState }
+  /** To whoever sent `factory.connect`: connected, or why not. */
+  | { t: 'factory.setup'; ok: boolean; error?: string }
+  /** Google Gemini Decisions connection, toggle or telemetry changed. */
+  | { t: 'gemini'; state: GeminiConnectionState }
+  /** To whoever sent `gemini.connect` or `gemini.check`: verified, or why not. */
+  | { t: 'gemini.setup'; ok: boolean; error?: string; latencyMs?: number }
+  /** Droid's install or sign-in changed, or the welcome was finished: all of it, to everyone. */
+  | { t: 'setup'; state: SetupState }
+  /** DroidProxy, an account or a model's quota changed: all of it, to everyone. */
+  | { t: 'subscriptions'; state: SubscriptionsState }
+  | { t: 'machine'; state: MachineState }
+  | { t: 'leaveOnMerge'; state: LeaveOnMergeState }
+  | { t: 'freshMain'; state: FreshMainState }
+  | { t: 'subagents'; state: SubagentsState }
+  | { t: 'models.hidden'; ids: string[] }
+  | { t: 'workerLabels'; state: WorkerLabelState }
+  /**
+   * Every visit on the floor (see shared/visits.ts), to everyone on it: after `welcome` and
+   * `floor.enter`, and whenever a visit starts, changes phase or ends.
+   */
+  | { t: 'visits'; visits: Visit[] }
+  /**
+   * A speech bubble over `worker` during `visit`: the visitor's message over the visitor, the host's
+   * reply over the host. The full text; the client trims it.
+   */
+  /**
+   * A floor's Whiteboard (see shared/whiteboard.ts and server/whiteboard.ts). A `snapshot` comes after
+   * `welcome` and `floor.enter` and for `whiteboard.sync`; a `patch` goes to everyone on the floor for
+   * every committed batch; `ack` and `rejected` go to the connection that sent the batch. `origin` on
+   * a patch names the batch it came from, so its sender can drop it from what it still has pending.
+   * `caps` are card capabilities (the whole map on a snapshot, new cards' on a patch) for the card URLs
+   * `/whiteboard/c/<cap>/<path>`. `renderer` comes with a snapshot.
+   */
+  | {
+      t: 'whiteboard';
+      floor: string;
+      update: WhiteboardUpdate;
+      origin?: { epoch: string; seq: number };
+      caps?: Record<string, string>;
+      renderer?: WhiteboardRendererStatus;
+    }
+  /**
+   * To everyone on the floor: a card has a new latest image (or a failed render), so the window, the
+   * grid fetch `/api/whiteboard/render` again. A snapshot is followed by one of these per
+   * card that has a render.
+   */
+  | { t: 'whiteboard.rendered'; floor: string; card: string; info: WhiteboardRenderInfo }
+  /** To everyone: the renderer became available or unavailable, or its browser download moved on. */
+  | { t: 'whiteboard.renderer'; status: WhiteboardRendererStatus }
+  /** To whoever pinged: the line went in (`how`), or why it didn't. */
+  | { t: 'whiteboard.pinged'; worker: string; ok: boolean; how?: PingHow; error?: string }
+  | { t: 'prompts'; state: PromptsState }
+  /** To whoever asked, and to everyone on the floor when it's changed. */
+  | { t: 'worktreeSetup'; state: WorktreeSetupState }
+  /** Sent to whoever watches that worker's changes, whenever they change. */
+  | { t: 'changes'; state: ChangesState }
+  | { t: 'changes.diff'; workerId: string; repo?: string; path: string; diff: string; truncated: boolean; error?: string }
+  /**
+   * Run a `window.office` command in this tab (POST /api/automation) and answer with
+   * `automation.result` under the same id.
+   */
+  /** `now` is the office's clock as it answered. */
+  | { t: 'pong'; at: number; now: number };

@@ -1,0 +1,86 @@
+// Phones paired with the office (Factory Flow for Android), as the office's own page sees them in
+// ⚙️ Settings → Phone & web. A phone pairs by scanning the pairing link's QR code and keeps a device token;
+// the office keeps only that token's hash (see server/devices.ts).
+
+/** A paired phone, without its token. Times are ISO strings. */
+export interface PairedDevice {
+  id: string;
+  /** What the phone called itself when it paired, like "Pixel 10 Pro XL". */
+  name: string;
+  pairedAt: string;
+  lastSeenAt: string;
+  /** What paired: a phone (the default, including every device paired before this field) or a desktop web browser (the dashboard). Browsers are not phones: they get no phone terminal sizing. */
+  kind?: 'phone' | 'browser';
+}
+
+/** How a pairing address reaches this machine: the local network, or a tailnet from anywhere. */
+export type PairingAddressKind = 'wifi' | 'tailscale';
+
+export interface PairingAddress {
+  /** A base URL like `http://192.168.1.20:4700`. */
+  url: string;
+  kind: PairingAddressKind;
+  /** For a Tailscale address: whether it's the MagicDNS name or the 100.x address. */
+  dns?: boolean;
+}
+
+/** What `GET /api/mobile/pairing` answers the Phone and Web companion windows with. */
+export interface PairingState {
+  office: { name: string; version: string };
+  /** Whether the web companion (`/dashboard`) is on. Off, desktop browsers can't pair or connect; phones are unaffected. */
+  companion: boolean;
+  /** The office on this machine itself, `http://localhost:<port>` (`https` with TLS). */
+  local: string;
+  /** Whether anything off this machine can reach the office: false when it listens on loopback only (`--host 127.0.0.1`). */
+  reachable: boolean;
+  /** Whether Tailscale is running and signed in on this machine. */
+  tailscale: boolean;
+  /** The QR code's text (`factoryflow://pair?…`), or none when nothing off this machine can reach the office. */
+  link?: string;
+  /** The addresses the link carries, in its order: Wi-Fi first, then Tailscale. */
+  addresses: PairingAddress[];
+  /** Why there's no link (a loopback-only bind, or no network). */
+  reason?: string;
+  devices: PairedDevice[];
+}
+
+/** The longest name a phone can pair under. */
+export const DEVICE_NAME_MAX = 64;
+/** The most phones one office keeps paired at once. */
+export const DEVICES_MAX = 32;
+/** Where the web companion lives, on any of the office's addresses. */
+export const COMPANION_PATH = '/dashboard';
+/** What a browser hears while the owner has the web companion turned off. */
+export const COMPANION_OFF = 'The web companion is turned off. Turn it on in ⚙️ Settings → Phone & web → Web companion on the office’s own machine.';
+
+/** How a browser reached the office, by the page's host name: this machine, a tailnet, or the local network. */
+export type OriginKind = 'local' | 'tailscale' | 'lan';
+
+export function originKind(hostname: string): OriginKind {
+  const host = hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  if (host === 'localhost' || host.endsWith('.localhost') || host === '::1' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)) return 'local';
+  if (host.endsWith('.ts.net') || host.startsWith('fd7a:115c:a1e0:')) return 'tailscale';
+  const m = /^100\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/.exec(host);
+  return m && Number(m[1]) >= 64 && Number(m[1]) <= 127 ? 'tailscale' : 'lan';
+}
+
+/** The web companion at one of the office's base URLs. This start's LAN token, when given, opens it the first time. */
+export function companionLink(base: string, token?: string): string {
+  const root = `${base.replace(/\/+$/, '')}${COMPANION_PATH}`;
+  return token ? `${root}?t=${encodeURIComponent(token)}` : root;
+}
+
+/** The pairing link's scheme and version (see pairingLink). */
+const PAIRING_SCHEME = 'factoryflow://pair';
+const PAIRING_VERSION = 1;
+
+/**
+ * The pairing QR code's text: `factoryflow://pair?v=1&name=…&t=<LAN token>&u=<base url>&u=…`, every
+ * value URL-encoded and the base URLs in the order the phone should try them.
+ */
+export function pairingLink(name: string, token: string, urls: readonly string[]): string {
+  // encodeURIComponent leaves !'()* alone; a Mac's name often has parentheses ("MacBook Pro (2)").
+  const enc = (v: string) => encodeURIComponent(v).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+  const q = [`v=${PAIRING_VERSION}`, `name=${enc(name)}`, `t=${enc(token)}`, ...urls.map((u) => `u=${enc(u)}`)];
+  return `${PAIRING_SCHEME}?${q.join('&')}`;
+}

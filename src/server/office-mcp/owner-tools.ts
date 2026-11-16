@@ -1,0 +1,175 @@
+import { randomUUID } from 'node:crypto';
+import { z } from 'zod';
+import { ORCHESTRATOR_ID } from '../../shared/mission-control.js';
+import type { ClientMsg } from '../../shared/protocol.js';
+import { AUTO_DESK } from '../../shared/protocol.js';
+import { formatImageLines, type StoredImageMeta } from '../office-images.js';
+import { mcpDeepLinkBase } from './deep-links.js';
+import type { OfficeMcpDeps, OfficeMcpServer } from './index.js';
+import { officeError } from './index.js';
+import { buildingOnly, findMissionAgent, findWorker, missionControlRefusal, outsideOffice, pickFloor, ownerResult, type OwnerAction, type OwnerOffice } from './owner.js';
+import { cloud, effort, floorRef, id, images, menu, model, PROMPT_TEXT_ERROR, resolvePromptText, resolveWorkerTarget, text, WORKER_TARGET_ERROR, workerTarget } from './owner-schemas.js';
+import { withImageOrigin } from './team-events.js';
+
+type WireInput<A extends OwnerAction> = Omit<Extract<ClientMsg, { t: A }>, 't' | 'request' | 'requestId' | 'requestFloor' | 'floor'>;
+type Input<A extends OwnerAction> = (A extends 'worker.prompt'
+  ? Omit<WireInput<A>, 'workerId' | 'prompt'> & { worker?: string; workerId?: string; name?: string; prompt?: string; text?: string }
+  : 'workerId' extends keyof WireInput<A>
+    ? Omit<WireInput<A>, 'workerId'> & { worker?: string; workerId?: string; name?: string }
+    : WireInput<A>) & { floor?: string };
+type Scope = 'floor' | 'worker';
+type Effect = 'read' | 'write' | 'delete';
+
+/**
+ * Every entry is a separate MCP tool, not a model-facing action dispatcher. Its schema is checked
+ * against the wire message at compile time; the bridge still applies the owner's runtime checks.
+ */
+function tool<A extends OwnerAction>(action: A, name: string, description: string, inputSchema: z.ZodObject & z.ZodType<Input<NoInfer<A>>>, scope: Scope, effect: Effect = 'write', external = false) {
+  return {
+    action,
+    name,
+    description,
+    inputSchema,
+    scope,
+    annotations: { readOnlyHint: effect === 'read', destructiveHint: effect === 'delete', idempotentHint: effect === 'read', openWorldHint: external },
+  };
+}
+
+const floor = { floor: floorRef.optional() };
+const worker = { ...workerTarget, ...floor };
+const hasWorker = (a: { worker?: string; workerId?: string; name?: string }) => resolveWorkerTarget(a) !== undefined;
+const number = z.number().int().positive();
+export const OWNER_TOOLS = [
+  tool(
+    'worker.spawn',
+    'office_worker_spawn',
+    'Spawn a standalone owner-managed worker, shell, or cloud worker ONLY when explicitly requested (may incur cloud charges). To delegate as a lead, ALWAYS use team_hire.',
+    z
+      .strictObject({
+        floor: floorRef,
+        deskId: id.max(32).default(AUTO_DESK).describe(`Seat id, or ${AUTO_DESK}.`),
+        prompt: text.optional(),
+        worktree: z.boolean().optional().describe('Isolated Git worktree.'),
+        kind: z.enum(['agent', 'shell', 'cloud']).default('agent'),
+        model: model.optional(),
+        effort: effort.optional(),
+        issue: number.optional().describe('Forge issue number.'),
+        repos: z.array(id).optional().describe('Extra floor ids for multi-repo.'),
+        images: images.optional(),
+        cloud: cloud.optional().describe('Required for cloud.'),
+      })
+      .refine((a) => (a.kind === 'cloud') === (a.cloud !== undefined), 'Supply cloud exactly when kind is cloud.'),
+    'floor',
+    'write',
+    true,
+  ),
+  tool(
+    'worker.prompt',
+    'office_worker_prompt',
+    'Prompt or steer an independent floor worker (check office_look first; for subagents use team_message; never prompt a worker at a permission prompt). Accepts worker (or workerId/name) and prompt (or text). Default queue: false steers during a running turn; queue: true waits for turn end; urgent: true interrupts via Escape and delivers immediately.',
+    z
+      .strictObject({
+        ...worker,
+        prompt: text.min(1).optional().describe('Prompt message (or pass text).'),
+        text: text.min(1).optional().describe('Alias for prompt.'),
+        issue: number.optional(),
+        images: images.optional(),
+        queue: z.boolean().default(false).describe('Default false: steer during the running turn; true queues via Ctrl+Enter for after the turn ends.'),
+        urgent: z.boolean().optional().describe('True: interrupt a running turn or blocking command via Escape and deliver immediately (not with queue: true).'),
+      })
+      .refine(hasWorker, WORKER_TARGET_ERROR)
+      .refine((a) => resolvePromptText(a) !== undefined, PROMPT_TEXT_ERROR)
+      .refine((a) => !(a.queue && a.urgent), 'Choose either queue: true (after turn) or urgent: true (interrupt and steer now), not both.'),
+    'worker',
+    'write',
+    true,
+  ),
+  tool(
+    'worker.answer',
+    'office_worker_answer',
+    'Answer an independent floor worker’s AskUser menu using its exact screen snapshot (for subagents use question_answer; never for permission prompts).',
+    z
+      .strictObject({
+        ...worker,
+        menu,
+        choice: number.optional().describe('Single option number.'),
+        choices: z.array(number).optional().describe('Checkbox option numbers.'),
+        text: text.optional().describe('Typed answer.'),
+      })
+      .refine(hasWorker, WORKER_TARGET_ERROR)
+      .refine((a) => (a.choice !== undefined ? a.choices === undefined && a.text === undefined : a.choices !== undefined || a.text !== undefined), 'Send one choice, checkbox choices, or text; do not combine choice with the others.'),
+    'worker',
+    'delete',
+  ),
+  tool('worker.interrupt', 'office_worker_interrupt', 'Interrupt a floor worker’s running turn without dismissing it.', z.strictObject({ ...worker }).refine(hasWorker, WORKER_TARGET_ERROR), 'worker', 'delete', true),
+  tool(
+    'thread.read',
+    'office_worker_thread',
+    'Read one page of a local or cloud worker’s conversation (or Orchestrator’s), read-only.',
+    z.strictObject({ ...worker, before: z.number().int().nonnegative().optional().describe('Entry sequence for older history.') }).refine(hasWorker, WORKER_TARGET_ERROR),
+    'worker',
+    'read',
+    true,
+  ),
+] as const;
+
+export function registerOwnerTools(server: OfficeMcpServer, owner: OwnerOffice, deps?: OfficeMcpDeps): void {
+  for (const entry of OWNER_TOOLS) {
+    server.tool(entry, buildingOnly, async (input, caller, signal) => {
+      const args: Record<string, unknown> = { ...input };
+      const ref = typeof args.floor === 'string' ? args.floor : undefined;
+      delete args.floor;
+      let floor: string | undefined;
+      if (entry.scope === 'worker') {
+        const target = resolveWorkerTarget(input as { worker?: string; workerId?: string; name?: string })!;
+        delete args.worker;
+        delete args.name;
+        const found = findWorker(owner.floors(), target, ref);
+        if (typeof found === 'string') {
+          const building = findMissionAgent(owner, target);
+          if (!building) return officeError(found);
+          // Building agents are read, never controlled, and only the Orchestrator's conversation is in this office.
+          if (entry.action !== 'thread.read') return officeError(missionControlRefusal(building, entry.name));
+          if (building.worker.id !== ORCHESTRATOR_ID) return officeError(outsideOffice(building, 'conversation'));
+          args.workerId = building.worker.id;
+        } else {
+          if (entry.action === 'worker.prompt' && found.worker.cloud && args.urgent === true) {
+            return officeError(`${found.worker.name} is a cloud worker: call office_worker_interrupt first, then office_worker_prompt.`);
+          }
+          args.workerId = found.worker.id;
+          floor = found.floor.id;
+        }
+        if (entry.action === 'worker.prompt') {
+          args.prompt = resolvePromptText(input as { prompt?: string; text?: string })!;
+          delete args.text;
+        }
+      } else {
+        const at = ref ?? caller.floor?.id;
+        if (!at) return officeError('Name the floor: office_floors lists them.');
+        const picked = pickFloor(owner.floors(), at);
+        if (typeof picked === 'string') return officeError(picked);
+        floor = picked.floor.id;
+      }
+      if (entry.action === 'thread.read') args.request = randomUUID();
+      if (args.urgent === undefined) delete args.urgent;
+      if (signal.aborted) return officeError('Cancelled before taking the action.');
+      const result = await owner.act(caller.worker, { ...args, t: entry.action }, { floor, signal });
+      const out = ownerResult(entry.name, result, { floor, linkBase: deps ? mcpDeepLinkBase(deps) : undefined });
+      if (!out.isError && entry.action === 'thread.read' && result.reply?.t === 'thread.snapshot' && owner.threadImages) {
+        let metas: StoredImageMeta[] = [];
+        try {
+          metas = await owner.threadImages(String(args.workerId), result.reply.entries, floor);
+        } catch (err) {
+          console.error(`${entry.name} threadImages failed:`, err);
+        }
+        const imageOrigin = caller.remoteOrigin ?? (deps?.images ?? deps?.remote?.images)?.origin();
+        const refs = withImageOrigin(metas, imageOrigin);
+        if (refs?.length) {
+          out.structuredContent = { ...(out.structuredContent as Record<string, unknown>), images: refs };
+          out.content.push({ type: 'text', text: formatImageLines(refs).join('\n') });
+        }
+      }
+      return out;
+    });
+  }
+}

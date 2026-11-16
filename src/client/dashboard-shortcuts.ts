@@ -1,0 +1,109 @@
+import { LAYOUT_ORDER, type LayoutMode } from './dashboard-workspace';
+
+export type WorkspaceCommand =
+  | { action: 'layout'; mode: LayoutMode }
+  | { action: 'maximize' | 'hire' | 'board' | 'boards' | 'sidebar' | 'settings' | 'orchestrator' | 'floors' }
+  | { action: 'pane' | 'worker' | 'floor'; direction: -1 | 1 }
+  | { action: 'floorIndex'; index: number };
+
+type ShortcutEvent = Pick<KeyboardEvent, 'key' | 'metaKey' | 'ctrlKey' | 'altKey' | 'shiftKey' | 'isComposing' | 'defaultPrevented' | 'repeat' | 'preventDefault' | 'stopImmediatePropagation'> & {
+  code?: string;
+};
+
+export const WORKSPACE_KEY_HINTS: [string, string][] = [
+  ['⌘ K', 'floors'],
+  ['⇧ ⌘ 1–0', 'jump to floor'],
+  ['⌘ 1–8', 'layout'],
+  ['⌘ ↵', 'maximize / restore'],
+  ['⌘ ← →', 'panes'],
+  ['⌘ ↑ ↓', 'workers'],
+  ['⌘ N', 'hire'],
+  ['⌘ B', 'whiteboard'],
+  ['⌘ I', 'boards'],
+  ['⌘ \\', 'sidebar'],
+  ['⌘ ,', 'settings'],
+  ['⌘ O', 'Orchestrator'],
+];
+
+function shiftedFloorIndex(e: ShortcutEvent): number | undefined {
+  if (e.code) {
+    const match = /^(?:Digit|Numpad)([0-9])$/.exec(e.code);
+    if (!match) return undefined;
+    const digit = Number(match[1]);
+    return digit === 0 ? 9 : digit - 1;
+  }
+  if (/^[1-9]$/.test(e.key)) return Number(e.key) - 1;
+  if (e.key === '0') return 9;
+  const shifted = '!@#$%^&*()'.indexOf(e.key);
+  return shifted >= 0 ? shifted : undefined;
+}
+
+/** Only Command chords belong to the workspace. All CLI and editing keys pass through. */
+export function workspaceCommand(e: ShortcutEvent, nativeCompanion = false): WorkspaceCommand | undefined {
+  if (e.defaultPrevented || !e.metaKey || e.ctrlKey || e.altKey || e.isComposing) return;
+  // Plus normally needs Shift; bare = is the same shortcut on US keyboards.
+  // External browsers keep these chords for zoom.
+  if (nativeCompanion) {
+    if (e.key === '+' || (e.key === '=' && !e.shiftKey)) return { action: 'floor', direction: 1 };
+    if (e.key === '-' && !e.shiftKey) return { action: 'floor', direction: -1 };
+  }
+  if (e.shiftKey) {
+    const index = shiftedFloorIndex(e);
+    return index === undefined ? undefined : { action: 'floorIndex', index };
+  }
+  const mode = LAYOUT_ORDER[Number(e.key) - 1];
+  if (/^[1-8]$/.test(e.key) && mode) return { action: 'layout', mode };
+  switch (e.key.toLowerCase()) {
+    case 'k':
+      return { action: 'floors' };
+    case 'enter':
+      return { action: 'maximize' };
+    case 'arrowleft':
+    case 'arrowright':
+      return { action: 'pane', direction: e.key === 'ArrowLeft' ? -1 : 1 };
+    case 'arrowup':
+    case 'arrowdown':
+      return { action: 'worker', direction: e.key === 'ArrowUp' ? -1 : 1 };
+    case 'n':
+      return { action: 'hire' };
+    case 'b':
+      return { action: 'board' };
+    case 'i':
+      return { action: 'boards' };
+    case '\\':
+      return { action: 'sidebar' };
+    case ',':
+      return { action: 'settings' };
+    case 'o':
+      return { action: 'orchestrator' };
+  }
+}
+
+/** Run in window capture, before xterm or a composer can consume or send the chord. */
+export function workspaceShortcut(e: ShortcutEvent, run: (command: WorkspaceCommand) => void, nativeCompanion = false, scope: 'workspace' | 'directory' = 'workspace'): boolean {
+  const command = workspaceCommand(e, nativeCompanion);
+  if (!command) return false;
+  if (scope === 'directory' && ['layout', 'maximize', 'pane', 'worker', 'sidebar'].includes(command.action)) return false;
+  e.preventDefault();
+  e.stopImmediatePropagation();
+  if (!e.repeat) run(command);
+  return true;
+}
+
+/**
+ * The row ↑/↓ goes to in the sidebar, which walks Mission Control's rows and then the floor's as one list:
+ * on from the row with the keyboard, else from the worker in the focused pane. A worker in both lists has a row in each.
+ */
+export function sideStep<T extends { id: string; button?: unknown }>(rows: readonly T[], from: unknown, focused: string, direction: -1 | 1): T | undefined {
+  if (!rows.length) return undefined;
+  let at = from ? rows.findIndex((r) => r.button === from) : -1;
+  if (at < 0) at = rows.findIndex((r) => r.id === focused);
+  if (at < 0) return rows[direction > 0 ? 0 : rows.length - 1];
+  return rows[(at + direction + rows.length) % rows.length];
+}
+
+export function adjacentFloor(floors: readonly { id: string }[], current: string | null, direction: -1 | 1): string | undefined {
+  const at = floors.findIndex((floor) => floor.id === current);
+  if (floors.length < 2 || at < 0) return;
+  return floors[(at + direction + floors.length) % floors.length]?.id;
+}

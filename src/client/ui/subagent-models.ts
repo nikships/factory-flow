@@ -1,0 +1,201 @@
+import { SUBAGENT_MODEL_NOTE_MAX, type SubagentModel } from '../../shared/protocol';
+import { offeredModels } from '../../shared/model-visibility';
+import { watchFactory } from '../factory';
+import { store } from '../state';
+import { withoutGlyph } from './glyph';
+import { h } from './dom';
+import { availabilityOf } from './model-search';
+import { modelLogo } from './model-logo';
+import { droidCatalogue, droidDisplayName, multiplierLabel, type DroidModelOption } from './models';
+
+export interface SubagentModelPicker {
+  element: HTMLElement;
+  /** Shows what the office has saved, unless the owner is part way through changing it. */
+  paint(saved: SubagentModel[] | undefined): void;
+  dispose(): void;
+}
+
+/** What a model costs and can do, in one line under its name. */
+function facts(m: DroidModelOption | undefined, id: string, why?: string): string {
+  if (why) return `${why} · ${id}`;
+  if (!m) return `${id} · droid doesn't list it now`;
+  const cost = m.custom ? 'own API key, no Factory credits' : m.tokenMultiplier !== undefined ? `${multiplierLabel(m.tokenMultiplier)} credits` : '';
+  return [id, m.provider, cost, m.noImages ? 'no images' : '', m.legacy ? 'legacy' : '', m.promo].filter(Boolean).join(' · ');
+}
+
+/**
+ * ⚙️ Settings → Subagents & visits: a checkbox for every model droid lists that is not hidden in
+ * Models → Models shown in pickers, cheapest first, and a note for each one picked that the Team
+ * lead reads in `team_models` when it chooses one. A pick hidden since stays listed,
+ * marked, so it can be unticked. Nothing picked lets leads run any model.
+ */
+export function subagentModelPicker(save: (models: SubagentModel[] | undefined) => void): SubagentModelPicker {
+  /** Picked ids, in the order they were picked, with their notes. */
+  let picked = new Map<string, string>();
+  let saved: SubagentModel[] | undefined;
+  let touched = false;
+  let models: DroidModelOption[] = [];
+  let loaded: 'loading' | 'ok' | 'failed' = 'loading';
+
+  const filter = h('input.input.sub-models-filter', { type: 'search', placeholder: 'Filter by name, id or provider', 'aria-label': 'Filter models' }) as HTMLInputElement;
+  const count = h('small.sub-models-count');
+  const list = h('ul.list.boxed.sub-models', { 'aria-label': 'Models leads can pick' });
+  const saveBtn = h('button.btn.sm.primary', { type: 'button' }, 'Save');
+  const anyBtn = h('button.btn.sm', { type: 'button' }, 'Allow any model');
+  const revert = h('button.btn.sm.ghost', { type: 'button' }, 'Undo changes');
+
+  const same = () => JSON.stringify([...picked].map(([id, note]) => ({ id, ...(note.trim() ? { note: note.trim() } : {}) }))) === JSON.stringify(saved ?? []);
+  const paintButtons = () => {
+    const changed = !same();
+    saveBtn.toggleAttribute('disabled', !changed);
+    revert.classList.toggle('hidden', !changed);
+    anyBtn.classList.toggle('hidden', !saved?.length && !picked.size);
+    const total = offeredModels(models, store.hiddenModels, new Set(picked.keys())).length;
+    count.textContent = loaded === 'loading' ? 'Loading Droid models…' : picked.size ? `${picked.size} picked${total ? ` of ${total}` : ''}` : loaded === 'failed' ? 'Model list unavailable' : `None picked: leads can run any of ${total}`;
+  };
+
+  const row = (id: string, m: DroidModelOption | undefined) => {
+    const on = picked.has(id);
+    const { reason, note: remark } = availabilityOf(id, store.subscriptions, Date.now(), store.factory, m);
+    const box = h('input', { type: 'checkbox', checked: on, disabled: !!reason && !on, 'aria-label': `Let leads pick ${m?.displayName ?? id}` }) as HTMLInputElement;
+    const note = h('input.input.sub-model-note', {
+      type: 'text',
+      maxlength: SUBAGENT_MODEL_NOTE_MAX,
+      placeholder: 'What it’s good for, for the lead (optional): “cheap, fine for tests and docs”',
+      'aria-label': `Note on ${m?.displayName ?? id}`,
+      class: on ? '' : 'hidden',
+    }) as HTMLInputElement;
+    note.value = picked.get(id) ?? '';
+    box.addEventListener('change', () => {
+      touched = true;
+      if (box.checked) picked.set(id, note.value);
+      else picked.delete(id);
+      note.classList.toggle('hidden', !box.checked);
+      li.classList.toggle('on', box.checked);
+      if (box.checked) note.focus();
+      paintButtons();
+    });
+    note.addEventListener('input', () => {
+      touched = true;
+      picked.set(id, note.value);
+      paintButtons();
+    });
+    const name = withoutGlyph(m?.displayName ?? droidDisplayName(id));
+    const line = facts(m, id, reason ?? remark);
+    const li = h(
+      'li.list-row.sub-model',
+      { class: `${on ? 'on' : ''} ${reason ? 'refused' : ''}` },
+      h(
+        'label.sub-model-pick',
+        { title: id },
+        h('span.list-icon', {}, box),
+        modelLogo({ id, name: m?.displayName, provider: m?.provider }),
+        h('span.list-main', {}, h('span.list-title', {}, name), h('span.list-meta', {}, store.hiddenModels.includes(id) ? `${line} · hidden from pickers` : line)),
+        !m?.custom && m?.tokenMultiplier !== undefined ? h('span.list-end', {}, multiplierLabel(m.tokenMultiplier)) : null,
+      ),
+      note,
+    );
+    return li;
+  };
+
+  const paintList = () => {
+    const want = filter.value.trim().toLowerCase();
+    // Hidden models are not offered; one picked before it was hidden stays, so it can be unticked.
+    const offered = offeredModels(models, store.hiddenModels, new Set(picked.keys()));
+    const known = new Set(offered.map((m) => m.id));
+    // The saved picks on top, then own-key models, then cheapest first; one picked that droid no
+    // longer lists stays visible. Rows reorder only on a repaint, never under the pointer mid-pick.
+    const rank = (m: DroidModelOption) => (m.custom ? -1 : (m.tokenMultiplier ?? Number.POSITIVE_INFINITY));
+    const sorted = [...offered].sort((a, b) => Number(picked.has(b.id)) - Number(picked.has(a.id)) || Number(!!a.legacy) - Number(!!b.legacy) || rank(a) - rank(b));
+    const rows: [string, DroidModelOption | undefined][] = [...[...picked.keys()].filter((id) => !known.has(id)).map((id): [string, undefined] => [id, undefined]), ...sorted.map((m): [string, DroidModelOption] => [m.id, m])];
+    const shown = rows.filter(([id, m]) => (!store.setup.airgapped || m?.custom) && (!want || [id, m?.displayName, m?.provider].some((s) => s?.toLowerCase().includes(want))));
+    list.replaceChildren(...(shown.length ? shown.map(([id, m]) => row(id, m)) : [h('li.list-row.sub-model', {}, h('span.list-meta', {}, loaded === 'loading' ? 'Loading Droid models…' : 'No model matches.'))]));
+    drawn = availabilityStamp();
+    drawnStates = stateStamp();
+    paintButtons();
+  };
+
+  const reset = () => {
+    touched = false;
+    picked = new Map((saved ?? []).map((m) => [m.id, m.note ?? '']));
+    paintList();
+  };
+
+  filter.addEventListener('input', paintList);
+  saveBtn.addEventListener('click', () => {
+    touched = false;
+    const next = [...picked].map(([id, note]) => ({ id, ...(note.trim() ? { note: note.trim() } : {}) }));
+    save(next.length ? next : undefined);
+  });
+  anyBtn.addEventListener('click', () => {
+    touched = false;
+    picked = new Map();
+    save(undefined);
+    paintList();
+  });
+  revert.addEventListener('click', reset);
+  // A quota running out or coming back redraws the list, but only then: a redraw would take focus from a note being typed.
+  const availabilityStamp = () => {
+    const now = Date.now();
+    return JSON.stringify(models.map((m) => availabilityOf(m.id, store.subscriptions, now, store.factory, m)));
+  };
+  const stateStamp = () => {
+    const now = Date.now();
+    return JSON.stringify(
+      models.map((m) => {
+        const a = availabilityOf(m.id, store.subscriptions, now, store.factory, m);
+        return [Boolean(a.reason), Boolean(a.note)];
+      }),
+    );
+  };
+  let drawn = '';
+  let drawnStates = '';
+  const stops: (() => void)[] = [];
+  const needsAvailabilityPaint = () => {
+    const typingInList = list.contains(document.activeElement);
+    return typingInList ? stateStamp() !== drawnStates : availabilityStamp() !== drawn;
+  };
+  const watch = (key: 'subscriptions' | 'factory' | 'hiddenModels', needsPaint: () => boolean) => {
+    stops.push(
+      store.on(key, () => {
+        if (list.isConnected && needsPaint()) paintList();
+      }),
+    );
+  };
+  watch('subscriptions', needsAvailabilityPaint);
+  watch('factory', needsAvailabilityPaint);
+  // Hiding or showing a model under Models → Models shown in pickers redraws this list at once.
+  watch('hiddenModels', () => true);
+  const unwatchLimits = watchFactory('limits');
+  let minute = Math.floor(Date.now() / 60_000);
+  const timer = setInterval(() => {
+    const nextMinute = Math.floor(Date.now() / 60_000);
+    if (nextMinute === minute) return;
+    minute = nextMinute;
+    if (list.isConnected && needsAvailabilityPaint()) paintList();
+  }, 5_000);
+
+  void droidCatalogue()
+    .then((c) => {
+      models = c.models;
+      loaded = 'ok';
+    })
+    .catch(() => {
+      loaded = 'failed';
+    })
+    .finally(paintList);
+
+  return {
+    element: h('div.stack.tight.sub-models-picker', {}, h('div.row', {}, filter, count), list, h('div.row', {}, saveBtn, anyBtn, revert)),
+    paint(next) {
+      saved = next?.map((m) => ({ ...m }));
+      if (!touched) reset();
+      else paintButtons();
+    },
+    dispose() {
+      for (const stop of stops) stop();
+      unwatchLimits();
+      clearInterval(timer);
+    },
+  };
+}

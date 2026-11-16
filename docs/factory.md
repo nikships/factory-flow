@@ -1,0 +1,300 @@
+# Factory in Factory Flow
+
+The office can be connected to [Factory](https://factory.ai) with a Factory API key. With it, the companion's Factory window shows Factory and the office acts on it: cloud computers (Droid Computers) and the Environments they start from, Droid sessions and their credits, CI automations, AutoWiki, and cloud workers (office workers whose Droid session runs on a Factory computer). It is a real feature, polished and complete, not a demo.
+
+This is the plan for that work and the contract every Factory feature follows. Status: **implemented**. The foundation (the connection, the API client, the feature registry, the Settings pane) and every feature on it are built.
+
+In [Airgapped (no-account) mode](subscriptions.md#airgapped-no-account-mode), Office pauses Factory key checks and polling, immediately publishes empty Factory account/usage state to open clients, and refuses Factory HTTP/cloud actions with an explanation. The key, cached data and Droid credentials are kept. Window watches still register and unregister without issuing requests while paused. Switching back immediately restores the cached state, resumes the connection and checks the saved key. Already-issued network requests and existing Droid turns are not a network-isolation guarantee.
+
+## Companion Factory window
+
+The header's Factory glyph is an accessible **Factory** button. It opens one modal with
+five tabs: **Computers** (including Environments), **AutoWiki**, **Files**, **Sessions** and **CI**. Each tab also has a
+`Factory: …` action in the ⌘K palette, after floors. No global shortcut is added.
+The last tab is stored in `factory-flow.factory.tab`; each tab mounts once per open
+window, preserving its selection, search, scroll and unsaved editor state while switching.
+
+Computers includes Environments, details, metrics, lifecycle actions, creation and computer
+secrets. AutoWiki reads the selected floor's repository, with page search, versions, generation
+and its cost confirmation, visibility, download and deletion. Files uses that floor's checkout:
+Docs/All files, ⌘P go-to-file, content search, Markdown preview/edit/split, and conflict-aware
+saves. Closing from any tab asks about unsaved file edits. These are embedded tab bodies,
+not nested window shells.
+
+Sessions is read-only and uses the existing Factory sessions slice and credit ledger. It shows
+running and pending sessions with their location, today's and seven-day credits, daily bars,
+top sessions by weekly credits, and recent PRs opened or merged by sessions. It labels ledger
+estimates and limited session history rather than presenting these as billing totals.
+
+CI shows the selected floor's repository workflows, runs and workflow pull requests, with
+actions to add, change or remove a workflow. It never mixes in another floor's automations.
+
+![The Factory window's five tabs, with CI selected](assets/readme/factory-ci.png)
+
+Disconnected, rejected-key and Airgapped states explain connection setup on every tab.
+**Settings → Connections** stacks Settings at the **Factory API key** row; Esc returns to
+the Factory window. Closing the window releases all feature watches, subscriptions and timers.
+
+## Limits and overage
+
+`FactoryState.limits` reads `GET /api/billing/limits` with the existing `fk-*` key. It preserves Standard and Droid Core `fiveHour`, `weekly`, and `monthly` windows (`usedPercent`, nullable `windowEnd` / `secondsRemaining`), subscription status, `overagePreference`, management permission, Extra Usage balance in cents and whether Extra Usage is allowed. Null reset fields mean the window has not started. Enterprise accounts (`usesTokenRateLimitsBilling: false` or no Standard windows) are not applicable, not failures.
+
+The limits feature polls every 60 seconds, or 20 seconds while watched or Factory-hosted workers are active. Model discovery, hire gates and retry inspections share a throttled on-demand recheck. Errors preserve the last displayable sample but fail open for hiring; disconnected, rejected or unknown limits never become a new quota refusal. Airgapped mode publishes empty limits and pauses reads and writes.
+
+Hosted Standard models, including Router, need every Standard window below 100%, unless Extra Usage is selected, allowed and has a positive balance. Droid Core models use their own three windows. Selecting Droid Core fallback does not silently make a requested Standard model runnable. Inactive subscriptions refuse hosted models while leaving BYOK/DroidProxy untouched. Exhaustion names the affected windows and the earliest exhausted reset to recheck, plus the fallback/balance explanation; subsequent exhausted windows can still block after that reset.
+
+`POST /api/factory/limits/overage` accepts only `{"overagePreference":"droidCore"}` or `{"overagePreference":"extraUsage"}` and forwards to `/api/organization/subscription/set-overage-preference`. It requires an office page or paired phone, a connected key and `canManageOverage`; successful writes schedule a poll. This changes account-wide billing behavior, so automated live verification reads the preference without changing it.
+
+Factory Standard and Droid Core appear independently of DroidProxy support in quota rings and subscription sheets, Settings → Connections → Factory, model picker reasons, Thread `/limits` (**Factory Limits & Overage**) and the Factory window's Sessions tab. A connected account whose limits are unavailable or not applicable gets an explanatory native dialog; only a disconnected account falls back to Raw TTY. Web and Android show all three windows, reset times, Extra Usage balance and overage mode. `team_models` / `models_list` include both tier summaries even when the subagent allowlist contains no models of one tier.
+
+## The owner's decisions
+
+- Build all of it: Computers and Environments, Sessions & credits with credits per office worker, CI automations, AutoWiki, and cloud workers.
+- Actions are full: create and delete computers, start cloud sessions, open CI workflow PRs and start wiki runs, along with the safe ones (wake or restart, refresh, send a message, interrupt).
+- Only non-enterprise features. Service accounts (402, "requires a Teams plan") are out. Enterprise controls history and org admin (invites, removing members, credit limits) are of little use in a single-owner office: at most a small read-only org and limits line, and no admin UIs.
+- The key is entered in ⚙️ Settings → **Connections**, the office's own Settings window, which the Mac app shows and which works in a browser too.
+
+## Factory's public API
+
+- Base URL `https://api.factory.ai`, ordinary public paths under `/api/v0`, header `Authorization: Bearer <key>`. Billing limits and overage preferences use `/api` without `/v0`, through the same authenticated, redacting, timeout/retry-aware client. Docs: <https://docs.factory.com/api-reference>. The live OpenAPI spec also has endpoints the docs pages don't show: `GET/PATCH /organization/computer-secrets`, `GET /sessions/{id}/children` and `GET /wiki/upload-access?repoUrl=`.
+- Several response schemas in the spec are empty (`{}`): CI jobs, runs and scan, and every wiki answer. The shapes in `src/shared/factory-*.ts` come from real answers instead, and for the wiki from the `droid` CLI's own schemas for the same endpoints. Where the account had no data yet (CI runs), a parsed item keeps the fields it most likely has and `raw`, the item as the API sent it.
+- Unit tests inject `fetch`, because CI has no Factory key, and use keys like `fk-test-…`. Every answer they inject is copied from a real one from the owner's account. A feature is done once it also works in a clone of the owner's office against their real account (the `flow-clone` skill), and its pull request's screenshots come from there. Never commit a real key, or put one in a test, fixture, log line, PR body or commit message.
+
+What a key reaches, from the owner's account:
+
+| Group | Access | Notes |
+| --- | --- | --- |
+| Computers | ✓ | A managed computer (`providerType` `e2b`) and a BYOM one (`byom`). `GET /computers/{id}/metrics` is an array of 5-minute samples `{timestamp, cpuUsedPct, cpuCount, memUsed, memTotal, diskUsed, diskTotal}` going back about four days; a BYOM computer answers 400 "Metrics are not supported for BYOM computers", and a managed one that's asleep answers `[]` for a recent `?start=`. Providers: `["e2b"]`. |
+| Sessions | ✓ | List items: `sessionId`, `title`, `status` (`idle`, `pending`, `running`), `messageCount`, `createdAt`, `updatedAt`, `computerId?`, `artifacts[]` (pull requests and so on). `factoryCredits` is only on `GET /sessions/{id}`. The office's own workers' sessions are in this list (`WorkerInfo.sessionId` matches `sessionId`), so credits per worker work. |
+| CI automations | ✓ | The scan finds the Droid workflows across the account's repositories (`templateId` like `code-review`, triggers, model, cron, `droidActionInputs`) and says how long it caches (`cacheTtlMs`, 30 minutes; `?forceRefresh=true` skips it); `repositories` lists about a hundred (`?owner=` narrows it). `jobs` lists the workflow PRs opened through `POST /automations/ci/edit`, whose body is not documented (see [CI automations](#ci-automations)). `runs` was empty for this account. |
+| Wiki | ✓ | `POST /wiki` is the *upload* of a finished wiki (`repoUrl`, `commitHash`, `branch`, `hasLocalChanges`, `hasNonRemoteCommits`, `pages`, `pageTree`), not a request to write one: the pages are written by a Droid session running `/wiki` in a checkout, which uploads them as its last step. `GET /wiki/upload-access` says `allowed: true` for any URL, even one that isn't a repository. See [AutoWiki](#autowiki). |
+| Environments | ✓ | `GET /environments` lists each with `latestBuild` (status, stages, failure, a log excerpt) and the organization's `defaultEnvironmentId`. Create answers 201 `{id, buildId}`, `PATCH` `{id, buildId?}` (a build only when the repositories or setup script changed), delete 204, `POST /{id}/builds` `{id, buildId}`, cancel 204, `PUT /environments/default` `{defaultEnvironmentId}`. `GET /environments/source-options` is `{providers: [{id, name, sources}]}`. A validation 400 is `{message, errors[]}`, not the usual shape. See [Environments](#environments). |
+| Organization | ✓, thin | Users, no credit limits, no enterprise history; computer secrets by name only. |
+| Service accounts | ✗ | 402, Teams plan. Out of scope. |
+
+How the API behaves, and what the office does about it:
+
+- `GET /sessions` (and sometimes `GET /sessions/{id}`) **hangs 30 to 90 seconds on a cold call**, then answers in about a second. The client gives calls under `/sessions` 60 seconds and everything else 20, and tries a GET once more after a timeout or a network error. Always pass `limit` (at most 100). Never block a WebSocket handler or a page on Factory: keep showing the last good data with its age.
+- Poll politely: computers every minute, metrics every few minutes (they're 5-minute samples), sessions every 90 seconds, CI and wiki every 5 minutes. Faster only while someone looks at the board or window, or while something is in flight (a computer provisioning, a cloud session running).
+- Errors are `{detail, status, title}`. 401 is a bad key, 402 a plan, 403 a role. A 429 may carry `Retry-After`.
+- Undocumented request bodies (CI edit, wiki create): find them with deliberately invalid requests (an empty body, missing fields) and read the validation errors; the `droid` CLI bundle may show the shape too. Don't run a real write against the live account (create or delete a computer, open a CI PR, start a wiki run, start a cloud session that costs credits) without the owner's go-ahead. Reads are free to run.
+
+## Shape of the code
+
+| Where | What |
+| --- | --- |
+| `src/server/factory/api.ts` | `FactoryApi`: fetch with the Bearer key, JSON, query params, per-request timeouts, one retry for GETs, `FactoryError {status, title, detail, retryAfter?, timedOut}`, the key redacted from every message. Small raw readers for the GETs the probe and the first pollers use. |
+| `src/server/factory/office.ts` | `FactoryOffice`: the key in the office's `.factory-flow/factory.json` (mode 0600, temp file and rename), the probe, whose key it is, rejected, disconnect. |
+| `src/server/factory/feature.ts` | The contract: `FactoryFeature`, `FeatureHost`, `FactoryRoute`, `FactoryRequest`, the `SliceFeature` base class and the route helpers. |
+| `src/server/factory/registry.ts` | `FactoryRegistry`: runs the pollers, keeps the watches, broadcasts, dispatches routes. |
+| `src/server/factory/index.ts` | `mountFactory`: makes the connection and the registry, registers every feature, handles the `factory.*` messages. server.ts calls only this. |
+| `src/server/factory/<feature>.ts` | One module per feature: `computers.ts`, `environments.ts`, `sessions.ts` (with `credits.ts`, its ledger), `ci.ts`, `wiki.ts` (with `wiki-run.ts`, its /wiki runs), `cloud.ts`. |
+| `src/server/factory/new-session.ts` | `whileNew`: a write to a session made in the last 30 seconds tries again after a 404 (see [Droid sessions](#droid-sessions)). |
+| `src/shared/factory.ts` | `FactoryState`, `FactoryConnection`, the probe's groups and capabilities. |
+| `src/shared/factory-<feature>.ts` | Each feature's slice type and the parsers that turn the API's answers into it. |
+| `src/client/factory.ts` | `factoryFetch`, `watchFactory`, `refreshFactory`, `onFactorySetup`. `store.factory` (topic `'factory'`) in `src/client/state.ts` holds the state. |
+| `src/client/ui/factory-settings.ts` | ⚙️ Settings → Connections → *Factory API key*. |
+| `src/client/ui/factory-*.ts`, `src/client/dashboard-factory*.ts` | A feature's tab bodies and the tabbed Factory window that mounts them. |
+
+The key is the building's, like the Jira and Linear connections: browsers never get it. They get `FactoryConnection`: whether it's connected, the fingerprint (`fk-…` and the last four), whose key it is (name and email), the organization's member count, who connected it and when, what it can reach, when it was last checked, and whether Factory has rejected it since. The key never goes into a worker's environment or a log, and error messages are scrubbed of it. The one process that gets it is an AutoWiki run the office starts (`droid exec "/wiki"`, as `FACTORY_API_KEY` in that child's environment only), so the wiki lands in the connected account; its output is scrubbed of the key before anyone sees a line.
+
+### The connection
+
+`connect(key, by)` checks the key with one cheap GET per group, all at once: computers (`/computers/providers`), sessions (`/sessions?limit=1`), CI (`/automations/ci/repository-owners`, which also says whether Factory's GitHub integration is connected), wiki (`/wiki`), organization (`/organization/users`) and service accounts (`/service-accounts`, expected to be a 402). Alongside, `/computers` says whose key it is: the human `ownerId` of its computers, matched against the organization's users, else the only user there is. The answer (`factory.setup`) goes out once everything but sessions is back; the sessions group reads *checking* until its slow call lands. A key every answering group turns down with a 401 is refused; so is a key nobody answered for.
+
+Each group comes out `ok` (with what it found, like "GitHub connected"), `denied` (with why: "Needs a Teams plan", "Key rejected"), `checking` or `error` (a timeout or a 5xx). The office checks the saved key again at every start and on **Check again**; while it does, every group reads *checking* until its own probe answers, and `connection.checking` stays set until the last one (usually sessions) has. A 401 on any later call marks the key *rejected*: Settings says so, `client()` returns nothing, and every feature stops polling until the key is checked again or replaced. Disconnecting deletes `factory.json` and resets every feature's slice. Replacing the key with another one resets them too.
+
+### Messages
+
+| Message | What it does |
+| --- | --- |
+| `welcome.factory`, `{ t: 'factory', state }` | Every connection gets the whole `FactoryState`, at arrival and on every change (coalesced: at most a few broadcasts a second). A poll that read the same data doesn't go out: broadcasts compare the state with every `fetchedAt` reduced to read-or-not, and a state that differs only there goes out once `HEARTBEAT_MS` (a minute) after the last one, so ages stay right. |
+| `factory.connect {key}` | Checks and saves a key; answered to the sender with `factory.setup {ok, error?}`. |
+| `factory.disconnect` | Forgets the key and every feature's data. |
+| `factory.refresh {feature?}` | Polls one feature now; without one, checks the key again and polls every feature. |
+| `factory.watch {feature, on}` | A board or window of the feature opened or closed in that tab. Dropped when the connection closes. |
+
+## The feature contract
+
+A Factory feature is one slice of `FactoryState`, a poller that fills it, and HTTP routes for its actions and on-demand reads. It touches only its own modules plus a line in `mountFactory`, and its client code. To add one, or grow one of the four that are there:
+
+1. **Its slice type** in `src/shared/factory-<feature>.ts`: `fetchedAt` (ms, 0 before the first read; name any other time a poll stamps `fetchedAt` too, so a poll that read nothing new doesn't make a broadcast), `error?` (why the last read failed, shown beside the last good data), and the data. Put the parsers from the API's raw answers there too, so the server and the client share them. Add the slice to `FactoryState` and `emptyFactoryState` in `src/shared/factory.ts` (and its id to `FactoryFeatureId` and `FACTORY_FEATURES`, for a new feature).
+2. **Its server module** in `src/server/factory/<feature>.ts`, implementing `FactoryFeature` (`feature.ts`), usually by extending `SliceFeature`:
+
+   ```ts
+   export class ComputersFeature extends SliceFeature<'computers'> {
+     readonly interval = 60_000; // between polls normally
+     readonly fastInterval = 15_000; // while watched or busy
+     readonly routes: readonly FactoryRoute[] = [
+       { method: 'POST', path: '/:id/restart', handle: async ({ api, params, by }) => { … } },
+     ];
+     constructor(host: FeatureHost) {
+       super('computers', host, emptyComputers);
+     }
+     busy() {
+       return this.slice.items.some((c) => c.status === 'provisioning');
+     }
+     async poll(api: FactoryApi) {
+       const r = await api.computers();
+       this.set({ items: …, fetchedAt: Date.now(), error: undefined });
+     }
+   }
+   ```
+
+   - `poll(api)` reads Factory and calls `this.set(…)`, which tells the registry the slice changed. It throws when the read failed; the registry then calls `failed(err)` (which keeps the data and sets `error`) and backs off. Clear `error` on success.
+   - `busy()` (optional) is "something is in flight": it polls at `fastInterval` until it isn't.
+   - `reset()` forgets everything (disconnect, another key). `SliceFeature` puts the empty slice back.
+   - `host.pollSoon()` polls again now, past the interval and any backoff, after an action changes something. `host.toast(text)` tells everyone, and `host.api()` is the API outside a poll.
+3. **Register it** in `mountFactory` (`src/server/factory/index.ts`): `registry.register((host) => new ComputersFeature(host))`.
+4. **Its routes** are served at `/api/factory/<feature><path>`, behind the office's access gate like every `/api/*` route. `path` may have `:name` segments, which arrive in `params`. `handle` resolves to the JSON to answer with (200), and gets `api`, `params`, `query`, `json()` (the body, a 400 when it isn't JSON, at most 256 KB unless the route sets a bigger `bodyMax` in bytes) and `by` (the page's player name). Throw `badRequest(…)`, `notFound(…)` or an `HttpError` for anything else; a `FactoryError` passes through as the right status with its message (a 401 from Factory answers 502 and marks the key rejected). A route runs only while the office is connected (409 otherwise). Anything but a GET needs the office's own page or a paired phone, so a web page can't drive Factory through the owner's loopback (403).
+5. **Its client code**: read `store.factory.<feature>` and listen for `'factory'`. Call `watchFactory('<feature>')` when its board or window opens and the function it returns when it closes, so the feature polls fast meanwhile. Call actions with `factoryFetch('<feature>', '/path', { method: 'POST', body })`, which throws an `Error` with the server's message. `factoryCan(store.factory.connection, '<group>')` says whether to offer the feature at all.
+
+The registry polls a feature only while the office is connected and the key isn't rejected. Features start 1.5 seconds apart after connecting. A feature never has two polls running. After a failure it waits one interval, then twice that, doubling up to 15 minutes; after a 429 at least the `Retry-After` and a minute, doubling. Replacing the key resets each feature. If an old poll is still running, its feature waits for it to finish (including the existing API timeouts and GET retry), then resets again before the replacement key's next poll. This also removes any old-account entries the unfinished poll saved in `factory-credits.json`. The old poll may briefly publish its slice before that final reset; replacement polling is not immediate. Rejection and rechecking the same key keep its history; disconnecting clears it. Routes retain their existing behavior and are not cancelled by a connection change.
+
+The four first versions, for their owners to grow:
+
+| Feature | Polls | Slice | Routes |
+| --- | --- | --- | --- |
+| `computers` | 60 s, 15 s fast; busy while one is provisioning or waking | The list with provisioning steps and cloned repositories (no relay URLs or keys), the providers (every 30 minutes), the computer secrets' names (every 5 minutes; `secretsError` when that read fails, which doesn't fail the poll), which computer is this machine (`here`), the ones waking, and for each managed computer the latest sample and six hours of history (read every 3 minutes from just after the last sample, every minute while it wakes) | `POST ''`, `POST /bulk`, `GET /repositories`, `GET`/`PATCH /secrets`, `GET /:id`, `GET /:id/metrics?hours=` (1 to 96), `PATCH /:id`, `DELETE /:id` (`confirm` = its name), `POST /:id/restart` (`resume` or `reboot`), `/:id/refresh`, `/:id/install-deps`, `/:id/activity` |
+| `sessions` | 90 s, 20 s fast; busy while a session on a Factory computer runs | The last ~100 sessions with their credits, the office's own workers' sessions, the credits ledger's week (see [Droid sessions](#droid-sessions)) | Create, read, message, interrupt, change, delete; messages and children (see [Droid sessions](#droid-sessions)) |
+| `ci` | 5 min, 60 s fast; busy for 3 minutes after an edit | Whether GitHub is connected, the GitHub owners, the scan's workflows (read again only once its `cacheTtlMs` runs out) and its time, the newest 50 runs, the workflow PRs; a read that fails keeps its part of the last data | `GET /repositories?owner=&fresh=1` (kept 10 minutes), `POST /rescan`, `POST /edit` |
+| `wiki` | 5 min, 60 s fast; busy while a /wiki run goes | The newest run of each repository, and per floor its run history and the office's own /wiki run | See [AutoWiki](#autowiki) |
+| `cloud` | live daemon notifications over one relay connection per computer; session reconciliation every minute; without a healthy stream, working sessions every 4 s and resting ones every minute | When its last read was, and why it failed; the workers themselves are each floor's (`cloud-workers.json`) and go out as `worker.update` | `POST /hire`, `POST /:workerId/message`, `POST /:workerId/interrupt`; over the WebSocket, `worker.spawn` with `cloud`, `worker.interrupt` and `thread.read` (see [Cloud workers](#cloud-workers)) |
+
+### AutoWiki
+
+What the API sends (the schemas are empty; these come from the `droid` CLI's schemas and real answers):
+
+- `GET /wiki` → `{wikiRuns: [run]}`, the newest run of each repository. `GET /wiki/history/{repoUrl}` → `{wikiRuns: [run]}`, one repository's runs. `repoUrl` there is the full `https://github.com/owner/repo` URL, `encodeURIComponent`ed; `owner/repo` answers 403 "You do not have access to this repository". So does the full URL of a repository Factory's integration doesn't cover (someone else's, or a renamed repository by its old name), while one it covers with no runs yet answers `{wikiRuns: []}`. The floor keeps that 403 as `noAccess`, and the tab warns that an upload may be refused.
+- A run: `wikiRunId`, `createdAt` (ms), `repoUrl`, `commitHash`, `branch`, `hasLocalChanges`, `hasNonRemoteCommits`, `pageCount`, `pageTree`, and optionally `sourceSessionId`, `ownerUserId`, `modelUsed {id, reasoningEffort}`, `droidVersion`, `privacyLevel` (`private` or `organization`), `canUpdatePrivacy`, `isRepoCoveredByOrgIntegration`. `GET /wiki/{id}` is the same with `videoOverview?`. A tree node is `{pageId, title, path, order, children}`, at most five levels deep.
+- `GET /wiki/{id}/pages/{pageId}` → `{pageId, path, title, content, order}`; `content` is Markdown whose links to other pages are relative `.md` paths (`../systems/terminals.md`).
+- `GET /wiki/{id}/search?q=&limit=` (`limit` 1 to 100) → `{results: [{pageId, title, path, snippet, matchCount}]}`.
+- `GET /wiki/{id}/export`: the pages as a .zip. Factory answers `{url}`, a signed S3 link the office fetches without the key; it also handles the .zip itself or a redirect to it.
+- `modelUsed` isn't always there: the run `/wiki` uploaded with `-m glm-5.3-flash` had none. `GET /sessions/{id}` doesn't name a model either; each assistant message in `GET /sessions/{id}/messages` has `modelId` and `reasoningEffort`, and a subagent session has `parent_session_id`.
+- `POST /wiki/{id}/privacy {privacyLevel}` (anything else is a 422), `DELETE /wiki/{id}` → `{deleted: true}`. An unknown run is a 404.
+
+What the office does with it (`src/server/factory/wiki.ts`, `wiki-run.ts`, `src/shared/factory-wiki.ts`, `src/client/ui/factory-wiki.ts`):
+
+- The slice has `runs` (from `GET /wiki`) and `floors`, by floor id: the floor's `repoUrl` (from its `origin` remote, `https://…`), or `why` it can't have a wiki (no remote, or not GitHub or GitLab); its `latest` run; its `history` (up to 20, read on each poll for floors that have a run, at most 12 floors, and on `GET /floor`); and its `job`, the office's own /wiki run. Page trees and pages aren't in the slice: the routes read them on demand and cache them, since a run never changes once uploaded.
+- Routes, under `/api/factory/wiki`: `GET /upload-access?repoUrl=`, `GET /floor?floor=` (the floor's slice, its history read again), `GET /runs/:id` (with its page tree), `GET /runs/:id/pages/:page`, `GET /runs/:id/search?q=` (at most 30 results), `GET /runs/:id/export` (the .zip, piped through as a download), `POST /runs/:id/privacy {privacyLevel}`, `DELETE /runs/:id`, `GET /models` (what Generate can pick, and its default), `POST /generate {floor, model?}` and `POST /cancel {floor}`.
+- **Generate** runs what Factory's own CI template runs, plus the model, the subagents' settings and the upload rule below: `droid exec --auto high -m <model> --settings <file> --append-system-prompt <rule> --output-format stream-json "/wiki <rule>"`. The model comes from Generate's confirm, which lists what `droid exec --help` prints under "Available Models" and "Custom Models" (deprecated ones left out, read again every 10 minutes); it is `glm-5.3-flash` unless someone picks another, and an id Droid doesn't list is a 400. The `--settings` file (the floor's `.factory-flow/wiki-run-settings.json`, gone when the run ends) puts /wiki's subagents on the same model: `subagentModelSettings` with `lightModel`, `mediumModel` and `heavyModel` set to it and each `…ReasoningEffort` to the model's default effort. Without it a subagent goes by the owner's own per-complexity subagent models in their Droid settings, which win over `-m` (tested: with `lightModel: gpt-6-luna` in the user settings, a light subagent of a `-m glm-5.3-flash` session ran on gpt-6-luna at max effort; with the file, on glm-5.3-flash at high). `subagentInheritTiers` in a settings file doesn't do it. The job carries the model. When a run the office made uploads, the floor's `.factory-flow/wiki-run-models.json` records which model wrote it (the newest 50), and a run without `modelUsed` gets its model from there; the tab shows it on the run's line.
+- What a run costs, on this repository (about 45 pages, 13 subagents): with `glm-5.3-flash`, 18 minutes and 422,787 credits (216,694 for /wiki, 206,093 for its subagents, all on glm-5.3-flash at high). Earlier runs on the account's default models (Opus 5.5, Kimi K3) were cut off after about 50 minutes, having spent 21.3 million and 5.1 million credits.
+- Generate uploads to Factory only, never to the repository's GitHub wiki tab. Left alone, /wiki's skill picks `--upload-to factory,github` for a GitHub repository in exec mode (its "Upload targets" section; run 3 above ran exactly that, and GitHub only said no because the repository's wiki was never initialized). Droid has no flag, setting or environment variable that turns the GitHub half off (`droid wiki-upload --upload-to` defaults to `factory`, but the skill names it; the only switch, the organization's `wikiCloudSync`, stops Factory uploads too), so the office does three things (`WIKI_UPLOAD_RULE`, `wikiGitBlock` in `wiki-run.ts`):
+  - The prompt is `/wiki <rule>` and the same rule goes in `--append-system-prompt`: "Upload targets are already decided: Factory cloud yes, GitHub wiki tab no. Run droid wiki-upload with --upload-to factory, never with github in --upload-to…". The skill reads the text after `/wiki` as the user's instructions. Probed cheaply on glm-5.3-flash (the skill's upload section and the run's prompt, no run; about 770 credits each): with the rule it answers `--upload-to factory`, without it `--upload-to factory,github`. Not verified with a full /wiki run.
+  - Git can't reach the wiki repository even if the model ignores the rule: the child's environment adds `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` (after any the office's environment already has) that rewrite `https://`, `http://`, `git@…:` and `ssh://` forms of `github.com/<owner>/<repo>.wiki` (from the worktree's `origin`, the URL the skill passes as `--repo-url`) to `factory-flow-no-github-wiki://`, a transport git doesn't have. Droid's GitHub wiki sync checks, clones and pushes that repository with git, so it stops at its first `git ls-remote` and prints "GitHub wiki not initialized" (tested: `droid wiki-upload --upload-to github` with that environment, git logged, ran `git ls-remote https://github.com/example/project.wiki.git`, which failed on the rewritten URL without reaching the network). The repository itself (`<repo>.git`) isn't touched.
+- Generate's other details: it runs with the office's Droid command (`--agent`, found as `resolveCommand` finds it, `.cmd` shims through the shell on Windows), in a detached worktree of `origin`'s default branch (fetched first) at the floor's `.factory-flow/wiki-run/`. Its environment is the office's (`childEnv()`) plus `FACTORY_API_KEY`, the office's key. One run per floor at a time (a second is a 409). A note in the floor's `.factory-flow/wiki-run.json` says one is running. Its last 6 lines (tool calls, what it says, the key scrubbed out) reach browsers at most once a second; its state changes go out at once. **Stop** sends SIGTERM to its process group (`taskkill /T /F` on Windows), then SIGKILL after 10 seconds. Exit 0 means the upload landed: the feature polls now and again 20 seconds later. Any other exit fails with its last 20 lines. The worktree goes when it ends. An office that stops mid-run ends it; the next one finds the note, kills what's left of it, removes the worktree and shows the run as *lost*.
+
+### Cloud workers
+
+**Live updates.** `CloudStream` (`src/server/factory/cloud-stream.ts`) discovers each worker computer's `relayClientUrl` and published X25519 identity through `GET /computers/{id}`, then uses the Droid SDK's remote WebSocket daemon client. One authenticated, identity-pinned connection serves all office workers on that computer. Its raw notification listener is installed before `loadSession`, which hydrates and subscribes to each session. Text and thinking deltas, tool calls/results, working-state changes and turn completion update the held Thread and worker state; screen previews are coalesced to at most four per second. This observer never answers permissions or AskUser, sends prompts, closes daemon sessions or wakes computers. Prompts and interrupts still use REST, so uncertain streaming acknowledgements cannot submit them twice. Disconnecting or replacing/rejecting the office key clears the connections and held live state; removing a worker drops its subscription locally, and the last worker on a computer disconnects its relay. Failures leave REST polling available and retry after 30 seconds, doubling to five minutes, with one credential-free warning per failure streak. A paused managed computer was verified to fall back without waking; an awake managed computer's relay remains unverified.
+
+What live tests showed: from the REST send, the relay delivered the working state in about 1.4 seconds, a tool call in 2.4, its result in 2.6, the first text delta in 3.7 and turn completion in 3.8. A long reply arrives as many small deltas (about 2,400 for 12,000 characters), at most about 0.8 seconds apart. A `DELETE /sessions/{id}` answered 204 while the session still read 200, and only a second one made it read 404. Every stream-backed session stays held, so a Thread read during streaming never waits for Factory: the minute's REST reconciliation runs in the background.
+
+The hired model stays in `WorkerInfo.model`; the reported session model updates `activeModel`. The first differing model reported by create/session settings or the live relay warns that floor once: `☁ Factory runs Ada on GPT 6 Sol, not DeepSeek V4.1 Flash 1017`. Display names come only from the already-cached Droid catalogue, falling back to ids without an extra lookup. `cloud.modelMismatchWarned` is saved with the worker so reconnects and office restarts do not repeat it. A substitution never refuses or cancels a hire.
+
+The agent on a Factory computer sees none of the office's system prompt, so the first message the office sends a cloud worker starts with the *Cloud worker context* prompt (`cloud.context`, Settings → Workers → Prompts; empty sends the message alone): its name, floor and computer, the floor's repository and its page, the folder its session starts in, the floor branch (`floor-branch.json`, else the repository default) and that the [Office MCP](office-mcp.md) tools aren't available there. When the session starts in the home folder or a typed folder, it says to find the repository's clone or clone it. `CloudWorker.intro` marks a worker whose next message carries it; a send that fails keeps it.
+
+What the live tests on `orb` showed: a managed computer's home folder is `/home/<remoteUser>` (`/home/factory-user`), which is the session's folder when `cwd` is left out; no repositories are cloned there by Factory. `POST /sessions` took about 16 seconds and the first `POST /sessions/{id}/messages` about 23. Right after a message, `GET /sessions/{id}` can still say `idle` with the old `messageCount`. `GET /sessions/{id}` doesn't return `sessionSettings`. `DELETE /sessions/{id}` answers 204; in the first tests the session still read 200 and stayed in the list afterwards, and in later ones it was gone from the list and read 404 at once, so the office drops a session it deleted from the slice itself (`SessionsFeature.forget`, also when a cloud worker goes home with its session) rather than wait for the list. Factory lists a new message many seconds late, 20 or more after it was made: a session can read `idle` while its reply isn't listed yet, and the newest message listed can still be the last turn's reply. So a cloud worker's turn counts as answered only by a reply made after the message went (`answeredByAssistant(messages, since)`), a turn that ended before its reply was listed reads the tail for up to 90 seconds more (`replyBy`), and its Thread goes on reading Factory every few seconds after a session stops, so a late reply still shows.
+
+A cloud worker can also be hired on an Environment (*Runs on* → *A fresh computer from an Environment*), one that has built. The office starts an unlisted computer from it for that worker alone, named `<environment>-<8 hex>`, and reads it every 2 seconds until it's active (4 minutes at most). The session starts in the floor's repository's clone there (`repoFolder`), unless a folder was typed. Since that clone is as old as the Environment's last build, the first message goes with the *Cloud worker on an Environment* prompt too, after the context (`cloud.environment`, Settings → Workers → Prompts; empty sends the message alone), which has the worker run `git fetch origin && git pull --ff-only` before anything else. In the live test it fast-forwarded two commits, then did the task. When anything in the hire fails, the computer is deleted. Sending the worker home deletes the computer (its sessions are archived with it), so there's no interrupt.
+
+**Its Thread.** A cloud worker's window, in the web and Android companions, is the same Thread a local Droid worker has, built from its Factory session instead of a session file. `thread.read` goes to `CloudThreadReader` (`src/server/factory/cloud-thread.ts`). Live snapshots and notifications update its held messages; healthy streams reconcile through `GET /sessions/{id}/messages` every 60 seconds in the background, without making live reads wait. Otherwise reads keep the original 2.5-second working and 15-second resting cadence, waiting at most 2.5 seconds for Factory before returning held messages. REST reads take 100 messages initially, then the newest 30; the cloud poll's newest messages merge in too. It keeps up to 1,500 messages for each of 8 held sessions, 3,000 once someone pages back so new messages don't push out what they paged back to (paging back stops there rather than dropping the newest), and pages older history with Factory's cursor, obtaining that cursor through REST when the daemon snapshot has older messages. When new messages, streamed or read, push the oldest held ones out, paging back walks Factory's pages from the newest to find the cursor again. Explicit older-history reads wait for the requested REST pages. `CloudStreamMessages` filters snapshots through the same display-safe parser, bounds deltas, deduplicates canonical messages and tool calls, correlates results and protects longer live text from delayed REST pages. Events without `seq` take provisional positions and adopt Factory's canonical position when supplied. `cloudEntries` (`src/shared/cloud-thread.ts`) turns these messages into `ThreadEntry` values: a message's block *i* at `seq × 256 + 2i`, tool results filled into their calls, TodoWrite lists, thinking, text and error notices, with hidden context and system reminders omitted. `presentThread` builds the same rows for every client. A newly made session reads as an empty thread, and failed reads retain held messages. Stop is `worker.interrupt`; there is no Queue, Raw TTY or slash-command list. Hire dialogs send `worker.spawn` with `cloud: {computerId | environmentId, cwd?}` to the same hire as `POST /hire`.
+
+### CI automations
+
+The CI tab of the Factory window (`ui/factory-ci.ts`, mounted by `dashboard-factory.ts`, with a `Factory: CI` action in ⌘K) reads the `ci` slice, then `ciForFloor` in `src/shared/factory-ci.ts` keeps only this floor's repository (its `origin` remote, `owner/repo`, matched without case). It needs the Factory key like the other tabs (the window's own connect screen shows first). Workflows, runs and workflow pull requests in any other repository stay in the scan and off the view, including the add form, which writes only to this floor. With nothing left, `groupCi` is that one repository (still created when it has no workflows yet, so there's somewhere to add the first) and each workflow's latest run. A run belongs to a workflow by repository and file, or by name when it has no file. A floor with no GitHub origin shows that instead of anyone else's automations.
+
+`POST /automations/ci/edit` adds, changes or removes a Droid workflow by opening a pull request in the repository. Its body, found from its validation errors and the Factory web app:
+
+```json
+{
+  "action": "create",
+  "automationName": "Droid Code Review",
+  "factoryAutomationId": "<a new UUID>",
+  "modeId": "code-review",
+  "repos": [{ "repoFullName": "owner/repo", "filePath": ".github/workflows/droid-review.yml" }],
+  "changes": { "name": "Droid Code Review", "yamlParams": "automatic_review: true\n", "customPrompt": "", "schedule": "", "githubEvents": ["pull-request"] }
+}
+```
+
+- `action` is `create`, `edit` or `delete`; a delete needs only `repos`. Without `action` and a repository the answer is 400 "Provide action ("edit"|"delete"|"create") and at least one repo."; an edit without `changes` answers "Edit action requires a `changes` payload."
+- `yamlParams` are the droid-action's inputs, as YAML lines (`automatic_review`, `review_depth: deep|shallow`, `automatic_security_review`, `review_model`, `reasoning_effort`). A Droid job of your own has `customPrompt`, and its model and effort as `customCIModel` and `customCIReasoningEffort`. `schedule` is a 5-field cron or `''`; `githubEvents` are `pull-request`, `pr-opened`, `comment-added`, `push`, `label-change` and `checks-completed`.
+- Factory's file names: `droid-review.yml` for code review, `factory-<name in kebab case>.yml` for a job of your own (`droid-wiki-refresh.yml` and `deep-security-review.yml` for its wiki and security templates, which the office doesn't add).
+- The answer has one `sessions` entry per repository: `{repoFullName, sessionId, prUrl}` once it opened a PR, `message` when there was nothing to do (deleting a file that isn't there: "Automation deleted"), or `error` ("Invalid repo target" for a delete without `filePath`). It still answers 200 then; the office answers 422 with the error. Factory's YAML has `workflow_dispatch` always on and uses `Factory-AI/droid-action@main`.
+- The office checks every field before it goes (`ciEditProblem`): a GitHub `owner/repo`, a file under `.github/workflows/`, known events, a cron, and a model and effort that are one id each, since they go into the YAML as written. Factory changes only the files its own templates write, so the window offers Change for `droid-review.yml` and `factory-*.yml`, and Remove for any workflow.
+
+### Computers
+
+The Factory window's **Computers** tab (`src/client/ui/factory-computers.ts`; open it from the header's Factory glyph or the ⌘K palette) shows this machine (CPU, memory and disk now and recently, fed by `/api/machine`) and the fleet. The fleet's states are: not connected (how to connect), no access, reading, and the computers, with the last good list and its age when Factory is down or the key is rejected. Phases (`computerPhase` in `src/shared/factory-computers.ts`): *provisioning* (with `currentStep`), *error*, *waking* (a restart that resumed it, until its first sample), *asleep* (managed, no sample for 20 minutes) and *active*. Deleting a computer takes its name typed out, and the route checks it too. Factory's computer file upload and download endpoints are left out: the office has nothing to send a computer that a session can't fetch itself.
+
+### Environments
+
+An Environment is a recipe Factory builds and checks once: a base image (a *source*; the Factory default is Ubuntu with Node, Python, git, gh and Droid, as `factory-user` with sudo), the repositories it clones with an install script each, and a machine setup script. It runs nothing itself. A Droid Computer started from one is ready in about ten seconds with all of that in place, where a plain one clones and installs as it's made. So the two live side by side: Environments replace the old Cloud Templates, not Droid Computers.
+
+What the live tests showed:
+
+- A computer starts from an Environment through `POST /computers` with `source: {kind: 'environment', environmentId, isListed}`; `POST /sessions` takes only a `computerId`, so a session never starts on an Environment directly. An unlisted computer (`isListed: false`) is what Factory's web app starts for a session: it's in `GET /computers` only with `includeUnlisted=true`, and reads back with `computerSource: {kind: 'template', templateId: <environment id>}`.
+- One was active 11 seconds after it was made, through four steps: create the computer, configure the environment, configure credentials, start services. Deleting it answered 204, then 404.
+- Each repository is cloned at `/home/factory-user/repos/<name>` at the commit of the Environment's last build. Starting a computer doesn't pull, so its clone is as old as that build.
+- Saving a change to the repositories or the setup script starts a build (about two minutes for this repository); computers keep starting from the last good build until the new one passes. Factory validates a build by starting a computer from it and checking Droid, each repository, git and gh. A name is lower-case letters, digits and hyphens, 63 at most; a script is 10,000 characters at most.
+
+The `environments` feature (`src/server/factory/environments.ts`, shapes in `src/shared/factory-environments.ts`) reads the list every 5 minutes, every 20 seconds while one builds or the tab is open, and the source options every 30. `environmentPhase` says what the owner sees: *queued*, *building*, *ready*, *updating* (a new build while the last good one serves), *update failed* (it still serves the last good one), *failed* and *unavailable*. A build's log is read when asked, not broadcast. Its routes, under `/api/factory/environments`:
+
+| Route | Body or query | Does |
+| --- | --- | --- |
+| `POST ''` | `{name, scope, repositories: [{url, script?}], setupScript?, sourceId?, makeDefault?}` | Makes one (`makeDefault` is `makeOrganizationDefault`); Factory builds it |
+| `PUT /default` | `{environmentId}` | The organization's default |
+| `PATCH /:id` | `{name?, repositories?, setupScript?, sourceId?}` | Saves a change; a build when repositories or the script changed |
+| `DELETE /:id` | `{confirm}`, its name | Deletes it; computers already started from it keep running |
+| `POST /:id/rebuild`, `POST /:id/cancel` | | A new build of what's saved; stops the running one |
+| `GET /:id/log` | `?build=` | The log's last few thousand characters (`build-diagnostics`) |
+
+The computers feature reads with `includeUnlisted=true`: `items` stays the listed computers (the Computers tab's list), and `instances` holds the unlisted ones, with no metrics. The Computers tab has two views. **Computers** is the fleet (counts, a card per computer with its load, the computer secrets), each computer's detail with the Environment it came from, and **+ New computer**, which can start from an Environment. **Environments** is an overview of what each is for and every computer started from one, grouped by Environment, with the ones whose Environment was deleted flagged for deletion; each Environment's build, its stages and log (read every 5 seconds while it builds), the computers started from it, its scripts, and Rebuild, Stop build, Make default, Edit and Delete (its name typed out); and the form that makes or edits one.
+
+### Droid sessions
+
+`src/server/factory/sessions.ts`, `src/server/factory/credits.ts` and `src/shared/factory-sessions.ts`; shown by the Factory window's **Sessions** tab (`src/client/ui/factory-sessions.ts`), which is read-only.
+
+**Polling.** `GET /sessions?limit=50` every poll, and the page after it (`cursor`) every 10 minutes, so the slice has the last ~100. The list's `status` lags (a session that runs can read `idle` there), and it has no credits: both come from `GET /sessions/{id}`, read at most 24 times a poll, three at once. A session is read when the office hasn't yet, when the list's `updatedAt` passed the one it read, every 15 seconds while it runs or is pending, and every minute while its office worker works; running ones first, then the office's workers' (even ones past the list), then the newest. A failed read waits 2 minutes (a 404, 15) and doesn't fail the poll; a 401 does. Every per-read time is called `fetchedAt`, so a poll that read nothing new doesn't broadcast.
+
+**The slice** (`FactorySessionsState`): `items` (the list, each with what its own read said: `credits`, settings, a fresher `status` and its `fetchedAt`), `hasMore`, `fetchedAt`, `error`, `office` (every floor's workers, local and cloud, with a session, by session id: `workerId`, `name`, `floor`, `color`, `credits`; cloud workers come from `floor.everyone()`, since they aren't in the `WorkerManager`) and `credits` (the ledger's last 7 days, `today`, `week`, `since` and the 5 sessions that spent the most). `sessionCredits(slice, sessionId)` and `creditsNote(…)` ("⚡ 841k credits", or '') are what a worker's hint, row and terminal show.
+
+**The credits ledger** is the office's `.factory-flow/factory-credits.json` (written whole, temp file and rename): each session's total as last read, and per day what each total grew by. A session's first read puts all its credits on the day it was last active (`updatedAt`), and that part of the day is `guessed` (some of it may have been spent earlier); a day with a guessed part, or before `since` (when the office started counting), is `estimated`. The Sessions tab hatches the guessed part of each bar and puts ≈ on a total that has one. Kept 31 days; deleted when the office disconnects or takes another account's key.
+
+**Routes**, under `/api/factory/sessions`. Bodies are JSON; anything but a GET needs the office's own page or a paired phone.
+
+| Route | Body or query | Answers |
+| --- | --- | --- |
+| `GET ''` | `?limit=` (1-100), `?cursor=` | `{sessions, hasMore, nextCursor?}`: older sessions than the slice keeps |
+| `POST ''` | `{computerId, computerName?, cwd?, model?, reasoningEffort?, interactionMode?, autonomyLevel?, prompt?, images?}` | `{session, messageId?, status?, error?}`. Creates the session on that Factory computer (`POST /sessions`), then sends `prompt` (and `images`) as its first message. `error` says the session started but the message didn't go. Toasts "started a Droid session on …". |
+| `GET /:id` | | `{session, credits?}`, read fresh (and counted in the ledger) |
+| `PATCH /:id` | `{model?, reasoningEffort?, interactionMode?, autonomyLevel?}` | `{session}` |
+| `DELETE /:id` | | `{ok: true}`; it leaves the slice at once. Toasts. |
+| `GET /:id/messages` | `?limit=` (1-100, 30), `?cursor=`, `?role=user\|assistant\|tool` | `{messages, hasMore, nextCursor?}`: one page, **oldest first**; the first page is the newest, `nextCursor` goes back. System and hidden messages are left out. |
+| `POST /:id/messages` | `{text, images?: [{data, mediaType}]}` (base64, PNG/JPEG/GIF/WebP, at most 6, 16 MB in all) | `{messageId, status, queued?}`: `queued` when it was busy and the message waits for its turn to end. The session reads `running` until the next read says otherwise. |
+| `POST /:id/interrupt` | | `{status}` |
+| `GET /:id/children` | | `{sessions}`: its Task subagents |
+
+**Just-made sessions.** Factory 404s a session it has just made for a few seconds. Polls wait that out (a 404 for a session the office hasn't read yet waits 15 minutes in the Sessions feature, and a cloud worker's counts as gone only once it was read before or is 3 minutes old, `NEW_SESSION_GRACE_MS`). Writes and the routes' own reads go through `whileNew` (`new-session.ts`): for a session made in the last 30 seconds (`NEW_SESSION_MS`; by the office's clock when it made it, else its worker's `createdAt`, else Factory's `createdAt`), a 404 is tried again after 1, 2, 3 and 4 seconds before it counts. That covers changing its settings, its first and later messages, interrupting, `GET /:id` and deleting, in the Sessions routes and for cloud workers (their messages, Interrupt and sending one home). A 404 on deleting an older session means it's gone already, which is what was asked; on a just-made one that never turned up, the Sessions route answers 409 and asks to try again. The Thread shows *Starting on <computer>…* rather than an error while a just-made session 404s or lists no messages yet (`cloudStarting` in `src/client/thread-startup.ts`), and reads again every few seconds.
+
+Settings take the API's values (`SESSION_EFFORTS`, `SESSION_MODES`, `SESSION_AUTONOMY`); anything else is a 400. A message is `FactoryMessage {id, role, createdAt, seq?, blocks, isError?, model?}`, its `blocks` cut down by `messageOf`: `text`, `thinking`, `tool_use {id, name, input}`, `tool_result {toolUseId, text, isError, images?}`, `image {mediaType, data?}` (no `data` past 1.5 MB of base64) and `document {name}`; long text and outputs are cut, with a note. `sessionWebUrl(id)` is the session in the Factory web app (`https://app.factory.ai/sessions/<id>`, the pattern droid's own share command prints).
+
+**A session in a window.** A cloud worker's session is drawn by the companions' Thread (`mountWorkerThread` in `src/client/ui/worker-thread.ts`, and the Android app's Thread), fed by `thread.read` (see [Cloud workers](#cloud-workers)); there is no separate transcript component.
+
+## The pieces
+
+The work was built in three pieces. Where each now lives:
+
+- **Foundation.** The connection, the API client, `FactoryState`, the registry and its routes, the client store and fetch helper, Settings → Connections, this document and the guide's bullets.
+- **Computers, Sessions and AutoWiki.** The Factory glyph window with its Computers, AutoWiki, Files and Sessions tabs (see [Companion Factory window](#companion-factory-window)).
+- **Cloud workers.** A hire option that runs a worker's Droid session on a Factory computer (the Sessions API: create with model, effort, autonomy and folder, send a prompt, poll its status, interrupt). It takes a slot with a cloud badge; its pane is the Thread and its composer, not a terminal, in the companion and on Android.
+
+Rules every piece follows:
+
+- Match the codebase: comments that say why in plain sentences, its naming, Biome's format, and no new dependency unless it's truly needed.
+- Keep wiring into the big shared files (`src/client/dashboard.ts`, `src/shared/protocol.ts`, `src/server/server.ts`, `docs/guide/how-it-works.md`) small, one block per file where possible: the logic goes in the feature's own module, which exports one mount or register function.
+- Status and feedback on actions use the office's toasts and its windows' inline errors.
+- Windows use the UI kit and Factory look in `src/client/ui/AGENTS.md`: near-black panels, mono labels and the orange `#ee6018` accent, with green, amber and red load colors.
+- Tests are `tests/factory-<piece>.test.ts`, injecting `fetch` with answers copied from the real API. `npm run test:coverage` has floors, so new code needs real tests. Then check the piece in a clone of the owner's office against their real account (the `flow-clone` skill).
+- The guide gets a "What's inside" and a "How it works" bullet for what each piece builds, and this document stays current.
+- Prefer no new environment variable; `.env.example` lists any there is.

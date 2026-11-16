@@ -1,0 +1,541 @@
+package ai.factory.droidoffice.core
+
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.longOrNull
+
+// The Thread's presentation model as the office builds it (src/shared/thread-presentation.ts) and
+// sends it on every thread.snapshot. The office decides what a thread hides, groups and says; the
+// app only decodes these rows and renders them. Raw entries still come alongside: message and
+// thought text, tool arguments and results are read from the entry with the row's, block's or
+// action's id.
+
+enum class ActivityState(val wire: String) {
+    Working("working"),
+    Complete("complete"),
+    Incomplete("incomplete"),
+    Failed("failed"),
+    Cancelled("cancelled");
+
+    companion object {
+        fun of(wire: String?): ActivityState? = entries.firstOrNull { it.wire == wire }
+    }
+}
+
+enum class NoticeTone(val wire: String) {
+    Quiet("quiet"),
+    Danger("danger"),
+    Attachment("attachment");
+
+    companion object {
+        fun of(wire: String?): NoticeTone? = entries.firstOrNull { it.wire == wire }
+    }
+}
+
+enum class ThreadCardKind(val wire: String) {
+    Change("change"),
+    Command("command"),
+    Delegate("delegate");
+
+    companion object {
+        fun of(wire: String?): ThreadCardKind? = entries.firstOrNull { it.wire == wire }
+    }
+}
+
+enum class DiffLineKind(val wire: String) {
+    Hunk("hunk"),
+    Ctx("ctx"),
+    Add("add"),
+    Del("del"),
+    Note("note");
+
+    companion object {
+        fun of(wire: String?): DiffLineKind? = entries.firstOrNull { it.wire == wire }
+    }
+}
+
+enum class FileChangeKind(val wire: String) {
+    Added("added"),
+    Modified("modified"),
+    Deleted("deleted");
+
+    companion object {
+        fun of(wire: String?): FileChangeKind? = entries.firstOrNull { it.wire == wire }
+    }
+}
+
+data class ThreadDiffLine(
+    val kind: DiffLineKind,
+    val text: String,
+    val oldLine: Int? = null,
+    val newLine: Int? = null,
+)
+
+data class ThreadFileChange(
+    val path: String,
+    val shortPath: String,
+    val kind: FileChangeKind,
+    val additions: Int,
+    val deletions: Int,
+    val generated: Boolean,
+    val truncated: Boolean = false,
+    val lines: List<ThreadDiffLine> = emptyList(),
+    /** Whether the diff starts open: only a few small ones in the latest turn do. Null from an older office. */
+    val open: Boolean? = null,
+)
+
+data class ThreadCommandMeta(
+    val command: String,
+    val summary: String? = null,
+)
+
+data class ThreadDelegationMeta(
+    val agent: String,
+    val role: String? = null,
+    val summary: String,
+    val workerId: String? = null,
+    val workerName: String? = null,
+    val branch: String? = null,
+)
+
+/** Where an action's arguments are in its entry's input: a key of the JSON object, `.` for a JSON string, or the whole input. */
+data class ThreadArgumentsRef(val label: String, val field: String? = null) {
+    /** The text this points at in [input], as the office's `threadArgumentsText` reads it. */
+    fun text(input: String?): String {
+        val raw = input?.trim().orEmpty()
+        val key = field ?: return raw
+        // JSON.parse's rules: the app's lenient reader would take a bare word for a string.
+        val value = try {
+            Json.parseToJsonElement(raw)
+        } catch (_: Exception) {
+            return raw
+        }
+        val picked = if (key == ".") value else (value as? JsonObject)?.get(key)
+        return (picked as? JsonPrimitive)?.takeIf { it.isString }?.content?.trim() ?: raw
+    }
+}
+
+data class ThreadModelAction(
+    /** The tool entry's id: its arguments and result are that entry's input and output. */
+    val id: String,
+    val title: String,
+    val detail: String? = null,
+    val category: String,
+    val state: ActivityState,
+    /** The state in words beside the title, empty when it simply finished. */
+    val status: String,
+    val causedBy: String? = null,
+    val arguments: ThreadArgumentsRef? = null,
+    /** The heading over the output: Result, Error or Cancelled. */
+    val result: String,
+    val open: Boolean = false,
+    val card: ThreadCardKind? = null,
+    val changes: List<ThreadFileChange>? = null,
+    val command: ThreadCommandMeta? = null,
+    val delegation: ThreadDelegationMeta? = null,
+    /** The app's per-tool icon name (`ThreadToolIcon`): read, search, glob, list, web, link, terminal, edit, create, delete, patch, ask, plan, bot, skill, spec, image, memory, tool. */
+    val icon: String? = null,
+    /** The row's action words in the tool-label colour ("Read", "Edit 12 lines"); empty for an Execute, whose title is its summary. */
+    val verb: String? = null,
+    /** What the row acted on, in the tertiary colour: a path, pattern, URL, basename or the Execute summary. */
+    val subject: String? = null,
+    /** What a failed row says at its end ("Command failed", "Error editing file", "Error"). */
+    val failedLabel: String? = null,
+)
+
+/** How an Activity reads in the app's grouping, in order, covering every block of the row. */
+sealed interface ThreadSegment {
+    val id: String
+
+    /** Exploration tools and the thoughts between them under one summary row: "Explored" + "4 files, 2 searches". */
+    data class Explore(
+        override val id: String,
+        val blockIds: List<String>,
+        val actionIds: List<String>,
+        val action: String,
+        val details: String,
+        val providers: List<String> = emptyList(),
+        val live: Boolean,
+        val open: Boolean,
+    ) : ThreadSegment
+
+    /** A thought with no exploration beside it. */
+    data class Thought(val blockId: String) : ThreadSegment {
+        override val id get() = blockId
+    }
+
+    /** One tool row: an Execute, file change, fetch, subagent, question, spec or anything else. */
+    data class Tool(val blockId: String, val actionId: String) : ThreadSegment {
+        override val id get() = actionId
+    }
+
+    /** Executes whose summaries repeat: "S1 → S2" run [times] times. */
+    data class Repeat(override val id: String, val actionIds: List<String>, val summaries: List<String>, val times: Int, val live: Boolean, val open: Boolean) : ThreadSegment
+
+    /** Five or more subagent calls in a row: "Running|Ran <summary>" with how many settled and failed. */
+    data class Tasks(override val id: String, val actionIds: List<String>, val label: String, val settled: Int, val failed: Int, val live: Boolean, val open: Boolean) : ThreadSegment
+}
+
+data class ThreadFailure(val id: String, val title: String, val preview: String)
+
+/** Three or more tool cards in one Activity fold under one disclosure: the blocks from its first card to its last. */
+data class ThreadToolGroup(
+    /** `group:` + its first block's id. */
+    val id: String,
+    /** The blocks it folds, in order, always consecutive in the Activity's blocks. */
+    val blockIds: List<String>,
+    val label: String,
+    val state: ActivityState,
+    val live: Boolean,
+    val open: Boolean = false,
+    /** Files its finished change cards changed, counted once, and their lines. */
+    val files: Int = 0,
+    val additions: Int = 0,
+    val deletions: Int = 0,
+)
+
+data class ThreadTurnFile(val path: String, val shortPath: String, val additions: Int, val deletions: Int)
+
+/** What a finished turn changed, on its last message or Activity row. */
+data class ThreadTurnChanges(
+    /** Every file the turn's finished change cards changed, counted once. */
+    val count: Int,
+    val additions: Int,
+    val deletions: Int,
+    /** The first files it changed, in order. */
+    val files: List<ThreadTurnFile>,
+)
+
+data class PlanStep(val done: Boolean, val active: Boolean, val text: String)
+
+data class ActivePlan(
+    val steps: List<PlanStep>,
+    val done: Int,
+    val total: Int,
+    val current: String? = null,
+    val allDone: Boolean,
+    val stale: Boolean,
+)
+
+sealed interface ThreadBlock {
+    val id: String
+    val live: Boolean
+    val open: Boolean
+
+    data class Thought(override val id: String, val preview: String, override val live: Boolean, override val open: Boolean = false) : ThreadBlock
+
+    data class Tools(
+        override val id: String,
+        val label: String,
+        val state: ActivityState,
+        override val live: Boolean,
+        override val open: Boolean = false,
+        val card: ThreadCardKind? = null,
+        val actions: List<ThreadModelAction>,
+        /** The run's plan, only when it changed since the last one shown. */
+        val plan: List<PlanStep>? = null,
+    ) : ThreadBlock
+}
+
+/** [from] and [to] are the seqs of the first and last entry a row stands for, hidden ones included. */
+sealed interface ThreadRow {
+    val id: String
+    val from: Long
+    val to: Long
+    /** Every entry the row stands for. */
+    val sourceIds: List<String>
+
+    data class Message(
+        override val id: String,
+        override val from: Long,
+        override val to: Long,
+        val role: ThreadRole,
+        val startsTurn: Boolean,
+        val turnChanges: ThreadTurnChanges? = null,
+    ) : ThreadRow {
+        override val sourceIds get() = listOf(id)
+    }
+
+    data class Notice(override val id: String, override val from: Long, override val to: Long, val role: ThreadRole, val text: String, val tone: NoticeTone) : ThreadRow {
+        override val sourceIds get() = listOf(id)
+    }
+
+    data class Activity(
+        override val id: String,
+        override val from: Long,
+        override val to: Long,
+        override val sourceIds: List<String>,
+        val label: String,
+        val state: ActivityState,
+        val live: Boolean,
+        val open: Boolean = false,
+        /** Cancellation and missing-result counts, never tool-failure counts. */
+        val status: String? = null,
+        /** The newest working action's title while live. */
+        val running: String? = null,
+        val failed: List<ThreadFailure> = emptyList(),
+        val blocks: List<ThreadBlock> = emptyList(),
+        val groups: List<ThreadToolGroup> = emptyList(),
+        val turnChanges: ThreadTurnChanges? = null,
+        /** The app's grouping of [blocks]; empty from an office that sends only blocks and groups. */
+        val segments: List<ThreadSegment> = emptyList(),
+    ) : ThreadRow
+}
+
+/** `presentation` of a thread.snapshot. Rows are only read for a [version] this app knows. */
+data class ThreadPresentation(val version: Int, val rows: List<ThreadRow>) {
+    companion object {
+        /** The office's THREAD_MODEL_VERSION this app reads. */
+        const val VERSION = 1
+
+        /** Null when there is no presentation object at all: an office from before it. */
+        fun of(e: JsonElement?): ThreadPresentation? {
+            val o = e as? JsonObject ?: return null
+            val version = o.int("version") ?: 0
+            if (version != VERSION) return ThreadPresentation(version, emptyList())
+            return ThreadPresentation(version, (o["rows"] as? JsonArray)?.mapNotNull(::row).orEmpty())
+        }
+
+        /** A row with no id or seqs, or of a kind, role or tone this version doesn't have, is skipped. */
+        fun row(e: JsonElement): ThreadRow? {
+            val o = e as? JsonObject ?: return null
+            val id = o.str("id")?.takeIf { it.isNotEmpty() } ?: return null
+            val from = o.long("from") ?: return null
+            val to = o.long("to") ?: return null
+            return when (o.str("kind")) {
+                "message" -> ThreadRow.Message(
+                    id,
+                    from,
+                    to,
+                    ThreadRole.of(o.str("role")) ?: return null,
+                    o.bool("startsTurn") ?: false,
+                    (o["turnChanges"] as? JsonObject)?.let(::turnChanges),
+                )
+                "notice" -> ThreadRow.Notice(id, from, to, ThreadRole.of(o.str("role")) ?: return null, o.str("text").orEmpty(), NoticeTone.of(o.str("tone")) ?: return null)
+                "activity" -> ThreadRow.Activity(
+                    id = id,
+                    from = from,
+                    to = to,
+                    sourceIds = o.strings("sourceIds"),
+                    label = o.str("label").orEmpty(),
+                    state = ActivityState.of(o.str("state")) ?: return null,
+                    live = o.bool("live") ?: false,
+                    open = o.bool("open") ?: false,
+                    status = o.str("status"),
+                    running = o.str("running"),
+                    failed = (o["failed"] as? JsonArray)?.mapNotNull(::failure).orEmpty(),
+                    blocks = (o["blocks"] as? JsonArray)?.mapNotNull(::block).orEmpty(),
+                    groups = (o["groups"] as? JsonArray)?.mapNotNull(::group).orEmpty(),
+                    turnChanges = (o["turnChanges"] as? JsonObject)?.let(::turnChanges),
+                    segments = (o["segments"] as? JsonArray)?.mapNotNull(::segment).orEmpty(),
+                )
+                else -> null
+            }
+        }
+
+        private fun segment(e: JsonElement): ThreadSegment? {
+            val o = e as? JsonObject ?: return null
+            fun id() = o.str("id")?.takeIf { it.isNotEmpty() }
+            return when (o.str("kind")) {
+                "explore" -> ThreadSegment.Explore(
+                    id = id() ?: return null,
+                    blockIds = o.strings("blockIds"),
+                    actionIds = o.strings("actionIds"),
+                    action = o.str("action").orEmpty(),
+                    details = o.str("details").orEmpty(),
+                    providers = o.strings("providers"),
+                    live = o.bool("live") ?: false,
+                    open = o.bool("open") ?: false,
+                )
+                "thought" -> ThreadSegment.Thought(o.str("blockId")?.takeIf { it.isNotEmpty() } ?: return null)
+                "tool" -> ThreadSegment.Tool(
+                    o.str("blockId")?.takeIf { it.isNotEmpty() } ?: return null,
+                    o.str("actionId")?.takeIf { it.isNotEmpty() } ?: return null,
+                )
+                "repeat" -> ThreadSegment.Repeat(
+                    id = id() ?: return null,
+                    actionIds = o.strings("actionIds"),
+                    summaries = o.strings("summaries"),
+                    times = o.int("times") ?: 0,
+                    live = o.bool("live") ?: false,
+                    open = o.bool("open") ?: false,
+                )
+                "tasks" -> ThreadSegment.Tasks(
+                    id = id() ?: return null,
+                    actionIds = o.strings("actionIds"),
+                    label = o.str("label").orEmpty(),
+                    settled = o.int("settled") ?: 0,
+                    failed = o.int("failed") ?: 0,
+                    live = o.bool("live") ?: false,
+                    open = o.bool("open") ?: false,
+                )
+                else -> null
+            }
+        }
+
+        private fun group(e: JsonElement): ThreadToolGroup? {
+            val o = e as? JsonObject ?: return null
+            return ThreadToolGroup(
+                id = o.str("id")?.takeIf { it.isNotEmpty() } ?: return null,
+                blockIds = o.strings("blockIds"),
+                label = o.str("label").orEmpty(),
+                state = ActivityState.of(o.str("state")) ?: return null,
+                live = o.bool("live") ?: false,
+                open = o.bool("open") ?: false,
+                files = o.int("files") ?: 0,
+                additions = o.int("additions") ?: 0,
+                deletions = o.int("deletions") ?: 0,
+            )
+        }
+
+        private fun turnChanges(o: JsonObject): ThreadTurnChanges = ThreadTurnChanges(
+            count = o.int("count") ?: 0,
+            additions = o.int("additions") ?: 0,
+            deletions = o.int("deletions") ?: 0,
+            files = (o["files"] as? JsonArray)?.mapNotNull { e ->
+                val f = e as? JsonObject ?: return@mapNotNull null
+                val path = f.str("path") ?: return@mapNotNull null
+                ThreadTurnFile(path, f.str("shortPath") ?: path, f.int("additions") ?: 0, f.int("deletions") ?: 0)
+            }.orEmpty(),
+        )
+
+        private fun block(e: JsonElement): ThreadBlock? {
+            val o = e as? JsonObject ?: return null
+            val id = o.str("id")?.takeIf { it.isNotEmpty() } ?: return null
+            return when (o.str("kind")) {
+                "thought" -> ThreadBlock.Thought(id, o.str("preview").orEmpty(), o.bool("live") ?: false, o.bool("open") ?: false)
+                "tools" -> ThreadBlock.Tools(
+                    id = id,
+                    label = o.str("label").orEmpty(),
+                    state = ActivityState.of(o.str("state")) ?: return null,
+                    live = o.bool("live") ?: false,
+                    open = o.bool("open") ?: false,
+                    card = ThreadCardKind.of(o.str("card")),
+                    actions = (o["actions"] as? JsonArray)?.mapNotNull(::action).orEmpty(),
+                    plan = (o["plan"] as? JsonArray)?.mapNotNull(::step),
+                )
+                else -> null
+            }
+        }
+
+        private fun action(e: JsonElement): ThreadModelAction? {
+            val o = e as? JsonObject ?: return null
+            return ThreadModelAction(
+                id = o.str("id")?.takeIf { it.isNotEmpty() } ?: return null,
+                title = o.str("title").orEmpty(),
+                detail = o.str("detail"),
+                category = o.str("category") ?: "other",
+                state = ActivityState.of(o.str("state")) ?: return null,
+                status = o.str("status").orEmpty(),
+                causedBy = o.str("causedBy"),
+                arguments = (o["arguments"] as? JsonObject)?.let { a -> a.str("label")?.let { ThreadArgumentsRef(it, a.str("field")) } },
+                result = o.str("result") ?: "Result",
+                open = o.bool("open") ?: false,
+                card = ThreadCardKind.of(o.str("card")),
+                changes = (o["changes"] as? JsonArray)?.mapNotNull(::fileChange),
+                command = (o["command"] as? JsonObject)?.let(::commandMeta),
+                delegation = (o["delegation"] as? JsonObject)?.let(::delegationMeta),
+                icon = o.str("icon"),
+                verb = o.str("verb"),
+                subject = o.str("subject"),
+                failedLabel = o.str("failedLabel"),
+            )
+        }
+
+        private fun fileChange(e: JsonElement): ThreadFileChange? {
+            val o = e as? JsonObject ?: return null
+            val path = o.str("path") ?: return null
+            val shortPath = o.str("shortPath") ?: path
+            val kind = FileChangeKind.of(o.str("kind")) ?: return null
+            return ThreadFileChange(
+                path = path,
+                shortPath = shortPath,
+                kind = kind,
+                additions = o.int("additions") ?: 0,
+                deletions = o.int("deletions") ?: 0,
+                generated = o.bool("generated") ?: false,
+                truncated = o.bool("truncated") ?: false,
+                lines = (o["lines"] as? JsonArray)?.mapNotNull(::diffLine).orEmpty(),
+                open = o.bool("open"),
+            )
+        }
+
+        private fun diffLine(e: JsonElement): ThreadDiffLine? {
+            val o = e as? JsonObject ?: return null
+            val kind = DiffLineKind.of(o.str("kind")) ?: return null
+            val text = o.str("text") ?: return null
+            return ThreadDiffLine(
+                kind = kind,
+                text = text,
+                oldLine = o.int("oldLine"),
+                newLine = o.int("newLine"),
+            )
+        }
+
+        private fun commandMeta(o: JsonObject): ThreadCommandMeta? {
+            val command = o.str("command") ?: return null
+            return ThreadCommandMeta(
+                command = command,
+                summary = o.str("summary"),
+            )
+        }
+
+        private fun delegationMeta(o: JsonObject): ThreadDelegationMeta? {
+            val agent = o.str("agent") ?: return null
+            val summary = o.str("summary") ?: return null
+            return ThreadDelegationMeta(
+                agent = agent,
+                role = o.str("role"),
+                summary = summary,
+                workerId = o.str("workerId"),
+                workerName = o.str("workerName"),
+                branch = o.str("branch"),
+            )
+        }
+
+        private fun failure(e: JsonElement): ThreadFailure? {
+            val o = e as? JsonObject ?: return null
+            return ThreadFailure(o.str("id") ?: return null, o.str("title").orEmpty(), o.str("preview").orEmpty())
+        }
+
+        private fun step(e: JsonElement): PlanStep? {
+            val o = e as? JsonObject ?: return null
+            return PlanStep(o.bool("done") ?: false, o.bool("active") ?: false, o.str("text").orEmpty())
+        }
+
+        private fun JsonObject.str(k: String) = (this[k] as? JsonPrimitive)?.takeIf { it !is JsonNull && it.isString }?.content
+        private fun JsonObject.bool(k: String) = (this[k] as? JsonPrimitive)?.booleanOrNull
+        private fun JsonObject.long(k: String) = (this[k] as? JsonPrimitive)?.let { it.longOrNull ?: it.contentOrNull?.toDoubleOrNull()?.toLong() }
+        private fun JsonObject.int(k: String) = (this[k] as? JsonPrimitive)?.let { it.intOrNull ?: it.contentOrNull?.toDoubleOrNull()?.toInt() }
+        private fun JsonObject.strings(k: String) = (this[k] as? JsonArray)?.mapNotNull { (it as? JsonPrimitive)?.takeIf { p -> p.isString }?.content }.orEmpty()
+    }
+}
+
+/** Whether the office's presentation can be shown: when it can't, the thread says why and offers Raw TTY. */
+enum class ThreadSupport(
+    /** The state's heading, or null when the Thread can be read. */
+    val title: String?,
+    val message: String?,
+) {
+    Supported(null, null),
+    /** No presentation at all: the office predates it. */
+    OlderOffice("Update Factory Flow", "Update Factory Flow on your computer to read this Thread here. Raw TTY still works."),
+    /** A presentation version this app doesn't know. */
+    NewerOffice("Update the app", "Update the app to read this Thread. Raw TTY still works.");
+
+    companion object {
+        fun of(p: ThreadPresentation?): ThreadSupport = when {
+            p == null -> OlderOffice
+            p.version == ThreadPresentation.VERSION -> Supported
+            p.version > ThreadPresentation.VERSION -> NewerOffice
+            else -> OlderOffice
+        }
+    }
+}

@@ -1,0 +1,1141 @@
+import type { Net } from '../net';
+import { loadSettings, saveSettings, store } from '../state';
+import { SUBAGENT_MAX_PER_LEAD, type AgentChoice, type SubagentSettings } from '../../shared/protocol';
+import { SETTINGS_PANES, initialSettingsPane, searchSettings, settingsCards, settingsPaneAfter, settingsPanes, type SettingsCardTitle, type SettingsPane, type SettingsSurface } from '../../shared/settings-nav';
+import { claimEscape, h, openModal, timeAgo } from './dom';
+import { onJiraSetup } from './jira';
+import { onLinearSetup } from './linear';
+import { modelPicker } from './model-picker';
+import { AUTOPILOT_MAX, LINEAR_PICKUPS, type LinearPickup } from '../../shared/linear';
+import { disclosure, field, toggle as kitToggle } from './kit';
+import { agentFields, droidCatalogue, modelBadge, officeChoice, pickerModel } from './models';
+import { subagentModelPicker } from './subagent-models';
+import { openPromptEditor, rewrittenPrompts } from './prompts';
+import { factoryKeySettings } from './factory-settings';
+import { geminiSettings } from './gemini-settings';
+import { subscriptionsSettings } from './subscriptions-settings';
+import { droidSettings } from './droid-settings';
+import { hiddenModelSettings } from './hidden-models';
+import { workerLabelSettings } from './worker-labels';
+import { openHostUpdate } from './host-update';
+import { openPhone, pairedPhones } from './phone';
+import { companionState, openCompanion } from './companion';
+import { remoteMcpSettings } from './remote-mcp';
+import type { PairingState } from '../../shared/devices';
+import type { PairedDevice } from '../../shared/devices';
+import { INCLUDE_FILE, SETUP_FILE, describeSetup, parsePatterns } from '../../shared/worktree-setup';
+import { DEFAULT_ORCHESTRATOR_SETTINGS, type OrchestratorSettings } from '../../shared/mission-control';
+import { ORCHESTRATOR_MODEL_CHANGE, orchestratorStarted } from '../mission';
+import { newOrchestratorConversation } from './orchestrator';
+export type { SettingsPane };
+
+/** What a settings row holds besides its title: a description under it, a control on its right, and anything wide (a form, a picker) full width under the label. */
+interface RowParts {
+  desc?: Node | null;
+  control?: Node | null;
+  below?: Node[];
+}
+
+/** One setting as a row: its name and a description on the left, whatever sets it on the right. */
+const setting = (title: string, { desc, control, below = [] }: RowParts) =>
+  h('div.group-row', { class: below.length ? 'block' : '' }, h('div.group-label', {}, h('b', {}, title), desc), control ? h('div.setting-control', {}, control) : null, ...below);
+
+/** A card from SETTINGS_CARDS, so a setting can't show up without a category (and search can find it). */
+const card = (title: SettingsCardTitle, parts: RowParts) => setting(title, parts);
+
+/** Rows under an eyebrow, in one bordered block. */
+const group = (title: string | null, ...rows: Node[]) => h('div.settings-group', {}, title ? h('h4.group-title', {}, title) : null, h('div.group', {}, ...rows));
+
+/** Rows that only mean something with the row above them: indented under it, and hidden with it. */
+const nest = (...rows: Node[]) => h('div.group-nest', {}, ...rows);
+
+/** A setting's description, its text set by whoever paints it. */
+const desc = (text = '') => h('small', {}, text);
+
+/** Where Settings was last on each surface, so it opens there again. */
+const lastPanes: Partial<Record<SettingsSurface, SettingsPane>> = {};
+
+/** An on/off switch for one setting; `paint` sets it from `now`. */
+function toggle(label: string, now: () => boolean, pick: (on: boolean) => void) {
+  const el = kitToggle({
+    label,
+    bare: true,
+    onChange: (on) => {
+      if (on !== now()) pick(on);
+    },
+  });
+  return { el, paint: () => (el.input.checked = now()) };
+}
+
+/** A row of radio buttons for one setting; `paint` redraws it from `now`. */
+function radios<T>(label: string, options: readonly (readonly [T, string])[], now: () => T, pick: (value: T) => void) {
+  const row = h('div.seg', { role: 'radiogroup', 'aria-label': label });
+  const paint = () => {
+    const at = now();
+    row.replaceChildren(
+      ...options.map(([value, text]) =>
+        h(
+          'button.btn',
+          {
+            type: 'button',
+            role: 'radio',
+            'aria-checked': String(at === value),
+            class: at === value ? 'on' : '',
+            onclick: () => {
+              if (now() !== value) pick(value);
+            },
+          },
+          text,
+        ),
+      ),
+    );
+  };
+  return { row, paint };
+}
+
+/** A worker choice in words: "Droid on Opus 5.5 · High", or Droid's own default. */
+function choiceLabel(c: AgentChoice): string {
+  const badge = modelBadge(c.model, c.effort);
+  return badge ? `Droid on ${badge}` : 'Droid on its default model';
+}
+
+/** The Subagents settings as the office keeps them, without who set them. */
+function subagentSettings(): SubagentSettings {
+  const { officeMcp, on, worktree, maxPerLead, wakeLead, visits, denyTask, agent, models } = store.subagents;
+  return { officeMcp: officeMcp ?? true, on, worktree, maxPerLead, wakeLead, visits: visits ?? true, denyTask: denyTask ?? true, ...(agent ? { agent } : {}), ...(models?.length ? { models } : {}) };
+}
+
+export type SettingsOptions = {
+  /** Opens on this category instead of the last one, when the surface has it. */
+  first?: SettingsPane;
+  /** Scrolls to and highlights a specific setting row by its card title after opening. */
+  focusCard?: SettingsCardTitle;
+  /** Opens the hire window with a task to write the repository's worktree setup. */
+  hireForSetup?: () => void;
+  surface: 'companion' | 'mac-companion';
+};
+
+/** Linear and Jira settings reused by the companion. */
+function connectionRows(net: Net) {
+  // ---- Connections: Jira --------------------------------------------------------------------------
+  // Jira: the office's one account (a read-only token is enough), and the epic this floor's issue board shows.
+  const jiraSite = h('input.input', { type: 'text', placeholder: 'https://your-site.atlassian.net', 'aria-label': 'Jira Cloud site', spellcheck: 'false', autocomplete: 'off' }) as HTMLInputElement;
+  const jiraEmail = h('input.input', { type: 'email', placeholder: 'you@example.com', 'aria-label': 'Atlassian account email', spellcheck: 'false', autocomplete: 'off' }) as HTMLInputElement;
+  const jiraToken = h('input.input', { type: 'password', placeholder: 'Read-only is enough', 'aria-label': 'Atlassian API token', spellcheck: 'false', autocomplete: 'new-password' }) as HTMLInputElement;
+  const jiraConnect = h('button.btn.primary', { type: 'button' }, 'Connect') as HTMLButtonElement;
+  const jiraCancel = h('button.btn.ghost', { type: 'button' }, 'Cancel');
+  const jiraForm = h('div.stack.tight.jira-form', {}, field('Site', jiraSite), field('Account email', jiraEmail), field('API token', jiraToken), h('div.row', {}, jiraConnect, jiraCancel));
+  const jiraChange = h('button.btn.sm', { type: 'button' }, 'Change');
+  const jiraRemove = h('button.btn.sm.danger', { type: 'button' }, 'Remove');
+  const jiraActions = h('div.row', {}, jiraChange, jiraRemove);
+  const jiraNote = desc();
+  const jiraFail = h('p.note.bad', { role: 'alert' });
+  const epicInput = h('input.input', { type: 'text', placeholder: 'Epic key, e.g. EDP-168', 'aria-label': 'Jira epic for this floor', spellcheck: 'false', autocomplete: 'off' }) as HTMLInputElement;
+  const epicSave = h('button.btn', { type: 'button' }, 'Set epic') as HTMLButtonElement;
+  const epicRemove = h('button.btn.ghost', { type: 'button' }, 'Remove epic');
+  const epicRow = h('div.row.wrap', {}, h('div.input-group.grow', {}, epicInput, epicSave), epicRemove);
+  const epicNote = desc();
+  const epicFail = h('p.note.bad', { role: 'alert' });
+  const epicCard = card("This floor's Jira epic", { desc: epicNote, below: [epicRow, epicFail] });
+  let editingJira = false;
+  let jiraBusy: '' | 'connect' | 'epic' = '';
+  let jiraError = '';
+  let epicError = '';
+  const paintJira = () => {
+    const { connection, epic } = store.jira;
+    jiraForm.classList.toggle('hidden', !!connection && !editingJira);
+    jiraCancel.classList.toggle('hidden', !connection);
+    jiraActions.classList.toggle('hidden', !connection || editingJira);
+    jiraConnect.disabled = jiraBusy === 'connect';
+    jiraConnect.textContent = jiraBusy === 'connect' ? 'Checking…' : 'Connect';
+    jiraFail.classList.toggle('hidden', !jiraError);
+    jiraFail.textContent = jiraError;
+    jiraNote.textContent = connection
+      ? `Reading ${connection.site} as ${connection.name === connection.email ? connection.email : `${connection.name} (${connection.email})`}. The office only reads Jira; it never changes a ticket.`
+      : 'Connect with your site, email and an API token from https://id.atlassian.com/manage-profile/security/api-tokens (read:jira-work is enough). Each floor then picks its own epic.';
+    epicCard.classList.toggle('hidden', !connection || !store.floor);
+    epicRemove.classList.toggle('hidden', !epic);
+    epicSave.disabled = jiraBusy === 'epic';
+    epicSave.textContent = jiraBusy === 'epic' ? 'Checking…' : 'Set epic';
+    if (!epicInput.value && epic) epicInput.value = epic.key;
+    epicFail.classList.toggle('hidden', !epicError);
+    epicFail.textContent = epicError;
+    epicNote.textContent = epic
+      ? `This floor’s issue board has a Jira tab for ${epic.key}${epic.summary ? ` (“${epic.summary}”)` : ''}, in To Do, In Progress and Done.`
+      : 'Give this floor an epic and its issue board gets a Jira tab with the epic’s tickets.';
+  };
+  const offSetup = onJiraSetup((msg) => {
+    if (msg.step === 'connect') {
+      jiraBusy = '';
+      jiraError = msg.error ?? '';
+      if (msg.ok) {
+        editingJira = false;
+        jiraToken.value = '';
+      }
+    } else {
+      jiraBusy = '';
+      epicError = msg.error ?? '';
+    }
+    paintJira();
+  });
+  paintJira();
+  const connectJira = () => {
+    if (!jiraSite.value.trim()) return jiraSite.focus();
+    if (!jiraEmail.value.trim()) return jiraEmail.focus();
+    if (!jiraToken.value.trim()) return jiraToken.focus();
+    jiraBusy = 'connect';
+    jiraError = '';
+    net.send({ t: 'jira.connect', site: jiraSite.value.trim(), email: jiraEmail.value.trim(), token: jiraToken.value.trim() });
+    paintJira();
+  };
+  jiraConnect.addEventListener('click', connectJira);
+  jiraToken.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') connectJira();
+  });
+  jiraChange.addEventListener('click', () => {
+    editingJira = true;
+    jiraSite.value = store.jira.connection?.site ?? '';
+    jiraEmail.value = store.jira.connection?.email ?? '';
+    paintJira();
+    jiraToken.focus();
+  });
+  jiraCancel.addEventListener('click', () => {
+    editingJira = false;
+    jiraError = '';
+    jiraToken.value = '';
+    paintJira();
+  });
+  jiraRemove.addEventListener('click', () => {
+    if (confirm('Disconnect the office from Jira? Every floor’s Jira tab goes away until someone connects it again.')) net.send({ t: 'jira.disconnect' });
+  });
+  const saveEpic = () => {
+    const key = epicInput.value.trim();
+    if (!key) return epicInput.focus();
+    jiraBusy = 'epic';
+    epicError = '';
+    net.send({ t: 'jira.epic', key });
+    paintJira();
+  };
+  epicSave.addEventListener('click', saveEpic);
+  epicInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') saveEpic();
+  });
+  epicRemove.addEventListener('click', () => {
+    epicInput.value = '';
+    net.send({ t: 'jira.epic', key: '' });
+  });
+
+  const offJira = store.on('jira', paintJira);
+
+  // ---- Connections: Linear ------------------------------------------------------------------------
+  // Linear: the office's one workspace (a personal API key; workers move and write tickets with it), the
+  // team this floor's issue board shows and its workers take tickets from, and the floor's autopilot.
+  const linearKeyIn = h('input.input', { type: 'password', placeholder: 'lin_api_…', 'aria-label': 'Linear API key', spellcheck: 'false', autocomplete: 'new-password' }) as HTMLInputElement;
+  const linearConnect = h('button.btn.primary', { type: 'button' }, 'Connect') as HTMLButtonElement;
+  const linearCancel = h('button.btn.ghost', { type: 'button' }, 'Cancel');
+  const linearForm = h(
+    'div.stack.tight.jira-form',
+    {},
+    field('Personal API key', linearKeyIn, 'In Linear: Settings → Account → Security & access → Personal API keys. Full access lets workers move, write and comment on tickets.'),
+    h('div.row', {}, linearConnect, linearCancel),
+  );
+  const linearChange = h('button.btn.sm', { type: 'button' }, 'Change key');
+  const linearRemove = h('button.btn.sm.danger', { type: 'button' }, 'Remove');
+  const linearActions = h('div.row', {}, linearChange, linearRemove);
+  const linearNote = desc();
+  const linearFail = h('p.note.bad', { role: 'alert' });
+  const teamSelect = h('select.select', { 'aria-label': 'Linear team for this floor' }) as HTMLSelectElement;
+  const projectSelect = h('select.select', { 'aria-label': 'Linear project for this floor' }) as HTMLSelectElement;
+  const teamNote = desc();
+  const teamFail = h('p.note.bad', { role: 'alert' });
+  const teamCard = card("This floor's Linear team", { desc: teamNote, below: [h('div.row.wrap', {}, teamSelect, projectSelect), teamFail] });
+  const pilotNote = desc();
+  const pilotFail = h('p.note.bad', { role: 'alert' });
+  const pilotOn = toggle(
+    'Linear autopilot',
+    () => store.linear.autopilot.on,
+    (on) => net.send({ t: 'linear.autopilot', on }),
+  );
+  const PICKUP_LABEL: Record<LinearPickup, string> = { triage: 'Triage', backlog: 'Backlog', unstarted: 'Todo' };
+  const pickupRow = h('div.chips', { role: 'group', 'aria-label': 'States autopilot takes tickets from' });
+  const maxSelect = h('select.select', { 'aria-label': 'Most autopilot workers at once' }, ...Array.from({ length: AUTOPILOT_MAX }, (_, i) => h('option', { value: String(i + 1) }, String(i + 1)))) as HTMLSelectElement;
+  const existingOn = toggle(
+    'Older tickets too',
+    () => store.linear.autopilot.existing,
+    (existing) => net.send({ t: 'linear.autopilot', existing }),
+  );
+  const pilotModel = modelPicker({ label: 'Autopilot model', small: true, models: [], value: store.linear.autopilot.model ?? '', none: { label: 'Office default', note: 'What new workers start on' } });
+  let pilotModels = false;
+  const pilotCard = card('Linear autopilot', { desc: pilotNote, control: pilotOn.el });
+  const pilotOptions = nest(
+    setting('Takes tickets from', { desc: desc('Tickets waiting in these states get a worker. Todo is where a ticket you write lands.'), control: pickupRow }),
+    setting('At most', { desc: desc('Autopilot workers on this floor at once. The next ticket waits for one to finish.'), control: maxSelect }),
+    setting('Older tickets too', { desc: desc('Off: only tickets written after autopilot was turned on. On: everything already waiting, too.'), control: existingOn.el }),
+    setting('Model', { desc: desc('What autopilot workers run on.'), control: pilotModel.element }),
+    pilotFail,
+  );
+  let editingLinear = false;
+  let linearBusy = false;
+  let linearError = '';
+  let teamError = '';
+  let pilotError = '';
+  // Rebuilding a select's options closes it while open, so they're rebuilt only when they change.
+  let teamOptions = '';
+  let projectOptions = '';
+  const paintLinear = () => {
+    const { connection, setup, autopilot, working } = store.linear;
+    linearForm.classList.toggle('hidden', !!connection && !editingLinear);
+    linearCancel.classList.toggle('hidden', !connection);
+    linearActions.classList.toggle('hidden', !connection || editingLinear);
+    linearConnect.disabled = linearBusy;
+    linearConnect.textContent = linearBusy ? 'Checking…' : 'Connect';
+    linearFail.classList.toggle('hidden', !linearError);
+    linearFail.textContent = linearError;
+    linearNote.textContent = connection
+      ? `Working ${connection.workspace} as ${connection.name} (${connection.email}). Workers on every floor can read, move, write and comment on its tickets.`
+      : 'Connect a Linear workspace and each floor’s issue board gets a Linear tab. Workers take tickets, move them through In Progress, In Review and Done, and write new ones.';
+    const floored = !!connection && !!store.floor;
+    teamCard.classList.toggle('hidden', !floored);
+    const teams = connection?.teams ?? [];
+    const teamKey = JSON.stringify(teams.map((t) => [t.id, t.name, t.key]));
+    if (teamKey !== teamOptions) {
+      teamOptions = teamKey;
+      teamSelect.replaceChildren(h('option', { value: '' }, 'No team'), ...teams.map((t) => h('option', { value: t.id }, `${t.name} (${t.key})`)));
+    }
+    teamSelect.value = setup?.team.id ?? '';
+    const team = teams.find((t) => t.id === setup?.team.id);
+    const projectKey = JSON.stringify((team?.projects ?? []).map((p) => [p.id, p.name]));
+    if (projectKey !== projectOptions) {
+      projectOptions = projectKey;
+      projectSelect.replaceChildren(h('option', { value: '' }, 'Every project'), ...(team?.projects ?? []).map((p) => h('option', { value: p.id }, p.name)));
+    }
+    projectSelect.value = setup?.project?.id ?? '';
+    projectSelect.classList.toggle('hidden', !team?.projects.length);
+    teamFail.classList.toggle('hidden', !teamError);
+    teamFail.textContent = teamError;
+    teamNote.textContent = setup
+      ? `The issue board’s Linear tab shows ${setup.team.name}${setup.project ? `’s ${setup.project.name} project` : ''}. Tickets workers write land here too.`
+      : 'Pick the team whose tickets this floor’s workers take.';
+    pilotCard.classList.toggle('hidden', !floored || !setup);
+    pilotOptions.classList.toggle('hidden', !floored || !setup || !autopilot.on);
+    pilotOn.paint();
+    existingOn.paint();
+    pilotNote.textContent = autopilot.on
+      ? `On: every new ${setup?.team.key ?? ''} ticket in ${autopilot.pickup.map((p) => PICKUP_LABEL[p]).join(' or ')} gets a worker of its own, which takes it to a merged pull request. ${working} working now.`
+      : 'Every ticket you write gets a worker of its own, who moves it along and opens a pull request. Your only job is writing tickets.';
+    pickupRow.replaceChildren(
+      ...LINEAR_PICKUPS.map((p) => {
+        const on = autopilot.pickup.includes(p);
+        return h(
+          'button.chip',
+          {
+            type: 'button',
+            'aria-pressed': String(on),
+            class: on ? 'on' : '',
+            onclick: () => {
+              const next = on ? autopilot.pickup.filter((x) => x !== p) : [...autopilot.pickup, p];
+              pilotError = '';
+              net.send({ t: 'linear.autopilot', pickup: next });
+            },
+          },
+          PICKUP_LABEL[p],
+        );
+      }),
+    );
+    maxSelect.value = String(autopilot.max);
+    if (pilotModel.value() !== (autopilot.model ?? '')) pilotModel.set(autopilot.model ?? '');
+    pilotFail.classList.toggle('hidden', !pilotError);
+    pilotFail.textContent = pilotError;
+    if (autopilot.on && !pilotModels) {
+      pilotModels = true;
+      void droidCatalogue()
+        .then((c) => pilotModel.setModels(c.models.map(pickerModel), { label: 'Office default', note: 'What new workers start on' }))
+        .catch(() => (pilotModels = false));
+    }
+  };
+  const offLinearSetup = onLinearSetup((msg) => {
+    if (msg.step === 'connect') {
+      linearBusy = false;
+      linearError = msg.error ?? '';
+      if (msg.ok) {
+        editingLinear = false;
+        linearKeyIn.value = '';
+      }
+    } else if (msg.step === 'team') teamError = msg.error ?? '';
+    else if (msg.step === 'autopilot') pilotError = msg.error ?? '';
+    paintLinear();
+  });
+  const connectLinear = () => {
+    if (linearBusy) return;
+    if (!linearKeyIn.value.trim()) return linearKeyIn.focus();
+    linearBusy = true;
+    linearError = '';
+    net.send({ t: 'linear.connect', key: linearKeyIn.value.trim() });
+    paintLinear();
+  };
+  linearConnect.addEventListener('click', connectLinear);
+  linearKeyIn.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') connectLinear();
+  });
+  linearChange.addEventListener('click', () => {
+    editingLinear = true;
+    paintLinear();
+    linearKeyIn.focus();
+  });
+  linearCancel.addEventListener('click', () => {
+    editingLinear = false;
+    linearError = '';
+    linearKeyIn.value = '';
+    paintLinear();
+  });
+  linearRemove.addEventListener('click', () => {
+    if (confirm('Disconnect the office from Linear? Every floor’s Linear tab and autopilot stop until someone connects it again.')) net.send({ t: 'linear.disconnect' });
+  });
+  teamSelect.addEventListener('change', () => {
+    teamError = '';
+    teamFail.classList.add('hidden');
+    net.send({ t: 'linear.team', team: teamSelect.value });
+  });
+  projectSelect.addEventListener('change', () => {
+    teamError = '';
+    teamFail.classList.add('hidden');
+    net.send({ t: 'linear.team', team: teamSelect.value, project: projectSelect.value });
+  });
+  const sendAutopilot = (change: { max?: number; model?: string }) => {
+    pilotError = '';
+    pilotFail.classList.add('hidden');
+    net.send({ t: 'linear.autopilot', ...change });
+  };
+  maxSelect.addEventListener('change', () => sendAutopilot({ max: Number(maxSelect.value) }));
+  pilotModel.element.addEventListener('change', () => sendAutopilot({ model: pilotModel.value() }));
+  paintLinear();
+  const offLinear = store.on('linear', paintLinear);
+
+  return {
+    jira: group('Jira', card('Jira', { desc: jiraNote, below: [jiraForm, jiraFail, jiraActions] }), epicCard),
+    linear: group('Linear', card('Linear', { desc: linearNote, below: [linearForm, linearFail, linearActions] }), teamCard, pilotCard, pilotOptions),
+    dispose: () => {
+      offJira();
+      offSetup();
+      offLinear();
+      offLinearSetup();
+      pilotModel.close();
+    },
+  };
+}
+
+/**
+ * Phone & web: pairing Android, the web companion's links and paired browsers, and bots on Tailscale.
+ * The server restricts these controls to its own machine; switching remote access off keeps this page connected.
+ */
+function phoneRows(): Node[] {
+  // Factory Flow for Android: the pairing QR code is its own window, over this one.
+  const phoneOpen = h('button.btn.primary', { type: 'button' }, 'Pair a phone…');
+  const phoneStatus = h('span.setting-meta', {}, 'Checking for paired phones…');
+  const paintPhones = (list: PairedDevice[] | string) => {
+    if (typeof list === 'string') phoneStatus.textContent = list;
+    else if (!list.length) phoneStatus.textContent = 'No phones paired yet.';
+    else phoneStatus.textContent = `${list.length} paired: ${list.map((d) => `${d.name} (seen ${timeAgo(d.lastSeenAt)})`).join(', ')}.`;
+  };
+  void pairedPhones().then(paintPhones);
+  phoneOpen.addEventListener('click', () => openPhone(paintPhones));
+
+  // The web companion: /dashboard in a desktop browser. Its links and paired browsers are their own window.
+  const webOpen = h('button.btn.primary', { type: 'button' }, 'Links & browsers…');
+  const webStatus = h('span.setting-meta', {}, 'Checking the web companion…');
+  const paintWeb = (s: PairingState | string) => {
+    if (typeof s === 'string') webStatus.textContent = s;
+    else {
+      const n = s.devices.filter((d) => d.kind === 'browser').length;
+      webStatus.textContent = `${s.companion ? 'On' : 'Off'} · ${n ? `${n} browser${n === 1 ? '' : 's'} paired` : 'no browsers paired'} · ${s.local.replace(/^https?:\/\//, '')}/dashboard`;
+    }
+  };
+  void companionState().then(paintWeb);
+  webOpen.addEventListener('click', () => openCompanion(paintWeb));
+
+  // External bots on the owner's Tailscale devices, as workers with their own desks.
+  const remoteMcp = remoteMcpSettings();
+
+  return [
+    group(
+      null,
+      card('Factory Flow for Android', { desc: h('span.stack.tight', {}, desc('Hire, watch and prompt workers from your phone. A paired phone keeps working after restarts.'), phoneStatus), control: phoneOpen }),
+      card('Web companion', { desc: h('span.stack.tight', {}, desc('Your workers, their terminals and the Whiteboard in any desktop browser, at /dashboard.'), webStatus), control: webOpen }),
+      card('Tailscale MCP', {
+        desc: h('span.stack.tight', {}, desc('Bots on your own Tailscale devices, such as an OpenClaw agent, join as workers with their own desks through this MCP server.'), remoteMcp.meta),
+        control: remoteMcp.control,
+        below: [remoteMcp.panel],
+      }),
+    ),
+  ];
+}
+
+/**
+ * Settings: the categories down the side, the one picked on the right. `surface` decides which
+ * categories and settings there are (see SETTINGS_CARDS).
+ */
+export function openSettings(net: Net, opts: SettingsOptions) {
+  const { surface, first, hireForSetup } = opts;
+  const connections = connectionRows(net);
+  const shown = settingsPanes(surface);
+  // ---- Workers ------------------------------------------------------------------------------------
+  // Where a fresh worker starts: the latest main, or the branch the checkout is on.
+  const freshNote = desc();
+  const fresh = radios(
+    'Where fresh workers start',
+    [
+      [true, 'Latest floor branch'],
+      [false, 'Checkout’s branch'],
+    ] as const,
+    () => store.freshMain.on,
+    (on) => net.send({ t: 'freshMain.set', on }),
+  );
+  const paintFresh = () => {
+    fresh.paint();
+    freshNote.textContent = store.freshMain.on
+      ? 'From the latest floor branch: the repository default, unless the floor menu picks another. Subagents start where their lead says.'
+      : 'From the branch the checkout is on, unless the floor menu picks one. Subagents start where their lead says.';
+  };
+  paintFresh();
+
+  // The most workers the office runs at once, across every floor.
+  const limitInput = h('input.input.setting-number', { type: 'text', inputmode: 'numeric', 'aria-label': 'Most workers at once', spellcheck: 'false', autocomplete: 'off' }) as HTMLInputElement;
+  const limitSave = h('button.btn', { type: 'button' }, 'Set');
+  const limitClear = h('button.btn.ghost', { type: 'button' });
+  const limitRow = h('div.row', {}, h('div.input-group', {}, limitInput, limitSave), limitClear);
+  const limitNote = desc();
+  const paintLimit = () => {
+    const m = store.machine;
+    limitInput.placeholder = m.limit !== undefined ? String(m.limit) : m.ceiling ? `1 to ${m.ceiling}` : 'e.g. 6';
+    limitClear.textContent = m.ceiling ? `Back to ${m.ceiling}` : 'No limit';
+    limitClear.classList.toggle('hidden', !m.set);
+    limitNote.textContent =
+      m.limit === undefined ? `No limit: a worker for every free seat. ${m.workers} working now, across every floor.` : `At most ${m.limit} at once across every floor, shells included (${m.workers} now). Hiring past it is refused.`;
+  };
+  paintLimit();
+  const saveLimit = () => {
+    const n = Number(limitInput.value.trim());
+    if (!limitInput.value.trim() || !Number.isInteger(n) || n < 1) return limitInput.focus();
+    net.send({ t: 'machine.limit', limit: n });
+    limitInput.value = '';
+  };
+  limitSave.addEventListener('click', saveLimit);
+  limitInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') saveLimit();
+  });
+  limitClear.addEventListener('click', () => net.send({ t: 'machine.limit', limit: null }));
+
+  // Whether a worker whose pull request merged goes home by itself.
+  const leaveNote = desc();
+  const leave = radios(
+    'Workers whose pull request merged',
+    [
+      [true, 'Go home'],
+      [false, 'Stay'],
+    ] as const,
+    () => store.leaveOnMerge.on,
+    (on) => net.send({ t: 'leaveOnMerge.set', on }),
+  );
+  const paintLeave = () => {
+    leave.paint();
+    leaveNote.textContent = store.leaveOnMerge.on
+      ? 'Once idle with its terminal closed, a merged worker goes home and its worktree and branch are deleted. Uncommitted or unpushed work is kept.'
+      : 'A merged worker stays at its desk, outlined in purple, until you send it home.';
+  };
+  paintLeave();
+
+  // How new worktrees on this floor are made ready: the repository's own setup, the detected one, or the floor's.
+  const setupNote = desc();
+  const setupFail = h('p.note.bad', { role: 'alert' });
+  const setupCmd = h('input.input', { type: 'text', placeholder: 'npm ci', 'aria-label': 'Setup command', spellcheck: 'false', autocomplete: 'off' }) as HTMLInputElement;
+  const setupCopy = h('textarea.input', { rows: 3, placeholder: '/.env\n/.env.local', 'aria-label': 'Files to copy', spellcheck: 'false' }) as HTMLTextAreaElement;
+  const setupSave = h('button.btn.sm.primary', { type: 'button' }, 'Save');
+  const setupCancel = h('button.btn.sm.ghost', { type: 'button' }, 'Cancel');
+  const setupForm = h(
+    'div.stack.tight',
+    {},
+    field('Setup command', setupCmd, 'One command line, run in the new worktree in the worker’s terminal before the agent starts. Empty runs nothing.'),
+    field('Files to copy', setupCopy, 'Gitignore patterns of untracked files in the checkout to copy into the new worktree, one per line. Empty copies nothing.'),
+    h('div.row', {}, setupSave, setupCancel),
+  );
+  const setupHire = h('button.btn.sm', { type: 'button' }, 'Have a worker set it up…');
+  const setupActions = h('div.row.wrap', {}, setupHire);
+  /** Set here is picked but not saved yet. */
+  let setupDraft = false;
+  const setupMode = radios(
+    'Where the worktree setup comes from',
+    [
+      [false, 'Automatic'],
+      [true, 'This floor’s own'],
+    ] as const,
+    () => setupDraft || !!store.worktreeSetup?.override,
+    (own) => {
+      const st = store.worktreeSetup;
+      if (!own) {
+        setupDraft = false;
+        if (st?.override) net.send({ t: 'worktreeSetup.set', setup: null });
+        return paintSetup();
+      }
+      setupDraft = true;
+      setupCmd.value = st?.resolved.setup ?? '';
+      setupCopy.value = (st?.resolved.copy ?? []).join('\n');
+      paintSetup();
+      setupCmd.focus();
+    },
+  );
+  const paintSetup = () => {
+    const st = store.worktreeSetup;
+    const git = !!st?.git;
+    setupMode.paint();
+    setupMode.row.classList.toggle('hidden', !git);
+    setupActions.classList.toggle('hidden', !git || !hireForSetup);
+    const own = !!st?.override;
+    setupForm.classList.toggle('hidden', !git || !(setupDraft || own));
+    setupCancel.classList.toggle('hidden', !setupDraft || own);
+    const repoError = st?.repo && 'error' in st.repo ? st.repo.error : undefined;
+    setupFail.classList.toggle('hidden', !repoError);
+    setupFail.textContent = repoError ? `${repoError}. New worktrees go by the lockfiles until it’s fixed.` : '';
+    if (!st) {
+      setupNote.textContent = store.floor ? 'Reading this floor’s checkout…' : 'Switch to a floor to set up its worktrees.';
+      return;
+    }
+    if (!git) {
+      setupNote.textContent = 'This floor’s project isn’t a git checkout, so its workers don’t get worktrees.';
+      return;
+    }
+    const r = st.resolved;
+    const from =
+      r.setupFrom === 'office'
+        ? 'Set for this floor, in place of the repository’s.'
+        : r.setupFrom === 'repo' || r.copyFrom === 'repo'
+          ? `From ${SETUP_FILE}${st.include ? ` and ${INCLUDE_FILE}` : ''} in the repository.`
+          : r.setupFrom === 'detected'
+            ? `Detected from its lockfiles; commit a ${SETUP_FILE} to pin it.`
+            : `Nothing to install was detected; commit a ${SETUP_FILE} to say what runs.`;
+    setupNote.textContent = `On this floor, a new worktree ${describeSetup(r, (c) => `“${c}”`)}. ${from} The agent starts once it’s done, even if it fails.`;
+  };
+  paintSetup();
+  setupSave.addEventListener('click', () => {
+    setupDraft = false;
+    net.send({ t: 'worktreeSetup.set', setup: { setup: setupCmd.value.trim(), copy: parsePatterns(setupCopy.value) } });
+  });
+  setupCancel.addEventListener('click', () => {
+    setupDraft = false;
+    paintSetup();
+  });
+  setupHire.addEventListener('click', () => {
+    modal.close();
+    hireForSetup?.();
+  });
+  net.send({ t: 'worktreeSetup.get' });
+  const offWorktreeSetup = [
+    store.on('worktreeSetup', paintSetup),
+    store.on('floor', () => {
+      setupDraft = false;
+      paintSetup();
+      if (store.floor) net.send({ t: 'worktreeSetup.get' });
+    }),
+  ];
+
+  // Every prompt the office writes for workers, subagents and visits included, in one editor.
+  const promptsOpen = h('button.btn.sm', { type: 'button', onclick: () => openPromptEditor(net) }, 'Edit prompts…');
+  const promptsNote = desc();
+  const paintPrompts = () => {
+    const n = rewrittenPrompts();
+    promptsNote.textContent = `What the office tells workers for you: handoffs, reviews, subagent briefs, visits and the sign writer. ${n ? `${n} rewritten.` : 'All as the office wrote them.'}`;
+  };
+  paintPrompts();
+
+  // Worker labels: the form folds away; its summary says what they're doing now.
+  const workerLabels = workerLabelSettings(net);
+  const labels = disclosure('Configure', workerLabels.element);
+  const paintLabels = () => {
+    const s = store.workerLabels.settings;
+    const modelName = s.implementation === 'openai' ? (s.model.length > 28 ? `${s.model.slice(0, 27)}…` : s.model) : (modelBadge(s.model, undefined) ?? s.model);
+    labels.meta.textContent = s.on ? `On · ${modelName} · every ${s.intervalSeconds} s` : 'Off';
+  };
+  paintLabels();
+
+  // ---- Models -------------------------------------------------------------------------------------
+  // The worker a new one starts on when whoever starts it picks no model.
+  const agent = agentFields('office-agent', officeChoice());
+  let agentTouched = false;
+  agent.element.addEventListener('change', () => (agentTouched = true));
+  agent.element.addEventListener('input', () => (agentTouched = true));
+  const agentSave = h('button.btn.sm.primary', { type: 'button' }, 'Save');
+  const agentBack = h('button.btn.sm', { type: 'button' });
+  const agentActions = h('div.row', {}, agentSave, agentBack);
+  const agentNote = desc();
+  const paintAgent = () => {
+    const picked = store.prompts.agent;
+    agentBack.classList.toggle('hidden', !picked);
+    agentBack.textContent = `Back to ${store.project?.agentCmd.split(' ')[0].split(/[\\/]/).pop() ?? 'the --agent'}`;
+    if (!agentTouched) agent.set(officeChoice());
+    agentNote.textContent = `What a new worker runs when nobody picks a model.${picked ? '' : ' Now it’s the agent the office started with, on its own default model.'}`;
+  };
+  paintAgent();
+  agentSave.addEventListener('click', () => {
+    agentTouched = false;
+    net.send({ t: 'prompts.agent', choice: agent.choice() });
+  });
+  agentBack.addEventListener('click', () => {
+    agentTouched = false;
+    net.send({ t: 'prompts.agent', choice: null });
+  });
+
+  const modelVisibility = hiddenModelSettings(net);
+  const pickerModels = disclosure('Choose models', modelVisibility.element);
+  const paintPickerModels = () => {
+    const n = store.hiddenModels.length;
+    pickerModels.meta.textContent = n ? `${n} hidden` : 'All shown';
+  };
+  paintPickerModels();
+
+  // ---- Subagents & visits -------------------------------------------------------------------------
+  const subSet = (patch: Partial<SubagentSettings>) => net.send({ t: 'subagents.set', settings: { ...subagentSettings(), ...patch } });
+  const subOn = toggle(
+    'Subagents',
+    () => store.subagents.on,
+    (on) => subSet({ on }),
+  );
+  const subNote = desc();
+  const subSize = radios(
+    'Most subagents per lead',
+    Array.from({ length: SUBAGENT_MAX_PER_LEAD }, (_, i) => [i + 1, String(i + 1)] as const),
+    () => store.subagents.maxPerLead,
+    (maxPerLead) => subSet({ maxPerLead }),
+  );
+  const subSizeNote = desc();
+  const subTree = radios(
+    'Where subagents work',
+    [
+      [true, 'Own worktree'],
+      [false, 'Lead’s checkout'],
+    ] as const,
+    () => store.subagents.worktree,
+    (worktree) => subSet({ worktree }),
+  );
+  const subWake = radios(
+    'Waking the lead',
+    [
+      [true, 'Wake it'],
+      [false, 'Let it check'],
+    ] as const,
+    () => store.subagents.wakeLead,
+    (wakeLead) => subSet({ wakeLead }),
+  );
+  const subTask = radios(
+    'Droid’s Task tool',
+    [
+      [true, 'Refuse it'],
+      [false, 'Allow it'],
+    ] as const,
+    () => store.subagents.denyTask ?? true,
+    (denyTask) => subSet({ denyTask }),
+  );
+
+  // What a subagent runs when its lead doesn't say: every model droid lists.
+  const subFallback = () => store.subagents.agent ?? officeChoice();
+  const subAgent = agentFields('subagent-agent', subFallback());
+  let subAgentTouched = false;
+  subAgent.element.addEventListener('change', () => (subAgentTouched = true));
+  subAgent.element.addEventListener('input', () => (subAgentTouched = true));
+  const subAgentSave = h('button.btn.sm.primary', { type: 'button' }, 'Save');
+  const subAgentBack = h('button.btn.sm', { type: 'button' }, 'Use the default worker');
+  const subAgentNote = desc();
+  subAgentSave.addEventListener('click', () => {
+    subAgentTouched = false;
+    subSet({ agent: subAgent.choice() });
+  });
+  subAgentBack.addEventListener('click', () => {
+    subAgentTouched = false;
+    subSet({ agent: undefined });
+  });
+
+  const subModels = subagentModelPicker((models) => subSet({ models }));
+  const subModelsNote = desc();
+  const subModelsMore = disclosure('Choose models', subModels.element);
+
+  const officeMcp = toggle(
+    'Office MCP',
+    () => store.subagents.officeMcp ?? true,
+    (officeMcp) => subSet({ officeMcp }),
+  );
+  const visitsOn = toggle(
+    'Visits between workers',
+    () => store.subagents.visits ?? true,
+    (visits) => subSet({ visits }),
+  );
+  const visitsNote = desc();
+
+  const subOptions = nest(
+    card('Team size', { desc: subSizeNote, control: subSize.row }),
+    card('Where subagents work', { desc: desc('Own worktrees let subagents change files side by side, each on its own branch. A lead can still choose when hiring.'), control: subTree.row }),
+    card('Waking the lead', { desc: desc('When a subagent reports back, a resting lead is nudged to read it. A busy lead hears it as its turn ends, and carries on with it.'), control: subWake.row }),
+    card('Droid’s Task tool', {
+      desc: desc('Refused, a worker that reaches for Droid’s own Task subagents is told to hire with team_hire instead, so every helper gets a desk and a terminal you can watch. Workers pick a change up when they next start.'),
+      control: subTask.row,
+    }),
+    card('Subagent worker', { desc: subAgentNote, below: [subAgent.element, h('div.row', {}, subAgentSave, subAgentBack)] }),
+    card('Models leads can pick', { desc: subModelsNote, below: [subModelsMore] }),
+  );
+
+  const paintSubagents = () => {
+    const s = store.subagents;
+    for (const r of [officeMcp, subOn, subSize, subTree, subWake, subTask, visitsOn]) r.paint();
+    subOptions.classList.toggle('hidden', !s.on);
+    subNote.textContent = s.on
+      ? 'Any ordinary worker can hire with team_hire. Its subagents sit at nearby desks and report back, but cannot hire subagents of their own.'
+      : 'Hiring is refused. Subagents already working carry on and can still report back.';
+    subSizeNote.textContent = `Up to ${s.maxPerLead} per lead at once; the worker limit still counts each one.`;
+    if (!subAgentTouched) subAgent.set(subFallback());
+    subAgentBack.classList.toggle('hidden', !s.agent);
+    subAgentNote.textContent = s.agent
+      ? `Subagents start on ${choiceLabel(s.agent)} unless their lead chooses another model or effort.`
+      : `Subagents start on the default worker (${choiceLabel(officeChoice())}, Models → Default worker) unless their lead chooses another model or effort.`;
+    subModels.paint(s.models);
+    const n = s.models?.length ?? 0;
+    subModelsMore.meta.textContent = n ? `${n} picked` : 'Any model';
+    subModelsNote.textContent = n
+      ? `Leads choose from these ${n} by your notes and each model’s credit multiplier; hire refuses any other. The subagent worker is always allowed.`
+      : 'Leads may give a subagent any model. Pick some to limit them, with a note on what each is for.';
+    visitsNote.textContent =
+      (s.visits ?? true)
+        ? 'Workers you hired find each other with visit_roster, walk over, read each other’s screens, and tell, ask or hand off work. An urgent message cancels the other worker’s turn.'
+        : 'Visit tools are unavailable, and visits under way end.';
+  };
+  paintSubagents();
+
+  // ---- Orchestrator -------------------------------------------------------------------------------
+  const orcSettings = (): OrchestratorSettings => store.missionControl?.orchestrator.settings ?? DEFAULT_ORCHESTRATOR_SETTINGS;
+  const orcSet = (settings: OrchestratorSettings) => net.send({ t: 'orchestrator.set', settings });
+  const orcOn = toggle(
+    'Orchestrator',
+    () => orcSettings().on,
+    (on) => orcSet({ ...orcSettings(), on }),
+  );
+  const orcNote = desc();
+  const orcBlocked = h('p.note.warn.hidden', { role: 'status' });
+  const orcPicked = (): AgentChoice | undefined => {
+    const { model, effort } = orcSettings();
+    return model || effort ? { ...(model ? { model } : {}), ...(effort ? { effort } : {}) } : undefined;
+  };
+  const orcAgent = agentFields('orchestrator-agent', orcPicked() ?? officeChoice());
+  let orcTouched = false;
+  orcAgent.element.addEventListener('change', () => (orcTouched = true));
+  orcAgent.element.addEventListener('input', () => (orcTouched = true));
+  const orcSave = h('button.btn.sm.primary', { type: 'button' }, 'Save');
+  const orcBack = h('button.btn.sm', { type: 'button' }, 'Use the default worker');
+  const orcAgentNote = desc();
+  orcSave.addEventListener('click', () => {
+    orcTouched = false;
+    const { model, effort } = orcAgent.choice();
+    orcSet({ on: orcSettings().on, ...(model ? { model } : {}), ...(effort ? { effort } : {}) });
+  });
+  orcBack.addEventListener('click', () => {
+    orcTouched = false;
+    orcSet({ on: orcSettings().on });
+  });
+  const orcReset = h('button.btn.sm', { type: 'button', onclick: () => newOrchestratorConversation(net) }, 'New conversation…');
+  const orcResetNote = desc();
+  const orcBrief = h('button.btn.sm', { type: 'button', onclick: () => openPromptEditor(net, 'orchestrator.system') }, 'Edit brief…');
+  const orcOptions = nest(
+    card('Orchestrator model', { desc: orcAgentNote, below: [orcAgent.element, h('div.row', {}, orcSave, orcBack)] }),
+    card('New conversation', { desc: orcResetNote, control: orcReset }),
+    card('Orchestrator brief', { desc: desc('What the office tells the Orchestrator about its job and its tools. It reads a change the next time its session starts or resumes.'), control: orcBrief }),
+  );
+  const paintOrchestrator = () => {
+    const s = orcSettings();
+    const blocked = store.missionControl?.orchestrator.blocked;
+    // A page newer than the office it talks to (source hot reload before a restart): nothing here would take.
+    const missing = !store.missionControl;
+    orcOn.paint();
+    orcOn.el.classList.toggle('hidden', missing);
+    orcOptions.classList.toggle('hidden', missing || !s.on);
+    const note = () => {
+      if (missing) return 'This office has no Orchestrator yet: restart it to get one.';
+      if (s.on) return 'One agent for the whole building, at the top of Mission Control on every floor. Tell it what you want done; it hires workers on any floor, answers their questions and reports back.';
+      return 'Off: it’s hidden on every floor and its session stops. Workers it hired keep working and report to nobody.';
+    };
+    orcNote.textContent = note();
+    orcBlocked.textContent = s.on && blocked ? `It can’t start now: ${blocked}` : '';
+    orcBlocked.classList.toggle('hidden', !(s.on && blocked));
+    const picked = orcPicked();
+    if (!orcTouched) orcAgent.set(picked ?? officeChoice());
+    orcBack.classList.toggle('hidden', !picked);
+    orcAgentNote.textContent = `${picked ? `It runs on ${choiceLabel(picked)}.` : `It runs on the default worker (${choiceLabel(officeChoice())}, Models → Default worker).`} ${ORCHESTRATOR_MODEL_CHANGE}`;
+    const started = orchestratorStarted(store.missionControl);
+    orcReset.toggleAttribute('disabled', !started);
+    orcResetNote.textContent = started ? 'It forgets this conversation and starts fresh on your next prompt. Workers it hired keep working and stay on its team.' : 'No conversation yet. Its first prompt starts one.';
+  };
+  paintOrchestrator();
+
+  // ---- Connections --------------------------------------------------------------------------------
+  const droid = droidSettings(net);
+  const factoryKey = factoryKeySettings(net);
+  const gemini = geminiSettings(net);
+  const subscriptions = subscriptionsSettings(net);
+  const subscriptionGroup = group('Subscriptions', card('DroidProxy', subscriptions.proxy), card('Accounts', subscriptions.accounts), card('Models in Droid', subscriptions.models));
+  subscriptions.hideWhenUnsupported(subscriptionGroup);
+  const geminiGroup = group('Google AI', card('Gemini Decisions API', gemini.card));
+
+  // ---- Office & floors ----------------------------------------------------------------------------
+  // Where the Add floor window looks for existing git projects on the office's machine.
+  const dirInput = h('input.input', { type: 'text', placeholder: '~/Workspace', 'aria-label': 'Workspace folder', spellcheck: 'false', autocomplete: 'off' }) as HTMLInputElement;
+  const dirSave = h('button.btn', { type: 'button' }, 'Save');
+  const dirDefault = h('button.btn.ghost', { type: 'button' }, 'Use the default');
+  const dirRow = h('div.row.wrap', {}, h('div.input-group.grow', {}, dirInput, dirSave), dirDefault);
+  const dirNote = desc();
+  const paintDir = () => {
+    const { dir, custom } = store.projectsDir;
+    dirInput.value = dir;
+    dirDefault.classList.toggle('hidden', !custom);
+    dirNote.textContent = 'The Add floor window lists the git projects in this folder, up to four levels deep, and opens your pick as a floor right where it is. Nothing is cloned or copied.';
+  };
+  paintDir();
+  const saveDir = () => {
+    const dir = dirInput.value.trim();
+    if (!dir) return dirInput.focus();
+    if (dir !== store.projectsDir.dir) net.send({ t: 'floor.projectsDir', dir });
+  };
+  dirSave.addEventListener('click', saveDir);
+  dirInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') saveDir();
+  });
+  dirDefault.addEventListener('click', () => net.send({ t: 'floor.projectsDir', dir: '' }));
+
+  // ---- The panes ----------------------------------------------------------------------------------
+  const settings = loadSettings();
+  const rememberModels = kitToggle({
+    label: 'Remember models at desks',
+    checked: settings.rememberDeskModels,
+    onChange: (on) => {
+      settings.rememberDeskModels = on;
+      saveSettings(settings);
+    },
+  });
+  const panes: Partial<Record<SettingsPane, Node[]>> = {
+    workers: [
+      group(
+        'Hiring',
+        card('Where fresh workers start', { desc: freshNote, control: fresh.row }),
+        card('Worker limit', { desc: limitNote, control: limitRow }),
+        card('Workers whose pull request merged', { desc: leaveNote, control: leave.row }),
+      ),
+      group('Worktrees', card('Worktree setup', { desc: setupNote, control: setupMode.row, below: [setupFail, setupForm, setupActions] })),
+      group(
+        'Guidance',
+        card('Prompts', { desc: promptsNote, control: promptsOpen }),
+        card('Worker labels', { desc: desc('A task subject and a one-line summary over each local worker, written by a small model as it works.'), below: [labels] }),
+      ),
+    ],
+    models: [
+      group(
+        null,
+        card('Remember models at desks', { desc: desc('Remember the model and effort last used for each numbered worker slot.'), control: rememberModels }),
+        card('Default worker', { desc: agentNote, below: [agent.element, agentActions] }),
+        card('Models shown in pickers', { desc: desc('Hide the models you never use from every picker on desktop, web and Android. Running workers and saved defaults stay as they are.'), below: [pickerModels] }),
+      ),
+    ],
+    subagents: [
+      group(null, card('Office MCP', { desc: desc('Local Droid workers get the office’s tools for subagents, the Whiteboard and visits. Off: workers get no office tools.'), control: officeMcp.el })),
+      group('Subagents', card('Subagents', { desc: subNote, control: subOn.el }), subOptions),
+      group('Visits', card('Visits between workers', { desc: visitsNote, control: visitsOn.el })),
+    ],
+    orchestrator: [orcBlocked, group(null, card('Orchestrator', { desc: orcNote, control: orcOn.el }), orcOptions)],
+    connections: [group('Factory', card('Droid', droid.parts), card('Factory API key', factoryKey.key)), subscriptions.unsupported, subscriptionGroup, geminiGroup, connections.linear, connections.jira],
+    office: [
+      group(null, card('Workspace folder', { desc: dirNote, below: [dirRow] })),
+      group(
+        'App',
+        card('Host desktop app', {
+          desc: desc('Check for a signed update to the Mac app. Workers keep running while it restarts.'),
+          control: h('button.btn', { type: 'button', onclick: openHostUpdate }, 'Check for updates…'),
+        }),
+      ),
+    ],
+    ...(shown.some((p) => p.id === 'phone') ? { phone: phoneRows() } : {}),
+  };
+
+  // The categories down the side, grouped under Personal / Workers / Office, the one picked on the right.
+  // On a phone the row is across the top. The search at the top of the side finds a setting by name
+  // without knowing its category, and a pick jumps to its row and flashes it.
+  const searchInput = h('input.input.settings-search', { type: 'search', placeholder: 'Search settings…', 'aria-label': 'Search settings' }) as HTMLInputElement;
+  const results = h('section.settings-pane.settings-results', { 'aria-label': 'Search results' });
+  results.classList.add('hidden');
+  const nav = h('nav.settings-nav', { role: 'tablist', 'aria-label': 'Settings' }, h('div.settings-search-wrap', {}, searchInput));
+  const tabs = new Map<SettingsPane, HTMLButtonElement>();
+  const bodies = new Map<SettingsPane, HTMLElement>();
+  let navSection = '';
+  for (const p of shown) {
+    if (p.section !== navSection) {
+      navSection = p.section;
+      nav.append(h('div.settings-nav-section', { 'aria-hidden': 'true' }, p.section));
+    }
+    const tab = h(
+      'button.settings-tab',
+      { type: 'button', role: 'tab', id: `settings-tab-${p.id}`, 'aria-controls': `settings-pane-${p.id}`, onclick: () => show(p.id) },
+      h('span.icon', { 'aria-hidden': 'true' }, p.icon),
+      h('span', {}, p.label),
+    ) as HTMLButtonElement;
+    tabs.set(p.id, tab);
+    nav.append(tab);
+    bodies.set(
+      p.id,
+      h(
+        'section.settings-pane',
+        { role: 'tabpanel', id: `settings-pane-${p.id}`, 'aria-labelledby': `settings-tab-${p.id}` },
+        h('div.settings-head', {}, h('div.settings-head-row', {}, h('h3', {}, h('span.icon', { 'aria-hidden': 'true' }, p.icon), p.label), h('span.pill', {}, p.scope)), h('p', {}, p.blurb)),
+        ...(panes[p.id] ?? []),
+      ),
+    );
+  }
+  /** Each card's row, by its title, so a search pick can jump to it. Only rows the registry names count. */
+  const rowByTitle = new Map<string, { pane: SettingsPane; row: HTMLElement }>();
+  {
+    const known = new Set<string>(settingsCards(surface).map((c) => c.title));
+    for (const [pane, body] of bodies) {
+      for (const row of body.querySelectorAll<HTMLElement>('.group-row')) {
+        const title = row.querySelector(':scope > .group-label > b')?.textContent ?? '';
+        if (known.has(title) && !rowByTitle.has(title)) rowByTitle.set(title, { pane, row });
+      }
+    }
+  }
+  let flashTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Flashes a setting's row. One hidden with the setting it hangs off (Classic rows under Remastered, subagent options while they're off, the epic before Jira is connected) flashes that setting instead. */
+  const flashRow = (title: string) => {
+    const hit = rowByTitle.get(title);
+    if (!hit) return;
+    if (lastPane !== hit.pane) show(hit.pane);
+    let row = hit.row;
+    if (!row.getClientRects().length) {
+      // The row the nest hangs off is the nearest setting row before it (another nest, like HDR before Classic's, can sit between).
+      let parent = row.closest('.group-nest')?.previousElementSibling;
+      while (parent && !parent.matches('.group-row')) parent = parent.previousElementSibling;
+      row = parent instanceof HTMLElement && parent.getClientRects().length ? parent : (row.closest('.group')?.querySelector<HTMLElement>(':scope > .group-row') ?? row);
+    }
+    clearTimeout(flashTimer);
+    for (const el of bodies.get(hit.pane)?.querySelectorAll('.group-row.flash') ?? []) el.classList.remove('flash');
+    row.classList.add('flash');
+    row.scrollIntoView({ block: 'center' });
+    flashTimer = setTimeout(() => row.classList.remove('flash'), 2000);
+  };
+  const remembered = lastPanes[surface];
+  let lastPane = remembered && shown.some((p) => p.id === remembered) ? remembered : shown[0].id;
+  const show = (id: SettingsPane) => {
+    lastPane = lastPanes[surface] = id;
+    searchInput.value = '';
+    results.classList.add('hidden');
+    for (const [t, tab] of tabs) {
+      tab.classList.toggle('on', t === id);
+      tab.setAttribute('aria-selected', String(t === id));
+      tab.tabIndex = t === id ? 0 : -1;
+    }
+    for (const [t, body] of bodies) body.classList.toggle('hidden', t !== id);
+    const pane = bodies.get(id)!;
+    pane.scrollTop = 0;
+    // On a phone the categories are a row across the top that scrolls sideways.
+    tabs.get(id)!.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  };
+  const paintSearch = () => {
+    const query = searchInput.value.trim();
+    if (!query) return show(lastPane);
+    const hits = searchSettings(query, surface);
+    const paneLabel = new Map(SETTINGS_PANES.map((p) => [p.id, p]));
+    results.replaceChildren(
+      h(
+        'div.settings-head',
+        {},
+        h('h3', {}, 'Search results'),
+        h('p', {}, hits.length ? `${hits.length} setting${hits.length === 1 ? ' matches' : 's match'} “${query}”. Pick one to jump to it.` : `No settings match “${query}”. Try a setting's name, like ${'“Jira”, “models” or “Factory”'}.`),
+      ),
+      ...(hits.length
+        ? [
+            h(
+              'div.list.boxed.settings-hit-list',
+              {},
+              ...hits.map((hit) => {
+                const pane = paneLabel.get(hit.pane)!;
+                return h(
+                  'button.list-row.settings-hit',
+                  {
+                    type: 'button',
+                    onclick: () => {
+                      show(hit.pane);
+                      flashRow(hit.title);
+                    },
+                  },
+                  h('span.icon', { 'aria-hidden': 'true' }, pane.icon),
+                  h('span.list-main', {}, h('span.list-title', {}, hit.title), h('span.list-meta', {}, `${pane.section} · ${pane.label}`)),
+                );
+              }),
+            ),
+          ]
+        : []),
+    );
+    for (const tab of tabs.values()) {
+      tab.classList.remove('on');
+      tab.setAttribute('aria-selected', 'false');
+    }
+    for (const body of bodies.values()) body.classList.add('hidden');
+    results.classList.remove('hidden');
+    results.scrollTop = 0;
+  };
+  searchInput.addEventListener('input', paintSearch);
+  const offSearchEscape = claimEscape(searchInput, () => {
+    if (!searchInput.value) return false;
+    searchInput.value = '';
+    show(lastPane);
+    return true;
+  });
+  nav.addEventListener('keydown', (e) => {
+    const next = settingsPaneAfter(lastPane, e.key, surface);
+    if (!next) return;
+    e.preventDefault();
+    show(next);
+    tabs.get(next)!.focus();
+  });
+  const wide = window.matchMedia('(min-width: 721px)');
+  const orient = () => nav.setAttribute('aria-orientation', wide.matches ? 'vertical' : 'horizontal');
+  orient();
+  wide.addEventListener('change', orient);
+
+  const close = h('button.btn.close', { 'aria-label': 'Close' }, '✕');
+  const el = h('div.modal.xl.settings', { role: 'dialog', 'aria-label': 'Settings' }, h('header', {}, h('h2', {}, 'Settings'), close), h('div.split.settings-body', {}, nav, ...bodies.values(), results));
+  const offStore = [
+    store.on('leaveOnMerge', paintLeave),
+    store.on('freshMain', paintFresh),
+    store.on('machine', paintLimit),
+    store.on('projectsDir', paintDir),
+    store.on('prompts', paintAgent),
+    store.on('setup', paintAgent),
+    store.on('setup', paintSubagents),
+    store.on('prompts', paintPrompts),
+    store.on('prompts', paintSubagents),
+    store.on('subagents', paintSubagents),
+    store.on('missionControl', paintOrchestrator),
+    store.on('prompts', paintOrchestrator),
+    store.on('workerLabels', paintLabels),
+    store.on('hiddenModels', paintPickerModels),
+    ...offWorktreeSetup,
+  ];
+  const modal = openModal(el, {
+    onClose: () => {
+      offSearchEscape();
+      clearTimeout(flashTimer);
+      wide.removeEventListener('change', orient);
+      for (const off of offStore) off();
+      connections.dispose();
+      factoryKey.dispose();
+      gemini.dispose();
+      subscriptions.dispose();
+      droid.dispose();
+      modelVisibility.dispose();
+      subModels.dispose();
+      workerLabels.dispose();
+    },
+  });
+  show(initialSettingsPane({ surface, first, focusCard: opts.focusCard, remembered }));
+  if (opts.focusCard) flashRow(opts.focusCard);
+  close.addEventListener('click', () => modal.close());
+}

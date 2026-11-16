@@ -1,0 +1,345 @@
+package ai.factory.droidoffice.core
+
+import ai.factory.droidoffice.core.Markdown.Block
+import ai.factory.droidoffice.core.Markdown.Span
+import org.junit.Assert.assertEquals
+import org.junit.Test
+
+class MarkdownTest {
+    @Test
+    fun imagesOnTheirOwnLineAreImageBlocksAndInlineOnesShowTheirAltText() {
+        val src = "### 2. Cozy Cinema & Media Den\nA camel bouclé swivel chair.\n\n  ![Cozy Cinema and Media Den](/Users/dev/Pictures/chaise-room-designs/02-cozy-media-den.png)\n" +
+            "![plan](<docs/my plan.png> \"Plan\")\nSee ![the chart](docs/chart.png) here."
+        val blocks = Markdown.parse(src, paths = true, math = true)
+        assertEquals(Block.Image("Cozy Cinema and Media Den", "/Users/dev/Pictures/chaise-room-designs/02-cozy-media-den.png"), blocks[2])
+        assertEquals(Block.Image("plan", "docs/my plan.png"), blocks[3])
+        assertEquals("See the chart here.", (blocks[4] as Block.Paragraph).spans.joinToString("") { it.text })
+    }
+
+    @Test
+    fun localImagePathMatchesTheWebThread() {
+        assertEquals("/Users/dev/Pictures/chaise-room-designs/02-cozy-media-den.png", Markdown.localImagePath("/Users/dev/Pictures/chaise-room-designs/02-cozy-media-den.png"))
+        assertEquals("~/Pictures/a b.png", Markdown.localImagePath(" <~/Pictures/a b.png> "))
+        assertEquals("docs/chart.svg", Markdown.localImagePath("docs/chart.svg"))
+        assertEquals("/tmp/shot 1+2.png", Markdown.localImagePath("file:///tmp/shot%201+2.png"))
+        assertEquals("/tmp/a.png", Markdown.localImagePath("file://localhost/tmp/a.png"))
+        for (web in listOf("https://example.com/a.png", "http://192.168.1.2:4700/a.png", "data:image/png;base64,AAAA", "blob:abc", "//cdn.example.com/a.png", "#top", "", "bad%E0%A4%A.png")) {
+            assertEquals(web, null, Markdown.localImagePath(web))
+        }
+    }
+    @Test
+    fun linksWorkspacePathsOnlyWhenAsked() {
+        val src = "Fixed `src/app.ts:12` and android/app/build.gradle.kts:4, see [docs](https://x.dev/src/a.ts) and `package.json`."
+        assertEquals(null, Markdown.parse(src).flatMap { (it as Block.Paragraph).spans }.firstOrNull { it.file != null })
+        val spans = (Markdown.parse(src, paths = true).single() as Block.Paragraph).spans
+        val files = spans.filter { it.file != null }
+        assertEquals(listOf("src/app.ts:12", "package.json"), files.map { it.text })
+        assertEquals(WorkspacePaths.Ref("src/app.ts", 12), files[0].file)
+        assertEquals(true, files[0].code)
+        assertEquals(WorkspacePaths.Ref("package.json"), files[1].file)
+        assertEquals(null, spans.first { it.text.contains("android/app/build.gradle.kts") }.file)
+        assertEquals(null, spans.first { it.link != null }.file)
+        assertEquals(src.replace("`", "").replace("[docs](https://x.dev/src/a.ts)", "docs"), spans.joinToString("") { it.text })
+    }
+
+    @Test
+    fun inlineCodePathsMatchFactoryDetection() {
+        val src = "Open `/Users/me/a file.ts:12:4`, `FooBar.ts`, `foo.ts` and [local](file:///tmp/a%20b.ts:3)."
+        val spans = (Markdown.parse(src, paths = true).single() as Block.Paragraph).spans
+        val files = spans.filter { it.file != null }
+        assertEquals(listOf("/Users/me/a file.ts:12:4", "foo.ts", "local"), files.map { it.text })
+        assertEquals(WorkspacePaths.Ref("/Users/me/a file.ts", 12), files[0].file)
+        assertEquals(WorkspacePaths.Ref("foo.ts"), files[1].file)
+        assertEquals(WorkspacePaths.Ref("/tmp/a b.ts", 3), files[2].file)
+        assertEquals(null, spans.first { it.text == "FooBar.ts" }.file)
+    }
+
+    @Test
+    fun linksPathsInListsQuotesHeadingsAndTables() {
+        val blocks = Markdown.parse("# `src/a.ts`\n- `src/b.ts:3`\n> `src/c.ts`\n\n| f |\n|---|\n| `src/d.ts` |", paths = true)
+        assertEquals("src/a.ts", (blocks[0] as Block.Heading).spans.single().file?.path)
+        assertEquals(WorkspacePaths.Ref("src/b.ts", 3), (blocks[1] as Block.Item).spans.single().file)
+        assertEquals("src/c.ts", (blocks[2] as Block.Quote).spans.single().file?.path)
+        assertEquals("src/d.ts", (blocks[3] as Block.Table).rows[0][0].single().file?.path)
+    }
+    @Test
+    fun blocks() {
+        val md = """
+            # Title
+            Some text
+            on two lines.
+
+            - one
+              - nested
+            1. first
+            - [x] done
+            - [ ] todo
+            > quoted
+            ---
+            ```kotlin
+            val x = 1
+            ```
+            | a | b |
+            |---|---|
+        """.trimIndent()
+        val blocks = Markdown.parse(md)
+        assertEquals(Block.Heading(1, listOf(Span("Title"))), blocks[0])
+        assertEquals(Block.Paragraph(listOf(Span("Some text on two lines."))), blocks[1])
+        assertEquals(Block.Item("•", 0, listOf(Span("one"))), blocks[2])
+        assertEquals(Block.Item("•", 1, listOf(Span("nested"))), blocks[3])
+        assertEquals(Block.Item("1.", 0, listOf(Span("first"))), blocks[4])
+        assertEquals(Block.Item("•", 0, listOf(Span("done")), checked = true), blocks[5])
+        assertEquals(Block.Item("•", 0, listOf(Span("todo")), checked = false), blocks[6])
+        assertEquals(Block.Quote(listOf(Span("quoted"))), blocks[7])
+        assertEquals(Block.Rule, blocks[8])
+        assertEquals(Block.Code("val x = 1", "kotlin"), blocks[9])
+        assertEquals(Block.Table(listOf(Markdown.Align.None, Markdown.Align.None), listOf(listOf(Span("a")), listOf(Span("b"))), emptyList(), "| a | b |\n|---|---|"), blocks[10])
+        assertEquals(11, blocks.size)
+    }
+
+    @Test
+    fun aTableHasItsColumnsAlignmentAndInlineStyles() {
+        val md = """
+            Before
+            | Script | Does | Size |
+            |:--|:-:|--:|
+            | `build:client` | **Builds** the [client](https://x.dev) | 12 |
+            | lint | *checks* | 3 |
+            After
+        """.trimIndent()
+        val blocks = Markdown.parse(md)
+        assertEquals(Block.Paragraph(listOf(Span("Before"))), blocks[0])
+        val t = blocks[1] as Block.Table
+        assertEquals(listOf(Markdown.Align.Left, Markdown.Align.Center, Markdown.Align.Right), t.align)
+        assertEquals(listOf(listOf(Span("Script")), listOf(Span("Does")), listOf(Span("Size"))), t.header)
+        assertEquals(listOf(Span("build:client", code = true)), t.rows[0][0])
+        assertEquals(listOf(Span("Builds", bold = true), Span(" the "), Span("client", link = "https://x.dev")), t.rows[0][1])
+        assertEquals(listOf(Span("checks", italic = true)), t.rows[1][1])
+        // A row ends the table at the first line without a pipe.
+        assertEquals(Block.Paragraph(listOf(Span("After"))), blocks[2])
+        assertEquals(3, blocks.size)
+    }
+
+    @Test
+    fun escapedPipesAndPipesInCodeStayInTheirCell() {
+        val t = Markdown.parse("a | b\n--- | ---\n`x || y` | one \\| two").single() as Block.Table
+        assertEquals(listOf(Span("x || y", code = true)), t.rows[0][0])
+        assertEquals(listOf(Span("one | two")), t.rows[0][1])
+        assertEquals(listOf("a", "b"), Markdown.cells("| a | b |"))
+        assertEquals(listOf("a \\| b", "c"), Markdown.cells("| a \\| b | c |"))
+        // An unclosed backtick is a plain character, so the pipe after it still splits.
+        assertEquals(listOf("`a", "b"), Markdown.cells("`a | b"))
+    }
+
+    @Test
+    fun shortRowsArePaddedAndLongRowsWidenTheTable() {
+        val t = Markdown.parse("| a | b |\n|---|---|\n| 1 |\n| 1 | 2 | 3 |").single() as Block.Table
+        assertEquals(3, t.align.size)
+        assertEquals(listOf(listOf(Span("a")), listOf(Span("b")), emptyList()), t.header)
+        assertEquals(listOf(listOf(Span("1")), emptyList(), emptyList()), t.rows[0])
+        assertEquals(listOf(listOf(Span("1")), listOf(Span("2")), listOf(Span("3"))), t.rows[1])
+    }
+
+    @Test
+    fun malformedPipeRowsStayAsTheirOwnText() {
+        // No delimiter row.
+        assertEquals(listOf(Block.Code("| a | b |\n| 1 | 2 |")), Markdown.parse("| a | b |\n| 1 | 2 |"))
+        // A delimiter with a different number of columns than the header.
+        assertEquals(listOf(Block.Code("| a | b |\n|---|\n| 1 | 2 |")), Markdown.parse("| a | b |\n|---|\n| 1 | 2 |"))
+        // Not dashes.
+        assertEquals(listOf(Block.Code("| a | b |\n| x | y |")), Markdown.parse("| a | b |\n| x | y |"))
+        // A prose line with a pipe and no table under it is still prose.
+        assertEquals(listOf(Block.Paragraph(listOf(Span("use a | b here")))), Markdown.parse("use a | b here"))
+    }
+
+    @Test
+    fun aTableInsideAFenceIsCode() {
+        val md = "```\n| a | b |\n|---|---|\n```\n| c | d |\n|---|---|\n```\nx\n```"
+        val blocks = Markdown.parse(md)
+        assertEquals(Block.Code("| a | b |\n|---|---|"), blocks[0])
+        assertEquals(Block.Table(listOf(Markdown.Align.None, Markdown.Align.None), listOf(listOf(Span("c")), listOf(Span("d"))), emptyList(), "| c | d |\n|---|---|"), blocks[1])
+        assertEquals(Block.Code("x"), blocks[2])
+        assertEquals(3, blocks.size)
+    }
+
+    @Test
+    fun anUnclosedFenceKeepsTheRestAsCode() {
+        assertEquals(listOf(Block.Code("a\nb", open = true)), Markdown.parse("```\na\nb"))
+    }
+
+    @Test
+    fun alertsMathFencesAndTableSource() {
+        val blocks = Markdown.parse(
+            "> [!WARNING] Custom title\n> First **paragraph**\n>\n> Second paragraph\n\n```math\n\\sum_{i=1}^{n} i\n```\n\n| a |\n|---|\n| 1 |",
+        )
+        assertEquals(
+            Block.Alert(
+                Markdown.AlertKind.Warning,
+                "Custom title",
+                listOf(listOf(Span("First "), Span("paragraph", bold = true)), listOf(Span("Second paragraph"))),
+            ),
+            blocks[0],
+        )
+        assertEquals(Block.Math("\\sum_{i=1}^{n} i", "```math\n\\sum_{i=1}^{n} i\n```"), blocks[1])
+        assertEquals("| a |\n|---|\n| 1 |", (blocks[2] as Block.Table).raw)
+        assertEquals(Block.Code("x", "math", open = true), Markdown.parse("```math\nx").single())
+        assertEquals(Block.Quote(listOf(Span("[!UNKNOWN] ordinary quote continued"))), Markdown.parse("> [!UNKNOWN] ordinary quote\n> continued").single())
+    }
+
+    @Test
+    fun inlineStyles() {
+        assertEquals(
+            listOf(Span("a "), Span("b", bold = true), Span(" "), Span("c", italic = true), Span(" "), Span("d", code = true), Span(" "), Span("e", strike = true)),
+            Markdown.inline("a **b** *c* `d` ~~e~~"),
+        )
+        assertEquals(listOf(Span("see "), Span("docs", link = "https://x.dev/a")), Markdown.inline("see [docs](https://x.dev/a)"))
+        assertEquals(listOf(Span("at "), Span("https://x.dev/a", link = "https://x.dev/a"), Span(".")), Markdown.inline("at https://x.dev/a."))
+        assertEquals(listOf(Span("a "), Span("b ", italic = true), Span("c", italic = true, bold = true)), Markdown.inline("a *b **c***"))
+    }
+
+    @Test
+    fun codeAndIdentifiersAreLeftAlone() {
+        assertEquals(listOf(Span("snake_case_name and 2 * 3 * 4")), Markdown.inline("snake_case_name and 2 * 3 * 4"))
+        assertEquals(listOf(Span("**not bold")), Markdown.inline("**not bold"))
+        assertEquals(listOf(Span("a*b", code = true)), Markdown.inline("`a*b`"))
+        assertEquals(listOf(Span("*literal*")), Markdown.inline("\\*literal\\*"))
+        assertEquals(listOf(Span("[x](javascript:alert(1))")), Markdown.inline("[x](javascript:alert(1))"))
+    }
+
+    @Test
+    fun tableCellsBreakOnlyBetweenWordsNeverInsideCode() {
+        val cell = Markdown.inline("Run `node --test tests/*.test.ts` then **check** it")
+        val pieces = Markdown.unbroken(cell)
+        assertEquals(listOf("Run ", "node --test tests/*.test.ts ", "then ", "check ", "it"), pieces.map { p -> p.joinToString("") { it.text } })
+        assertEquals(cell.joinToString("") { it.text }, pieces.flatten().joinToString("") { it.text })
+        assertEquals(Span("node --test tests/*.test.ts", code = true), pieces[1][0])
+        assertEquals(listOf(listOf(Span("a/b/c", code = true), Span("d"))), Markdown.unbroken(listOf(Span("a/b/c", code = true), Span("d"))))
+        assertEquals(emptyList<List<Span>>(), Markdown.unbroken(emptyList()))
+    }
+
+    @Test
+    fun emailAndSuggestionFencesStayPlainCodeBlocksLikeTheTui() {
+        val md = """
+            Draft ready:
+            ```email
+            To: Alice <alice@example.com>
+            Subject: Thread V3 Android Parity
+
+            Hi team,
+
+            Android parity is green!
+            ```
+            ```suggestion
+            val improved = true
+            ```
+        """.trimIndent()
+        val blocks = Markdown.parse(md)
+        assertEquals(3, blocks.size)
+        assertEquals(
+            Block.Code("To: Alice <alice@example.com>\nSubject: Thread V3 Android Parity\n\nHi team,\n\nAndroid parity is green!", "email"),
+            blocks[1],
+        )
+        assertEquals(Block.Code("val improved = true", "suggestion"), blocks[2])
+    }
+
+    @Test
+    fun extractsJsonRenderWidgetsOutsideCodeAndHandlesStreamingAndCycles() {
+        val widgetJson = """{"root":"root","elements":{
+            "root":{"type":"Card","props":{"title":"Build Summary","padding":"md"},"children":["row","bar","spark","tbl","lst","call","tl","div","nl","sp"]},
+            "row":{"type":"Box","props":{"flexDirection":"row","gap":2,"borderStyle":"dashed"},"children":["h","txt","kv","st","bdg","met","prog"]},
+            "h":{"type":"Heading","props":{"text":"Metrics","level":2},"children":[]},
+            "txt":{"type":"Text","props":{"text":"All green","bold":true,"color":"success"},"children":[]},
+            "kv":{"type":"KeyValue","props":{"label":"Tests","value":142},"children":[]},
+            "st":{"type":"StatusLine","props":{"text":"Healthy","status":"success"},"children":[]},
+            "bdg":{"type":"Badge","props":{"label":"OK","variant":"success"},"children":[]},
+            "met":{"type":"Metric","props":{"label":"Latency","value":"14ms","trend":"down"},"children":[]},
+            "prog":{"type":"ProgressBar","props":{"progress":0.75,"label":"Coverage"},"children":[]},
+            "bar":{"type":"BarChart","props":{"data":[{"label":"JVM","value":80,"color":"accent"},{"label":"Lint","value":20}],"showPercentage":true},"children":[]},
+            "spark":{"type":"Sparkline","props":{"data":[10,20,15,30],"color":"#3ccf91"},"children":[]},
+            "tbl":{"type":"Table","props":{"columns":[{"header":"Suite","key":"s"}],"rows":[{"s":"Core"}]},"children":[]},
+            "lst":{"type":"List","props":{"items":["One","Two"],"ordered":true},"children":[]},
+            "call":{"type":"Callout","props":{"type":"tip","title":"Note","content":"Fast"},"children":[]},
+            "tl":{"type":"Timeline","props":{"items":[{"title":"Compiled","status":"done"}]},"children":[]},
+            "div":{"type":"Divider","props":{"title":"Details"},"children":[]},
+            "nl":{"type":"Newline","props":{},"children":[]},
+            "sp":{"type":"Spacer","props":{},"children":[]}
+        }}""".replace("\n", "")
+        val src = """
+            Use `<json-render>` inline or fenced:
+            ```html
+            <json-render>{"ignored":true}</json-render>
+            ```
+            <json-render>$widgetJson</json-render>
+            Streaming next:
+            <json-render>{"root":"r"
+        """.trimIndent()
+        val blocks = Markdown.parse(src)
+        assertEquals(5, blocks.size)
+        org.junit.Assert.assertTrue(blocks[0] is Block.Paragraph)
+        assertEquals(Block.Code("<json-render>{\"ignored\":true}</json-render>", "html"), blocks[1])
+        val complete = blocks[2] as Block.Widget
+        org.junit.Assert.assertTrue(complete.complete)
+        val parsed = JsonWidget.parse(complete.rawJson) as JsonWidget.Node.Card
+        assertEquals("Build Summary", parsed.title)
+        assertEquals(10, parsed.children.size)
+
+        val streaming = blocks[4] as Block.Widget
+        org.junit.Assert.assertFalse(streaming.complete)
+        org.junit.Assert.assertNull(JsonWidget.parse(streaming.rawJson))
+
+        // Cyclic graph and malformed props never crash or loop infinitely.
+        val cyclic = """{"root":"a","elements":{"a":{"type":"Box","props":{},"children":["b"]},"b":{"type":"Box","props":{},"children":["a"]}}}"""
+        val cyclicNode = JsonWidget.parse(cyclic) as JsonWidget.Node.Box
+        assertEquals(1, cyclicNode.children.size)
+
+        // Deep nesting beyond MAX_DEPTH is truncated safely.
+        val deepElements = (0..40).joinToString(",") { i ->
+            val child = if (i < 40) "\"n${i + 1}\"" else "\"leaf\""
+            "\"n$i\":{\"type\":\"Box\",\"props\":{},\"children\":[$child]}"
+        } + ",\"leaf\":{\"type\":\"Text\",\"props\":{\"text\":\"deep\"},\"children\":[]}"
+        val deepTree = JsonWidget.parse("""{"root":"n0","elements":{$deepElements}}""")
+        org.junit.Assert.assertNotNull(deepTree)
+        org.junit.Assert.assertNull(JsonWidget.parse("""{"root":"missing","elements":{}}"""))
+    }
+
+    @Test
+    fun tokenizesCodeHighlightingKeywordsStringsCommentsAndNumbersVerbatim() {
+        val kt = """
+            // Greeting helper
+            @Composable
+            fun greet(count: Int = 42): String {
+                return "hello \"world\""
+            }
+        """.trimIndent()
+        val tokens = Markdown.tokenizeCode(kt, "kotlin")
+        assertEquals(kt, tokens.joinToString("") { it.text })
+        val kinds = tokens.map { it.kind }.toSet()
+        org.junit.Assert.assertTrue(Markdown.TokenKind.Comment in kinds)
+        org.junit.Assert.assertTrue(Markdown.TokenKind.Keyword in kinds)
+        org.junit.Assert.assertTrue(Markdown.TokenKind.Type in kinds)
+        org.junit.Assert.assertTrue(Markdown.TokenKind.Number in kinds)
+        org.junit.Assert.assertTrue(Markdown.TokenKind.String in kinds)
+    }
+
+    @Test
+    fun mathOnlyWhenAskedAsSpansAndDisplayBlocks() {
+        val src = "Given \$x_1^2 + y^2\$ for **\$a\$** at \$100,\n\n\$\$\n\\sum_{i=1}^{n} i\n\$\$\n\n| \$k\$ | v |\n|---|---|\n| \$n^2\$ | 1 |\n\n`\$x\$` stays code, \\\$5 is a price."
+        val plain = Markdown.parse(src)
+        assertEquals(null, plain.filterIsInstance<Block.Paragraph>().flatMap { it.spans }.firstOrNull { it.math != null })
+        assertEquals(0, plain.filterIsInstance<Block.Math>().size)
+
+        val blocks = Markdown.parse(src, paths = true, math = true)
+        val first = (blocks[0] as Block.Paragraph).spans
+        assertEquals(listOf("x_1^2 + y^2", "a"), first.mapNotNull { it.math })
+        assertEquals(Span("\$x_1^2 + y^2\$", math = "x_1^2 + y^2"), first[1])
+        assertEquals(true, first.single { it.math == "a" }.bold)
+        assertEquals("Given \$x_1^2 + y^2\$ for \$a\$ at \$100,", first.joinToString("") { it.text })
+        assertEquals(Block.Math("\\sum_{i=1}^{n} i", "\$\$\n\\sum_{i=1}^{n} i\n\$\$"), blocks[1])
+        val table = blocks[2] as Block.Table
+        assertEquals("k", table.header[0].single().math)
+        assertEquals(listOf(listOf(Span("\$n^2\$", math = "n^2"))), Markdown.unbroken(table.rows[0][0]))
+        val last = (blocks[3] as Block.Paragraph).spans
+        assertEquals(Span("\$x\$", code = true), last[0])
+        assertEquals(" stays code, \$5 is a price.", last[1].text)
+    }
+}

@@ -1,0 +1,11 @@
+# Desktop
+
+Electron main process for the Mac app (`tsconfig.desktop.json` → `dist/desktop/main.js`, `.js` relative imports; sandboxed preloads use `.cts` → `.cjs`). Office UI lives in `src/client`, loaded with `sandbox: true` and `contextIsolation: true`.
+
+- **User data & isolated runs**: `userData` is `…/com.nikships.factory-flow` (the bare `Factory Flow` folder belongs to the older Unity app). Pass `--user-data-dir=<folder>` and `--startup-check` when testing a packaged app so the installed app's lock, settings and logs stay untouched.
+- **Daemon & Chromium**: `office.ts` spawns `bin/factory-flow.js` on Electron's Helper binary (`runtime.ts`, `ELECTRON_RUN_AS_NODE=1`) in the login shell environment (`shell-path.ts`). Quitting sends `SIGTERM` so workers and the PTY host survive restarts; **Quit and Stop Workers…** sends `SIGINT`. `browser.ts` runs non-fatal `factory-flow browser install` on the Helper binary at launch into the shared folder named by `src/server/whiteboard-browser.ts`.
+- **Menu bar vs quit**: Closing the window (Cmd+Q / **Close to Menu Bar** included) hides the Dock icon and keeps the daemon running behind `tray.ts` (`tray-model.ts`, `tests/desktop-tray.test.ts`; regenerate the monochrome template `tray-icon.ts` with `tools/tray-icon.py`, and the app icon `build/icon.svg` with `tools/app-icon.py`), with `windowWanted` keeping restarts or crashes from reopening it. Stop the office only in `before-quit` (Quit menu items, Option+Cmd+Q, Dock Quit, logout, shutdown, updates).
+- **Window**: The app owns one ordinary sandboxed companion window at `/dashboard` (`companion.ts`). Closing it destroys the page and leaves the daemon and tray running.
+- **Startup gates**: `requirements.ts` enforces macOS 14+ and arm64. Keep it aligned with `mac.minimumSystemVersion` in `electron-builder.yml`; route startup failures through `startup.ts` and `startup-failure.ts`.
+- **Updates & packaging**: `updates.ts` installs signed Squirrel.Mac zips inside the `update-window.ts` sheet. `electron-builder.yml` packs arm64 hardened-runtime bundles (`asar: false`, `npmRebuild: false`). Verify packaging and startup using a signed app without modifying its bundle.
+- **Untrusted page boundary**: The companion is sandboxed with context isolation and no Node integration. Validate navigation against this office's origin before opening external links.

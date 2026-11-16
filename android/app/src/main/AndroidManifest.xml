@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <uses-feature
+        android:name="android.hardware.camera.any"
+        android:required="false" />
+
+    <application
+        android:name=".DroidOfficeApp"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:enableOnBackInvokedCallback="true"
+        android:fullBackupContent="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.DroidOffice.Splash"
+        tools:targetApi="36">
+
+        <!-- Compose lays itself out again on a rotation or resize. Recreating the activity would also
+             destroy the live WebViews (a card's video, a worker's terminal) and lose their place. -->
+        <activity
+            android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- The pairing QR code: the system camera opens the app straight into pairing. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:host="pair"
+                    android:scheme="factoryflow" />
+            </intent-filter>
+            <!-- Deep links to a worker's terminal, a floor, a Whiteboard card, or a pending question. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:host="open"
+                    android:pathPrefix="/"
+                    android:scheme="factoryflow" />
+                <data
+                    android:host="worker"
+                    android:pathPrefix="/"
+                    android:scheme="factoryflow" />
+                <data
+                    android:host="floor"
+                    android:pathPrefix="/"
+                    android:scheme="factoryflow" />
+                <data
+                    android:host="card"
+                    android:pathPrefix="/"
+                    android:scheme="factoryflow" />
+                <data
+                    android:host="question"
+                    android:pathPrefix="/"
+                    android:scheme="factoryflow" />
+                <data
+                    android:host="ask"
+                    android:pathPrefix="/"
+                    android:scheme="factoryflow" />
+            </intent-filter>
+            <!-- Tailscale MagicDNS /open/... links when shared or enabled under Open by default;
+                 browsers also bounce /open/... into factoryflow://open/... from the server. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="http" />
+                <data android:scheme="https" />
+                <data android:host="*.ts.net" />
+                <data android:pathPrefix="/open/" />
+            </intent-filter>
+            <!-- A join link or deep link shared from a chat or the browser. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".notify.StayConnectedService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keeps a WebSocket open to the user's own Factory Flow server (same Wi-Fi or Tailscale) so the phone can alert when a coding agent needs input or finishes, which the server has no push channel for." />
+        </service>
+
+        <receiver
+            android:name=".notify.ReplyReceiver"
+            android:exported="false" />
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.updates"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/update_paths" />
+        </provider>
+    </application>
+</manifest>

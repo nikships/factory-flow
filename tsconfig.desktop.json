@@ -1,0 +1,11 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist/desktop",
+    "rootDir": "src/desktop",
+    "types": ["node"],
+    "lib": ["ES2022"]
+  },
+  "include": ["src/desktop/**/*.ts", "src/desktop/**/*.cts"],
+  "exclude": ["src/desktop/page"]
+}

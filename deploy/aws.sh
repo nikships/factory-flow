@@ -1,0 +1,694 @@
+#!/usr/bin/env bash
+# Deploy your own Factory Flow to AWS with one command, using only the AWS CLI.
+#
+#   deploy/aws.sh up        create the machine, install and start the office, open it
+#   deploy/aws.sh open      tunnel to the office and open it in your browser
+#   deploy/aws.sh pause     stop the machine to save money (asks first)
+#   deploy/aws.sh resume    start it again
+#   deploy/aws.sh destroy   delete everything it created (asks first)
+#
+# The office is never exposed to the internet: it listens on the box's loopback and you
+# reach it through an SSH tunnel. Run `deploy/aws.sh help` for all commands and options.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+NAME="factory-flow"
+INSTANCE_TYPE="t3.xlarge"
+INSTANCE_TYPE_SET=0
+DISK_GB=50
+APP_REF="main"
+APP_REPO=""
+PROJECT=""
+GH_TOKEN_ARG=""
+NO_GH_TOKEN=0
+FACTORY_KEY="${FACTORY_API_KEY:-}"
+YES=0
+NO_OPEN=0
+EXTRA_ALLOW=()
+SSH_USER="ubuntu"
+OFFICE_PORT=4700     # where the office listens on the box (127.0.0.1 only)
+LOCAL_PORT=4700
+LOCAL_PORT_SET=0
+
+usage() {
+  cat <<'EOF'
+Factory Flow on AWS — one command up, one command down.
+
+Usage: deploy/aws.sh <command> [options]
+
+The office is never on the internet. It listens on the machine's loopback, the firewall only
+opens SSH, and you reach the office through an SSH tunnel on http://localhost:4700.
+
+Commands
+  up                 Create (or reuse) your office on EC2, install and start it, and open it in
+                     your browser
+  open               Tunnel to your office and open it in the browser (Ctrl-C closes the tunnel)
+  pause              Stop the machine to save money (asks first). The disk, the address and
+                     everything on it stay; only the disk and the address are billed while paused
+  resume             Start a paused office again and open it in the browser
+  destroy            Terminate the machine and delete everything this script created (asks you
+                     to type the office name first). `down` does the same.
+
+  status             Show the instance, whether the office is up and which IPs may SSH in
+  allow <ip|me>      Let an IP (or CIDR) reach SSH. "me" = your current IP. "anywhere" opens SSH
+                     to every IP — reasonable, since SSH only accepts your key
+  revoke <ip|me>     Take that access away again
+  ssh                SSH into the machine
+  logs               Follow the office's logs
+  resize <type>      Change the machine size, e.g. t3.2xlarge (stops it for ~1-2 minutes;
+                     the address stays the same). `up --instance-type <type>` does this too.
+  update             Install the latest factory-flow on the machine and restart it
+
+Options
+  --name <name>             Deployment name, lets you run several offices (default: factory-flow)
+  --region <region>         AWS region (default: your AWS CLI region, else us-east-1)
+  --profile <profile>       AWS CLI profile
+  --instance-type <type>    EC2 instance type (default: t3.xlarge — 4 vCPU, 16 GiB)
+  --disk <GiB>              Root disk size (default: 50)
+  --allow <ip|cidr>         With up: also allow this IP to SSH in (repeatable).
+                            Your own IP is always allowed.
+  --port <n>                Local port for the tunnel (default: 4700, or the next free one)
+  --project <owner/repo>    Also clone this GitHub repo as the office's first floor. Without it
+                            the office opens on its elevator, which lists every repo your GitHub
+                            token can see: pick one there. Projects go in ~/workspace on the box
+  --app-repo <url>          factory-flow repo to install (default: this checkout's GitHub origin)
+  --app-ref <ref>           Branch or tag to install (default: main)
+  --github-token <token>    GitHub token for private repos + the issue/PR boards
+                            (default: your local `gh auth token`)
+  --no-github-token         Don't put any GitHub token on the machine
+  --factory-api-key <key>   A Factory API key for Droid on the machine (default:
+                            $FACTORY_API_KEY). Without one, sign Droid in over SSH once the
+                            box is up: deploy/aws.sh ssh, run `droid`, log in.
+  --no-open                 Don't open the browser (up, resume: don't open the tunnel either)
+  -y, --yes                 Don't ask for confirmation
+EOF
+}
+
+say() { printf '\033[1;35m▸\033[0m %s\n' "$*"; }
+ok() { printf '\033[1;32m✓\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m!\033[0m %s\n' "$*" >&2; }
+die() {
+  printf '\033[1;31m✗\033[0m %s\n' "$*" >&2
+  exit 1
+}
+
+CMD="${1:-help}"
+[[ $# -gt 0 ]] && shift
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --name) NAME="$2"; shift 2 ;;
+    --region) export AWS_REGION="$2" AWS_DEFAULT_REGION="$2"; shift 2 ;;
+    --profile) export AWS_PROFILE="$2"; shift 2 ;;
+    --instance-type) INSTANCE_TYPE="$2"; INSTANCE_TYPE_SET=1; shift 2 ;;
+    --disk) DISK_GB="$2"; shift 2 ;;
+    --allow) EXTRA_ALLOW+=("$2"); shift 2 ;;
+    --port) LOCAL_PORT="$2"; LOCAL_PORT_SET=1; shift 2 ;;
+    --project) PROJECT="$2"; shift 2 ;;
+    --app-repo) APP_REPO="$2"; shift 2 ;;
+    --app-ref) APP_REF="$2"; shift 2 ;;
+    --github-token) GH_TOKEN_ARG="$2"; shift 2 ;;
+    --no-github-token) NO_GH_TOKEN=1; shift ;;
+    --factory-api-key) FACTORY_KEY="$2"; shift 2 ;;
+    --no-open) NO_OPEN=1; shift ;;
+    -y | --yes) YES=1; shift ;;
+    -h | --help) usage; exit 0 ;;
+    -*) die "unknown option $1 (see: deploy/aws.sh help)" ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+
+[[ "$NAME" =~ ^[a-zA-Z0-9-]+$ ]] || die "--name may only contain letters, numbers and dashes"
+[[ "$LOCAL_PORT" =~ ^[0-9]+$ && $LOCAL_PORT -gt 0 && $LOCAL_PORT -lt 65536 ]] || die "--port must be a port number"
+RESOURCE="factory-flow-$NAME"
+[[ "$NAME" == "factory-flow" ]] && RESOURCE="factory-flow"
+STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/factory-flow/aws/$NAME"
+NAME_FLAG=""
+[[ "$NAME" != "factory-flow" ]] && NAME_FLAG=" --name $NAME"
+KEY_FILE="$STATE_DIR/id_ed25519"
+KNOWN_HOSTS="$STATE_DIR/known_hosts"
+
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required (${2:-install it first})"; }
+aws_() { aws --output text "$@"; }
+
+preflight() {
+  need aws "https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
+  need ssh
+  need curl
+  if [[ -z "${AWS_REGION:-}" ]]; then
+    local r
+    r=$(aws configure get region 2>/dev/null || true)
+    export AWS_REGION="${r:-us-east-1}" AWS_DEFAULT_REGION="${r:-us-east-1}"
+  fi
+  ACCOUNT=$(aws_ sts get-caller-identity --query Account 2>/dev/null) || die "the AWS CLI isn't logged in (try: aws configure / aws sso login)"
+}
+
+my_ip() { curl -fsS --max-time 10 https://checkip.amazonaws.com | tr -d '[:space:]'; }
+
+to_cidr() {
+  local v="$1"
+  [[ "$v" == "me" ]] && v=$(my_ip)
+  [[ "$v" == "anywhere" ]] && v="0.0.0.0/0"
+  [[ "$v" == */* ]] || v="$v/32"
+  [[ "$v" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || die "not an IPv4 address or CIDR: $1"
+  echo "$v"
+}
+
+open_url() {
+  local url="$1"
+  if [[ $NO_OPEN -eq 1 ]]; then return; fi
+  if command -v open >/dev/null 2>&1; then open "$url"
+  elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$url" >/dev/null 2>&1 &
+  elif command -v wslview >/dev/null 2>&1; then wslview "$url"
+  elif command -v cmd.exe >/dev/null 2>&1; then cmd.exe /c start "" "$url"
+  fi
+}
+
+# --- AWS lookups --------------------------------------------------------------------------------
+
+find_instance() {
+  aws_ ec2 describe-instances \
+    --filters "Name=tag:factory-flow,Values=$NAME" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+    --query 'Reservations[].Instances[0].InstanceId | [0]' | sed 's/^None$//'
+}
+
+instance_field() { aws_ ec2 describe-instances --instance-ids "$1" --query "Reservations[0].Instances[0].$2" | sed 's/^None$//'; }
+
+find_sg() {
+  aws_ ec2 describe-security-groups --filters "Name=group-name,Values=$RESOURCE" "Name=tag:factory-flow,Values=$NAME" \
+    --query 'SecurityGroups[0].GroupId' 2>/dev/null | sed 's/^None$//'
+}
+
+find_eip() {
+  # prints: <allocation-id> <association-id|None> <public-ip>
+  aws_ ec2 describe-addresses --filters "Name=tag:factory-flow,Values=$NAME" \
+    --query 'Addresses[0].[AllocationId,AssociationId,PublicIp]' 2>/dev/null | sed 's/^None$//'
+}
+
+# A fixed address, so the office URL survives stops, starts and resizes.
+ensure_eip() {
+  local inst="$1" alloc assoc ip current
+  read -r alloc assoc ip <<<"$(find_eip)"
+  if [[ -z "$alloc" || "$alloc" == "None" ]]; then
+    read -r alloc ip <<<"$(aws_ ec2 allocate-address --domain vpc \
+      --tag-specifications "ResourceType=elastic-ip,Tags=[{Key=factory-flow,Value=$NAME},{Key=Name,Value=$RESOURCE}]" \
+      --query '[AllocationId,PublicIp]')"
+    ok "Elastic IP $ip"
+  fi
+  current=$(aws_ ec2 describe-addresses --allocation-ids "$alloc" --query 'Addresses[0].InstanceId' | sed 's/^None$//')
+  if [[ "$current" != "$inst" ]]; then
+    aws ec2 associate-address --allocation-id "$alloc" --instance-id "$inst" --allow-reassociation >/dev/null
+  fi
+  IP="$ip"
+}
+
+type_arch() {
+  aws_ ec2 describe-instance-types --instance-types "$1" --query 'InstanceTypes[0].ProcessorInfo.SupportedArchitectures[0]' 2>/dev/null |
+    sed 's/^None$//'
+}
+
+# Stop -> change type -> start. The disk, the address and everything on the machine stay.
+resize_instance() {
+  local inst="$1" want="$2" have want_arch have_arch
+  have=$(instance_field "$inst" InstanceType)
+  [[ "$have" == "$want" ]] && { ok "Already a $want"; return; }
+  want_arch=$(type_arch "$want" || true)
+  [[ -n "$want_arch" ]] || die "unknown instance type $want"
+  have_arch=$(type_arch "$have" || true)
+  [[ "$want_arch" == "$have_arch" ]] || die "can't switch CPU architecture ($have is $have_arch, $want is $want_arch) — use destroy + up instead"
+  say "Resizing $inst from $have to $want. The office goes offline for a minute or two;"
+  echo "   running workers stop and come back asleep (press R at their desk to resume)."
+  if [[ $YES -ne 1 ]]; then
+    read -r -p "   Continue? [y/N] " answer
+    [[ "$answer" =~ ^[Yy] ]] || die "cancelled"
+  fi
+  if [[ "$(instance_field "$inst" State.Name)" != "stopped" ]]; then
+    aws ec2 stop-instances --instance-ids "$inst" >/dev/null
+    say "Stopping"
+    aws ec2 wait instance-stopped --instance-ids "$inst"
+  fi
+  aws ec2 modify-instance-attribute --instance-id "$inst" --instance-type "Value=$want"
+  aws ec2 start-instances --instance-ids "$inst" >/dev/null
+  say "Starting as $want"
+  aws ec2 wait instance-running --instance-ids "$inst"
+  ok "Now a $want"
+}
+
+# Start a stopped (or stopping) instance; a running one is left alone.
+start_instance() {
+  local inst="$1"
+  [[ "$(instance_field "$inst" State.Name)" =~ ^(stopped|stopping)$ ]] || return 0
+  say "Starting $inst"
+  aws ec2 wait instance-stopped --instance-ids "$inst"
+  aws ec2 start-instances --instance-ids "$inst" >/dev/null
+}
+
+require_instance() {
+  INSTANCE_ID=$(find_instance)
+  [[ -n "$INSTANCE_ID" ]] || die "no office named \"$NAME\" in $AWS_REGION — run: deploy/aws.sh up"
+  [[ "$(instance_field "$INSTANCE_ID" State.Name)" =~ ^(stopped|stopping)$ ]] &&
+    die "the office is paused — start it with: deploy/aws.sh resume$NAME_FLAG"
+  IP=$(instance_field "$INSTANCE_ID" PublicIpAddress)
+  [[ -n "$IP" ]] || die "the instance $INSTANCE_ID has no public IP (is it stopped?)"
+}
+
+ssh_opts() {
+  echo -i "$KEY_FILE" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$KNOWN_HOSTS" \
+    -o ConnectTimeout=8 -o ServerAliveInterval=15 -o LogLevel=ERROR
+}
+
+remote() {
+  [[ -f "$KEY_FILE" ]] || die "the SSH key for this office isn't on this machine ($KEY_FILE)"
+  # shellcheck disable=SC2046
+  ssh $(ssh_opts) "$SSH_USER@$IP" "$@"
+}
+
+# Only SSH is ever opened; the office itself is reached through the tunnel.
+allow_cidr() {
+  local sg="$1" cidr="$2" out
+  if ! out=$(aws ec2 authorize-security-group-ingress --group-id "$sg" \
+    --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=$cidr,Description=factory-flow}]" 2>&1); then
+    [[ "$out" == *InvalidPermission.Duplicate* ]] || die "could not allow $cidr: $out"
+  fi
+}
+
+revoke_cidr() {
+  aws ec2 revoke-security-group-ingress --group-id "$1" --protocol tcp --port 22 --cidr "$2" >/dev/null 2>&1 || true
+}
+
+allowed_cidrs() {
+  aws_ ec2 describe-security-groups --group-ids "$1" \
+    --query "SecurityGroups[0].IpPermissions[?FromPort==\`${2:-22}\`].IpRanges[].CidrIp" | tr '\t' '\n' | sed '/^$/d;/^None$/d'
+}
+
+office_get() { remote "curl -fs --max-time 4 http://127.0.0.1:$OFFICE_PORT$1"; }
+
+wait_healthy() {
+  local i rc
+  for ((i = 0; i < 30; i++)); do
+    rc=0
+    remote "for i in \$(seq 90); do curl -fs --max-time 4 http://127.0.0.1:$OFFICE_PORT/api/health >/dev/null && exit 0; sleep 2; done; exit 1" \
+      2>/dev/null || rc=$?
+    [[ $rc -eq 255 ]] || return "$rc" # 255: ssh itself failed, the machine is still booting
+    sleep 5
+  done
+  return 1
+}
+
+port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null || (exec 3<>"/dev/tcp/::1/$1") 2>/dev/null; }
+
+pick_port() {
+  local p
+  if [[ $LOCAL_PORT_SET -eq 1 ]]; then
+    port_busy "$LOCAL_PORT" && die "localhost:$LOCAL_PORT is already in use"
+    echo "$LOCAL_PORT"
+    return
+  fi
+  for ((p = LOCAL_PORT; p < LOCAL_PORT + 50; p++)); do
+    port_busy "$p" || { echo "$p"; return; }
+  done
+  die "no free local port from $LOCAL_PORT up (pick one with --port)"
+}
+
+# Forward localhost:<port> to the office on the box, open the browser, and hold until Ctrl-C.
+tunnel() {
+  local path="$1" port pid i up=0
+  port=$(pick_port) || exit 1
+  # shellcheck disable=SC2046
+  ssh $(ssh_opts) -N -o ExitOnForwardFailure=yes -L "$port:127.0.0.1:$OFFICE_PORT" "$SSH_USER@$IP" &
+  pid=$!
+  trap 'kill "$pid" 2>/dev/null; echo; ok "Tunnel closed"; exit 0' INT TERM
+  for ((i = 0; i < 40; i++)); do
+    kill -0 "$pid" 2>/dev/null || die "couldn't open the SSH tunnel to $IP"
+    curl -fs --max-time 2 "http://localhost:$port/api/health" >/dev/null 2>&1 && { up=1; break; }
+    sleep 0.5
+  done
+  if [[ $up -ne 1 ]]; then
+    kill "$pid" 2>/dev/null
+    die "the tunnel opened but the office didn't answer through it — check: deploy/aws.sh logs$NAME_FLAG"
+  fi
+  ok "Your office: http://localhost:$port$path"
+  echo "   (tunneled over SSH to $IP — keep this running while you use it; Ctrl-C closes it)"
+  open_url "http://localhost:$port$path"
+  wait "$pid" || true
+  trap - INT TERM
+  warn "The tunnel dropped — reopen it with: deploy/aws.sh open$NAME_FLAG"
+}
+
+# The tunnel lands on the box's loopback, which the office trusts (see lan.ts), so the
+# owner walks straight in: no login, no token, nothing to write down.
+open_office() {
+  tunnel "/"
+}
+
+# --- commands --------------------------------------------------------------------------------------
+
+github_https() {
+  # git@github.com:owner/repo(.git) | https://github.com/owner/repo(.git) | owner/repo -> https URL
+  local v="$1"
+  v="${v%.git}"
+  v="${v#git@github.com:}"
+  v="${v#https://github.com/}"
+  v="${v#ssh://git@github.com/}"
+  [[ "$v" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 1
+  echo "https://github.com/$v"
+}
+
+cmd_up() {
+  preflight
+  need ssh-keygen
+
+  # What to install. The office starts with no project (never the checkout this script is in):
+  # you pick yours in its elevator, unless --project names a first one.
+  if [[ -z "$APP_REPO" ]]; then
+    APP_REPO=$(github_https "$(git -C "$SCRIPT_DIR/.." remote get-url origin 2>/dev/null || true)" || echo "https://github.com/nikships/factory-flow")
+  fi
+  local project_repo=""
+  if [[ -n "$PROJECT" ]]; then
+    project_repo=$(github_https "$PROJECT") || die "--project must be a GitHub repo (owner/name or URL), got: $PROJECT"
+  fi
+
+  local gh_token="$GH_TOKEN_ARG"
+  if [[ -z "$gh_token" && $NO_GH_TOKEN -eq 0 ]] && command -v gh >/dev/null 2>&1; then
+    gh_token=$(gh auth token 2>/dev/null || true)
+  fi
+  [[ $NO_GH_TOKEN -eq 1 ]] && gh_token=""
+
+  local my
+  my=$(my_ip) || die "couldn't detect your public IP"
+  local cidrs=("$my/32")
+  local a
+  for a in "${EXTRA_ALLOW[@]+"${EXTRA_ALLOW[@]}"}"; do cidrs+=("$(to_cidr "$a")"); done
+
+  say "Factory Flow \"$NAME\" in $AWS_REGION (account $ACCOUNT)"
+  echo "   machine:  $INSTANCE_TYPE, ${DISK_GB} GiB disk, Ubuntu 24.04"
+  echo "   app:      $APP_REPO @ $APP_REF"
+  echo "   projects: ${project_repo:+$project_repo, then }pick them in the office's elevator (cloned into ~/workspace)"
+  echo "   access:   SSH tunnel only (the office is never exposed); SSH from ${cidrs[*]}"
+  if [[ -n "$gh_token" ]]; then
+    echo "   github:   your GitHub token goes on the machine (private clones, issue/PR boards, pushes)"
+  else
+    echo "   github:   no token — private repos and the boards won't work"
+  fi
+  if [[ -n "$FACTORY_KEY" ]]; then
+    echo "   droid:    signed in with the Factory API key you provided"
+  else
+    echo "   droid:    not signed in — run 'deploy/aws.sh ssh' once and log in to Droid there"
+  fi
+
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR"
+
+  # SSH key pair (ed25519), kept locally.
+  if [[ ! -f "$KEY_FILE" ]]; then
+    if aws ec2 describe-key-pairs --key-names "$RESOURCE" >/dev/null 2>&1; then
+      [[ -n "$(find_instance)" ]] && die "key pair $RESOURCE exists in AWS but its private key isn't here ($KEY_FILE)"
+      aws ec2 delete-key-pair --key-name "$RESOURCE" >/dev/null
+    fi
+    ssh-keygen -q -t ed25519 -N '' -C "$RESOURCE" -f "$KEY_FILE"
+  fi
+  if ! aws ec2 describe-key-pairs --key-names "$RESOURCE" >/dev/null 2>&1; then
+    aws ec2 import-key-pair --key-name "$RESOURCE" --public-key-material "fileb://$KEY_FILE.pub" \
+      --tag-specifications "ResourceType=key-pair,Tags=[{Key=factory-flow,Value=$NAME}]" >/dev/null
+    ok "SSH key pair $RESOURCE"
+  fi
+
+  # Security group: only the allowed IPs can reach 22 (ssh). Nothing else is open.
+  local vpc sg
+  vpc=$(aws_ ec2 describe-vpcs --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' | sed 's/^None$//')
+  [[ -n "$vpc" ]] || die "no default VPC in $AWS_REGION (create one with: aws ec2 create-default-vpc)"
+  sg=$(find_sg)
+  if [[ -z "$sg" ]]; then
+    sg=$(aws_ ec2 create-security-group --group-name "$RESOURCE" --vpc-id "$vpc" \
+      --description "Factory Flow $NAME - SSH from allowed IPs only" \
+      --tag-specifications "ResourceType=security-group,Tags=[{Key=factory-flow,Value=$NAME},{Key=Name,Value=$RESOURCE}]" \
+      --query GroupId)
+    ok "Security group $sg"
+  fi
+  local c
+  for c in "${cidrs[@]}"; do allow_cidr "$sg" "$c"; done
+  # Offices from before the SSH tunnel served https on 443 to the allowed IPs; close that.
+  for c in $(allowed_cidrs "$sg" 443); do
+    aws ec2 revoke-security-group-ingress --group-id "$sg" --protocol tcp --port 443 --cidr "$c" >/dev/null 2>&1 || true
+  done
+  ok "SSH allowed from ${cidrs[*]}"
+
+  # The machine.
+  INSTANCE_ID=$(find_instance)
+  if [[ -z "$INSTANCE_ID" ]]; then
+    local arch ami
+    arch=$(aws_ ec2 describe-instance-types --instance-types "$INSTANCE_TYPE" --query 'InstanceTypes[0].ProcessorInfo.SupportedArchitectures[0]') ||
+      die "unknown instance type $INSTANCE_TYPE"
+    [[ "$arch" == "x86_64" ]] && arch="amd64"
+    ami=$(aws_ ssm get-parameter --name "/aws/service/canonical/ubuntu/server/24.04/stable/current/$arch/hvm/ebs-gp3/ami-id" --query Parameter.Value)
+    say "Launching $INSTANCE_TYPE ($ami)"
+    INSTANCE_ID=$(aws_ ec2 run-instances --image-id "$ami" --instance-type "$INSTANCE_TYPE" \
+      --key-name "$RESOURCE" --security-group-ids "$sg" \
+      --block-device-mappings "DeviceName=/dev/sda1,Ebs={VolumeSize=$DISK_GB,VolumeType=gp3,DeleteOnTermination=true}" \
+      --metadata-options "HttpTokens=required,HttpEndpoint=enabled" \
+      --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$RESOURCE},{Key=factory-flow,Value=$NAME}]" \
+      "ResourceType=volume,Tags=[{Key=Name,Value=$RESOURCE},{Key=factory-flow,Value=$NAME}]" \
+      --query 'Instances[0].InstanceId')
+  elif [[ $INSTANCE_TYPE_SET -eq 1 && "$(instance_field "$INSTANCE_ID" InstanceType)" != "$INSTANCE_TYPE" ]]; then
+    resize_instance "$INSTANCE_ID" "$INSTANCE_TYPE"
+  elif [[ "$(instance_field "$INSTANCE_ID" State.Name)" =~ ^(stopped|stopping)$ ]]; then
+    start_instance "$INSTANCE_ID"
+  else
+    say "Reusing $INSTANCE_ID ($(instance_field "$INSTANCE_ID" InstanceType))"
+  fi
+  aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+  ensure_eip "$INSTANCE_ID"
+  ok "Instance $INSTANCE_ID is running at $IP"
+
+  say "Waiting for SSH"
+  local i
+  for ((i = 0; i < 60; i++)); do
+    remote true 2>/dev/null && break
+    sleep 5
+  done
+  remote true || die "SSH never came up on $IP"
+
+  say "Provisioning (Node, git, gh, the Droid CLI, factory-flow) — a few minutes on first run"
+  local git_name git_email
+  git_name=$(git config user.name 2>/dev/null || true)
+  git_email=$(git config user.email 2>/dev/null || true)
+  {
+    printf 'export APP_REPO=%q APP_REF=%q PROJECT_REPO=%q\n' "$APP_REPO" "$APP_REF" "$project_repo"
+    printf 'export GH_TOKEN=%q FACTORY_API_KEY=%q\n' "$gh_token" "$FACTORY_KEY"
+    printf 'export GIT_NAME=%q GIT_EMAIL=%q\n' "$git_name" "$git_email"
+    cat "$SCRIPT_DIR/provision.sh"
+  } | remote 'bash -s' || die "provisioning failed (re-run \"deploy/aws.sh up\" to retry; it picks up where it left off)"
+
+  say "Waiting for the office to answer"
+  wait_healthy || die "the office didn't come up — check: deploy/aws.sh logs"
+  ok "Your office is running on $IP (reachable only through SSH)"
+  echo
+  echo "   Open it later:     deploy/aws.sh open$NAME_FLAG"
+  echo "   Pause / resume:    deploy/aws.sh pause$NAME_FLAG   /   deploy/aws.sh resume$NAME_FLAG"
+  echo "   Tear it down:      deploy/aws.sh destroy$NAME_FLAG"
+  echo
+  [[ $NO_OPEN -eq 1 ]] && return
+  open_office
+}
+
+cmd_open() {
+  preflight
+  require_instance
+  wait_healthy || die "the office isn't answering — check: deploy/aws.sh logs$NAME_FLAG"
+  open_office
+}
+
+cmd_status() {
+  preflight
+  INSTANCE_ID=$(find_instance)
+  if [[ -z "$INSTANCE_ID" ]]; then
+    echo "No office named \"$NAME\" in $AWS_REGION."
+    return
+  fi
+  local sg state
+  sg=$(find_sg)
+  state=$(instance_field "$INSTANCE_ID" State.Name)
+  IP=$(instance_field "$INSTANCE_ID" PublicIpAddress)
+  echo "office:    $NAME ($AWS_REGION)"
+  echo "instance:  $INSTANCE_ID $(instance_field "$INSTANCE_ID" InstanceType) $state"
+  echo "address:   ${IP:-none}  (open the office with: deploy/aws.sh open$NAME_FLAG)"
+  if [[ "$state" =~ ^(stopped|stopping)$ ]]; then
+    echo "office:    paused (start it with: deploy/aws.sh resume$NAME_FLAG)"
+  elif [[ -n "$IP" && -f "$KEY_FILE" ]] && office_get /api/health >/dev/null 2>&1; then
+    echo "office:    up"
+  else
+    echo "office:    not answering"
+  fi
+  echo "ssh from:  $(allowed_cidrs "$sg" | tr '\n' ' ')"
+}
+
+cmd_allow() {
+  preflight
+  [[ ${#POSITIONAL[@]} -gt 0 ]] || die "usage: deploy/aws.sh allow <ip|cidr|me> [...]"
+  local sg c
+  sg=$(find_sg)
+  [[ -n "$sg" ]] || die "no office named \"$NAME\" — run: deploy/aws.sh up"
+  for c in "${POSITIONAL[@]}"; do
+    c=$(to_cidr "$c")
+    allow_cidr "$sg" "$c"
+    ok "Allowed $c"
+  done
+}
+
+cmd_revoke() {
+  preflight
+  [[ ${#POSITIONAL[@]} -gt 0 ]] || die "usage: deploy/aws.sh revoke <ip|cidr|me> [...]"
+  local sg c
+  sg=$(find_sg)
+  [[ -n "$sg" ]] || die "no office named \"$NAME\""
+  for c in "${POSITIONAL[@]}"; do
+    c=$(to_cidr "$c")
+    revoke_cidr "$sg" "$c"
+    ok "Revoked $c"
+  done
+}
+
+cmd_ssh() {
+  preflight
+  require_instance
+  # shellcheck disable=SC2046
+  exec ssh $(ssh_opts) -t "$SSH_USER@$IP" "${POSITIONAL[@]+"${POSITIONAL[@]}"}"
+}
+
+cmd_logs() {
+  preflight
+  require_instance
+  # shellcheck disable=SC2046
+  exec ssh $(ssh_opts) -t "$SSH_USER@$IP" 'sudo journalctl -u factory-flow -n 100 -f'
+}
+
+cmd_resize() {
+  preflight
+  [[ ${#POSITIONAL[@]} -eq 1 ]] || die "usage: deploy/aws.sh resize <instance-type>   (e.g. t3.2xlarge, m7i.xlarge)"
+  INSTANCE_ID=$(find_instance)
+  [[ -n "$INSTANCE_ID" ]] || die "no office named \"$NAME\" in $AWS_REGION — run: deploy/aws.sh up"
+  resize_instance "$INSTANCE_ID" "${POSITIONAL[0]}"
+  ensure_eip "$INSTANCE_ID"
+  say "Waiting for the office to answer"
+  wait_healthy || die "the office didn't come back — check: deploy/aws.sh logs"
+  ok "Your office is back — open it with: deploy/aws.sh open$NAME_FLAG"
+}
+
+cmd_pause() {
+  preflight
+  INSTANCE_ID=$(find_instance)
+  [[ -n "$INSTANCE_ID" ]] || die "no office named \"$NAME\" in $AWS_REGION"
+  local state
+  state=$(instance_field "$INSTANCE_ID" State.Name)
+  if [[ "$state" != "stopped" ]]; then
+    say "Pausing office \"$NAME\" ($INSTANCE_ID). Running workers stop and come back asleep"
+    echo "   when you resume (press R at their desk). Open tunnels are dropped."
+    if [[ $YES -ne 1 ]]; then
+      read -r -p "   Continue? [y/N] " answer
+      [[ "$answer" =~ ^[Yy] ]] || die "cancelled"
+    fi
+    [[ "$state" == "pending" ]] && aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+    [[ "$state" != "stopping" ]] && aws ec2 stop-instances --instance-ids "$INSTANCE_ID" >/dev/null
+    say "Stopping"
+    aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"
+  fi
+  ok "Paused. The disk and the address stay (and are all that's billed until you resume)"
+  echo "   Start it again with: deploy/aws.sh resume$NAME_FLAG"
+}
+
+cmd_resume() {
+  preflight
+  INSTANCE_ID=$(find_instance)
+  [[ -n "$INSTANCE_ID" ]] || die "no office named \"$NAME\" in $AWS_REGION — run: deploy/aws.sh up"
+  start_instance "$INSTANCE_ID"
+  aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
+  ensure_eip "$INSTANCE_ID"
+  say "Waiting for the office to answer"
+  wait_healthy || die "the office didn't come back — check: deploy/aws.sh logs$NAME_FLAG"
+  ok "Your office is back (workers pick up where they left off)"
+  [[ $NO_OPEN -eq 1 ]] && return
+  open_office
+}
+
+cmd_update() {
+  preflight
+  require_instance
+  say "Updating factory-flow on $IP"
+  remote "set -e
+    ref=\$(git -C /opt/factory-flow rev-parse --abbrev-ref HEAD)
+    git -C /opt/factory-flow fetch --depth 1 origin \"\$ref\" -q
+    git -C /opt/factory-flow reset --hard FETCH_HEAD -q
+    echo \"   at \$(git -C /opt/factory-flow log -1 --format='%h %s')\"
+    cd /opt/factory-flow && npm install --no-audit --no-fund --loglevel=error >/dev/null
+    # Offices provisioned before KillMode=process: without it the restart stops every worker too.
+    if [ \"\$(systemctl show --property=KillMode --value factory-flow)\" != process ]; then
+      sudo mkdir -p /etc/systemd/system/factory-flow.service.d
+      printf '[Service]\nKillMode=process\n' | sudo tee /etc/systemd/system/factory-flow.service.d/keep-workers.conf >/dev/null
+      sudo systemctl daemon-reload
+    fi
+    sudo systemctl restart factory-flow" || die "update failed"
+  wait_healthy || die "the office didn't come back — check: deploy/aws.sh logs"
+  ok "Updated and restarted (workers carry on through it)"
+}
+
+cmd_down() {
+  preflight
+  local inst sg
+  inst=$(find_instance)
+  sg=$(find_sg)
+  local eip_alloc
+  eip_alloc=$(find_eip | awk '{print $1}')
+  if [[ -z "$inst" && -z "$sg" && ( -z "$eip_alloc" || "$eip_alloc" == "None" ) ]] && ! aws ec2 describe-key-pairs --key-names "$RESOURCE" >/dev/null 2>&1; then
+    echo "Nothing to delete for \"$NAME\" in $AWS_REGION."
+    rm -rf "$STATE_DIR"
+    return
+  fi
+  say "This permanently deletes office \"$NAME\" in $AWS_REGION: ${inst:-no instance}${sg:+, $sg}, its Elastic IP and key pair $RESOURCE."
+  echo "   Anything on the machine that isn't pushed to GitHub is lost."
+  if [[ $YES -ne 1 ]]; then
+    read -r -p "   Type the office name ($NAME) to confirm: " answer
+    [[ "$answer" == "$NAME" ]] || die "cancelled"
+  fi
+  if [[ -n "$inst" ]]; then
+    aws ec2 terminate-instances --instance-ids "$inst" >/dev/null
+    say "Terminating $inst"
+    aws ec2 wait instance-terminated --instance-ids "$inst"
+    ok "Instance terminated (its disk goes with it)"
+  fi
+  if [[ -n "$sg" ]]; then
+    local i
+    for ((i = 0; i < 30; i++)); do
+      aws ec2 delete-security-group --group-id "$sg" >/dev/null 2>&1 && break
+      sleep 5
+    done
+    aws ec2 describe-security-groups --group-ids "$sg" >/dev/null 2>&1 && die "couldn't delete $sg yet — run destroy again in a minute"
+    ok "Security group deleted"
+  fi
+  local alloc assoc eip
+  read -r alloc assoc eip <<<"$(find_eip)"
+  if [[ -n "$alloc" && "$alloc" != "None" ]]; then
+    aws ec2 release-address --allocation-id "$alloc" >/dev/null
+    ok "Elastic IP $eip released"
+  fi
+  aws ec2 delete-key-pair --key-name "$RESOURCE" >/dev/null 2>&1 || true
+  ok "Key pair deleted"
+  rm -rf "$STATE_DIR"
+  ok "All gone"
+}
+
+case "$CMD" in
+  up) cmd_up ;;
+  open) cmd_open ;;
+  status) cmd_status ;;
+  allow) cmd_allow ;;
+  revoke) cmd_revoke ;;
+  ssh) cmd_ssh ;;
+  logs) cmd_logs ;;
+  resize) cmd_resize ;;
+  pause) cmd_pause ;;
+  resume) cmd_resume ;;
+  update) cmd_update ;;
+  destroy | down) cmd_down ;;
+  help | -h | --help) usage ;;
+  *) die "unknown command \"$CMD\" (see: deploy/aws.sh help)" ;;
+esac

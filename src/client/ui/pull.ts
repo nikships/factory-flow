@@ -1,0 +1,1349 @@
+import type { GhCheck, GhCloseReason, GhComment, GhIssue, GhIssueDetail, GhLabel, GhMergeMethod, GhPull, GhPullDetail, GhReviewComment, ServerMsg } from '../../shared/protocol';
+import type { Net } from '../net';
+import { AVATAR_COLORS, store, words, workerForPull } from '../state';
+import { withToken } from '../token';
+import { pullWorkerChip, issuePrompt, issueVars, type BoardActions } from './boards';
+import { officePrompt } from './prompts';
+import { mergeCommand, pullPromptVars } from '../../shared/prompts';
+import { h, openModal, timeAgo, type Modal } from './dom';
+import { markdown, repoUrlOf } from './markdown';
+import { buildTree, looksGenerated, parseDiff, renderFileDiff, renderThread, repliesOf, Reviewed, STATUS_WORD, treeOrder, type DiffFile, type TreeDir } from './pulldiff';
+import { emptyState, field, toggle } from './kit';
+
+// The windows behind the board cards. A PR opens on its conversation (description, comments,
+// reviews, line comments, checks) with a Files tab for the diff, where you tick files off as
+// reviewed; from here you comment, label, merge or close it, or hand it to a worker to review, fix up and merge.
+
+/** The board windows ask about the floor you're on. */
+function onFloor(url: string): string {
+  const u = store.floor ? `${url}${url.includes('?') ? '&' : '?'}floor=${encodeURIComponent(store.floor)}` : url;
+  return withToken(u);
+}
+
+async function getJson<T>(url: string): Promise<T> {
+  const r = await fetch(onFloor(url), { credentials: 'same-origin' });
+  if (!r.ok) throw new Error((await r.json().catch(() => null))?.error ?? `HTTP ${r.status}`);
+  return r.json() as Promise<T>;
+}
+
+async function getText(url: string): Promise<string> {
+  const r = await fetch(onFloor(url), { credentials: 'same-origin' });
+  if (!r.ok) throw new Error((await r.json().catch(() => null))?.error ?? `HTTP ${r.status}`);
+  return r.text();
+}
+
+const mergeWaiters = new Map<number, (msg: Extract<ServerMsg, { t: 'gh.merged' }>) => void>();
+const commentWaiters = new Map<string, (msg: Extract<ServerMsg, { t: 'gh.commented' }>) => void>();
+/** Open close dialogs, by "issue:N" or "pull:N". */
+const closeWaiters = new Map<string, (msg: Extract<ServerMsg, { t: 'gh.closed' }>) => void>();
+/** Open label pickers, by "issue:N" or "pull:N". */
+const labelWaiters = new Map<string, (msg: Extract<ServerMsg, { t: 'gh.labeled' }>) => void>();
+
+/** Main feeds server messages through here so an open merge, close or label dialog or comment box hears back. */
+export function routePullMessage(msg: ServerMsg) {
+  if (msg.t === 'gh.merged') mergeWaiters.get(msg.number)?.(msg);
+  if (msg.t === 'gh.commented') commentWaiters.get(`${msg.kind}#${msg.number}`)?.(msg);
+  if (msg.t === 'gh.closed') closeWaiters.get(`${msg.kind}:${msg.number}`)?.(msg);
+  if (msg.t === 'gh.labeled') labelWaiters.get(`${msg.kind}:${msg.number}`)?.(msg);
+}
+
+function pref<T>(key: string, fallback: T): T {
+  try {
+    return (JSON.parse(localStorage.getItem(key) ?? 'null') as T) ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function savePref(key: string, v: unknown) {
+  try {
+    localStorage.setItem(key, JSON.stringify(v));
+  } catch {
+    // storage blocked
+  }
+}
+
+const MERGE_KEY = 'factory-flow.merge';
+const FILES_KEY = 'factory-flow.pr-files';
+const TAB_KEY = 'factory-flow.pr-tab';
+/** Followed by the issue or PR's URL: the comment you were writing there. */
+const DRAFT_KEY = 'factory-flow.comment:';
+
+interface MergePref {
+  method?: GhMergeMethod;
+  deleteBranch?: boolean;
+}
+
+const METHOD_LABEL: Record<GhMergeMethod, string> = { squash: 'Squash and merge', merge: 'Create a merge commit', rebase: 'Rebase and merge' };
+/** GitLab merges the way the project is set up to; squashing is the one choice per merge request. */
+const GITLAB_METHOD_LABEL: Record<GhMergeMethod, string> = { squash: 'Squash and merge', merge: 'Merge', rebase: 'Rebase and merge' };
+
+function methodLabel(m: GhMergeMethod): string {
+  return (store.project?.forge === 'gitlab' ? GITLAB_METHOD_LABEL : METHOD_LABEL)[m];
+}
+
+/** The merge dialog's remembered defaults. */
+function mergePref(methods: GhMergeMethod[]): { method: GhMergeMethod; deleteBranch: boolean } {
+  const p = pref<MergePref>(MERGE_KEY, {});
+  return { method: p.method && methods.includes(p.method) ? p.method : methods[0], deleteBranch: p.deleteBranch ?? true };
+}
+
+/** owner/repo (GitLab: group/…/project) from a PR or issue URL. */
+function nameWithOwner(url: string): string {
+  return repoUrlOf(url).replace(/^https?:\/\/[^/]+\//, '');
+}
+
+/** The project's page, for glab's --repo (which then reaches the right GitLab instance). */
+function repoArg(url: string): string {
+  return store.project?.forge === 'gitlab' ? repoUrlOf(url) : nameWithOwner(url);
+}
+
+// ---- Small pieces ---------------------------------------------------------------------------------
+
+/** A label in its own color, with text that stays readable on dark ones. */
+export function labelChip(l: GhLabel) {
+  const n = parseInt(l.color.slice(1), 16);
+  const lum = Number.isNaN(n) ? 1 : (0.299 * ((n >> 16) & 255) + 0.587 * ((n >> 8) & 255) + 0.114 * (n & 255)) / 255;
+  const chip = h('span.label', { class: lum < 0.55 ? 'dark' : '' }, l.name);
+  chip.style.setProperty('--label', l.color);
+  return chip;
+}
+
+function avatar(name: string) {
+  let x = 0;
+  for (const ch of name) x = (x * 31 + ch.charCodeAt(0)) | 0;
+  const el = h('span.gh-avatar', { 'aria-hidden': 'true' }, (name[0] ?? '?').toUpperCase());
+  el.style.setProperty('--avatar', AVATAR_COLORS[Math.abs(x) % AVATAR_COLORS.length]);
+  // A GitHub login has a public picture; the initial on its color shows under it and stays if it can't load.
+  if (words().site === 'GitHub' && /^[A-Za-z0-9-]+(\[bot\])?$/.test(name)) {
+    const img = h('img', { src: `https://github.com/${encodeURIComponent(name.replace(/\[bot\]$/, ''))}.png?size=48`, alt: '', loading: 'lazy', referrerpolicy: 'no-referrer' });
+    img.addEventListener('error', () => img.remove());
+    el.append(img);
+  }
+  return el;
+}
+
+/** A callout under a form: what's happening (with a spinner) or what went wrong. Hidden while empty. */
+function setNote(el: HTMLElement, kind: 'info' | 'bad' | 'good' | 'warn' | null, ...children: (Node | string)[]) {
+  el.className = kind ? `note ${kind}` : 'note hidden';
+  el.replaceChildren(...children);
+}
+
+/** The MergeStatus tone as a note's. */
+const NOTE_TONE: Record<MergeStatus['cls'], 'good' | 'warn' | 'bad' | 'info'> = { ok: 'good', warn: 'warn', bad: 'bad', muted: 'info' };
+
+/** A row in the side column of an issue or PR window: an eyebrow and what it holds. */
+function sideSection(title: string, ...content: (Node | string | null)[]) {
+  return h('section.gh-side-sec', {}, h('div.eyebrow', {}, title), ...content.filter((c): c is Node | string => c != null));
+}
+
+/**
+ * The action bar of an issue or PR window: groups of buttons that each stay on one line, with a
+ * hairline between groups. On a narrow window whole groups wrap to the next row.
+ */
+function actionGroups(...groups: (HTMLElement | null)[][]): HTMLElement[] {
+  return groups
+    .map((g) => g.filter((b): b is HTMLElement => b !== null))
+    .filter((g) => g.length)
+    .map((g) => h('div.gh-group', {}, ...g));
+}
+
+/** A file tree row indented `depth` levels. */
+function depthOf(depth: number, row: HTMLElement): HTMLElement {
+  row.style.setProperty('--depth', String(depth));
+  return row;
+}
+
+function when(iso: string, url?: string) {
+  const title = iso ? new Date(iso).toLocaleString() : '';
+  return url ? h('a.when', { href: url, target: '_blank', rel: 'noopener noreferrer', title }, timeAgo(iso)) : h('span.when', { title }, timeAgo(iso));
+}
+
+const REVIEW_BADGE: Record<string, [string, string]> = {
+  APPROVED: ['✅ approved', 'ok'],
+  CHANGES_REQUESTED: ['🛠 requested changes', 'bad'],
+  COMMENTED: ['💬 reviewed', ''],
+  DISMISSED: ['review dismissed', 'muted'],
+};
+
+function commentCard(c: GhComment, itemUrl: string, verb: string, badge?: [string, string]) {
+  return h(
+    'article.gh-card',
+    { class: badge?.[1] ? `is-${badge[1]}` : '' },
+    h('header', {}, avatar(c.author), h('b', {}, c.author), h('span', {}, verb), when(c.createdAt, c.url), badge ? h('span.gh-badge', { class: badge[1] }, badge[0]) : null),
+    c.body.trim() || !badge ? markdown(c.body, itemUrl) : null,
+  );
+}
+
+/** Drops the nulls of optional pieces, for replaceChildren. */
+function nodes(...xs: (Node | string | null | undefined)[]): (Node | string)[] {
+  return xs.filter((x): x is Node | string => x != null);
+}
+
+function spinnerRow(text: string) {
+  return h('div.gh-loading', {}, h('span.spinner'), text);
+}
+
+function errorBox(text: string, retry?: () => void) {
+  const box = emptyState('⚠️', `Couldn't load from ${words().site}`, text, retry ? h('button.btn', { type: 'button', onclick: retry }, 'Try again') : undefined);
+  box.classList.add('gh-error');
+  return box;
+}
+
+const CHECK_ICON: Record<GhCheck['state'], string> = { pass: '✅', fail: '❌', pending: '🟡', skip: '⚪' };
+
+function stateOf(it: { state: string; isDraft?: boolean }): [string, string] {
+  if (it.state === 'MERGED') return ['merged', 'merged'];
+  if (it.state === 'CLOSED') return ['closed', 'offline'];
+  return it.isDraft ? ['draft', 'idle'] : ['open', 'working'];
+}
+
+// ---- Whether a PR can merge ---------------------------------------------------------------------
+
+export interface MergeStatus {
+  icon: string;
+  text: string;
+
+  cls: 'ok' | 'warn' | 'bad' | 'muted';
+  /** False when merging can't work at all (draft, conflicts, already merged). */
+  can: boolean;
+  /** GitHub or GitLab could merge it on its own once the requirements pass. */
+  auto: boolean;
+}
+
+/** An open PR whose branch can't merge until someone resolves conflicts with the base. */
+function conflicted(d: GhPullDetail) {
+  return d.state === 'OPEN' && !d.isDraft && (d.mergeable === 'CONFLICTING' || d.mergeStateStatus === 'DIRTY');
+}
+
+/** Whether a PR can merge, and what the merge box says. */
+function mergeStatus(d: GhPullDetail): MergeStatus {
+  const failing = d.checks.filter((c) => c.state === 'fail').length;
+  const pending = d.checks.filter((c) => c.state === 'pending').length;
+  if (d.state === 'MERGED') return { icon: '🎉', text: 'Merged.', cls: 'ok', can: false, auto: false };
+  if (d.state === 'CLOSED') return { icon: '🗑️', text: 'Closed without merging.', cls: 'muted', can: false, auto: false };
+  if (d.isDraft) return { icon: '📝', text: `This is still a draft. Mark it ready for review on ${words().site} before merging.`, cls: 'muted', can: false, auto: false };
+  if (conflicted(d)) return { icon: '⚠️', text: `This branch has conflicts with ${d.baseRefName} that must be resolved first.`, cls: 'bad', can: false, auto: false };
+  if (d.mergeStateStatus === 'BEHIND') return { icon: '⤵️', text: `The branch is behind ${d.baseRefName}, and this repo wants it up to date before merging.`, cls: 'warn', can: true, auto: true };
+  if (d.mergeStateStatus === 'BLOCKED') {
+    const why =
+      d.reviewDecision === 'CHANGES_REQUESTED'
+        ? 'changes were requested'
+        : d.reviewDecision === 'REVIEW_REQUIRED'
+          ? 'it needs an approving review'
+          : d.blocked
+            ? d.blocked
+            : failing
+              ? `${failing} check${failing > 1 ? 's are' : ' is'} failing`
+              : pending
+                ? 'required checks are still running'
+                : 'a branch rule is not met yet';
+    return { icon: '🚫', text: `Merging is blocked: ${why}.`, cls: 'bad', can: true, auto: true };
+  }
+  if (failing) return { icon: '❌', text: `${failing} check${failing > 1 ? 's' : ''} failing. It can still be merged.`, cls: 'warn', can: true, auto: false };
+  if (pending || d.mergeStateStatus === 'UNSTABLE') return { icon: '🟡', text: 'Checks are still running. It can be merged now, or once they pass.', cls: 'warn', can: true, auto: true };
+  if (d.mergeStateStatus === 'UNKNOWN' || d.mergeable === 'UNKNOWN') return { icon: '⏳', text: `${words().site} is still working out whether this can merge. Refresh in a moment.`, cls: 'muted', can: true, auto: false };
+  return { icon: '✅', text: `Ready to merge: no conflicts with ${d.baseRefName}${d.checks.length ? ' and all checks passed' : ''}.`, cls: 'ok', can: true, auto: false };
+}
+
+function checksList(checks: GhCheck[]) {
+  const order: GhCheck['state'][] = ['fail', 'pending', 'pass', 'skip'];
+  const sorted = [...checks].sort((a, b) => order.indexOf(a.state) - order.indexOf(b.state));
+  return h('ul.gh-checks', {}, ...sorted.map((c) => h('li', {}, h('span', { 'aria-label': c.state }, CHECK_ICON[c.state]), c.url ? h('a', { href: c.url, target: '_blank', rel: 'noopener noreferrer' }, c.name) : h('span', {}, c.name))));
+}
+
+// ---- Comment box --------------------------------------------------------------------------------
+
+interface CommentBox {
+  el: HTMLElement;
+  /** Names the GitHub or GitLab account the comment goes out as, once the window knows it. */
+  setViewer(login: string): void;
+  /** Stops waiting for an answer; the window closed. */
+  dispose(): void;
+}
+
+/**
+ * Where you comment on an issue or a PR's conversation. It goes out through the server's gh or glab, so
+ * as that account rather than as you. The draft is kept per item until it is posted, so Esc or a
+ * closed window doesn't lose it.
+ */
+function commentBox(kind: 'issue' | 'pull', number: number, itemUrl: string, net: Net, onPosted: (c: GhComment) => void): CommentBox {
+  const draftKey = `${DRAFT_KEY}${itemUrl}`;
+  const waitKey = `${kind}#${number}`;
+  let busy = false;
+  let timer = 0;
+  const ta = h('textarea.input', { rows: 4, placeholder: 'Leave a comment. Markdown works.', 'aria-label': 'Comment' }) as HTMLTextAreaElement;
+  ta.value = pref<string>(draftKey, '');
+  const shown = h('div.gh-compose-preview.hidden');
+  const write = h('button.btn.sm.on', { type: 'button' }, 'Write');
+  const preview = h('button.btn.sm', { type: 'button' }, 'Preview');
+  const who = h('span.grow', {}, `Posts to ${words().site} as the office's ${words().cli} account`);
+  const postText = h('span', {}, 'Comment');
+  const post = h('button.btn.primary', { type: 'button', title: 'Post it (⌘/Ctrl+Enter)' }, postText, h('span.key', {}, '⌘↵'));
+  const result = h('div.note.bad.hidden');
+  const el = h('article.gh-card.gh-compose', {}, h('header', {}, h('b', {}, 'Add a comment'), h('span.grow'), h('div.seg', {}, write, preview)), h('div.gh-compose-body', {}, ta, shown, result), h('div.gh-compose-foot', {}, who, post));
+
+  const sync = () => {
+    post.disabled = busy || !ta.value.trim();
+    ta.readOnly = busy;
+    postText.textContent = busy ? 'Posting…' : 'Comment';
+  };
+  const saveDraft = () => {
+    if (ta.value) savePref(draftKey, ta.value);
+    else
+      try {
+        localStorage.removeItem(draftKey);
+      } catch {
+        // storage blocked
+      }
+  };
+  const setPreview = (on: boolean) => {
+    write.classList.toggle('on', !on);
+    preview.classList.toggle('on', on);
+    ta.classList.toggle('hidden', on);
+    shown.classList.toggle('hidden', !on);
+    if (on) shown.replaceChildren(ta.value.trim() ? markdown(ta.value, itemUrl) : h('p.gh-quiet', {}, 'Nothing to preview.'));
+    else ta.focus();
+  };
+  const fail = (text: string) => setNote(result, 'bad', text);
+  const settle = () => {
+    commentWaiters.delete(waitKey);
+    clearTimeout(timer);
+    busy = false;
+  };
+  const submit = () => {
+    const body = ta.value;
+    if (busy || !body.trim()) return;
+    busy = true;
+    result.classList.add('hidden');
+    sync();
+    commentWaiters.set(waitKey, (msg) => {
+      settle();
+      if (msg.comment) {
+        ta.value = '';
+        saveDraft();
+        setPreview(false);
+        onPosted(msg.comment);
+      } else fail(msg.error ?? `${words().site} did not take the comment`);
+      sync();
+    });
+    // The office drops messages while it's disconnected, and then no answer comes.
+    timer = window.setTimeout(() => {
+      settle();
+      fail('No answer from the office. Reload the conversation to see whether the comment went through before posting it again.');
+      sync();
+    }, 45_000);
+    net.send({ t: 'gh.comment', kind, number, body });
+  };
+
+  ta.addEventListener('input', () => (saveDraft(), sync()));
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      submit();
+    }
+  });
+  write.addEventListener('click', () => setPreview(false));
+  preview.addEventListener('click', () => setPreview(true));
+  post.addEventListener('click', submit);
+  sync();
+  return {
+    el,
+    setViewer(login) {
+      if (login) who.textContent = `Posts to ${words().site} as @${login}`;
+    },
+    dispose: settle,
+  };
+}
+
+// ---- Prompts for workers ------------------------------------------------------------------------
+
+/** What a pull request's prompts fill in on this floor. */
+function pullVars(it: GhPull) {
+  return pullPromptVars(store.project?.forge, it, nameWithOwner(it.url), repoArg(it.url));
+}
+
+function reviewPrompt(it: GhPull) {
+  return officePrompt('pull.review', pullVars(it));
+}
+
+function mergeVars(it: GhPull, method: GhMergeMethod, deleteBranch: boolean) {
+  return { ...pullVars(it), merge: mergeCommand(store.project?.forge, it.number, method, deleteBranch, nameWithOwner(it.url), repoArg(it.url)) };
+}
+
+function fixAndMergePrompt(it: GhPull, method: GhMergeMethod, deleteBranch: boolean) {
+  return officePrompt('pull.fixMerge', mergeVars(it, method, deleteBranch));
+}
+
+function fixConflictsPrompt(it: GhPull, method: GhMergeMethod, deleteBranch: boolean) {
+  return officePrompt('pull.fixConflicts', mergeVars(it, method, deleteBranch));
+}
+
+function pullContext(it: GhPull) {
+  return officePrompt('pull.ask', pullVars(it));
+}
+
+function issueContext(it: GhIssue) {
+  return officePrompt('issue.ask', issueVars(it));
+}
+
+// ---- Merge dialog -------------------------------------------------------------------------------
+
+function openMerge(it: GhPull, d: GhPullDetail, net: Net, handToWorker: () => void, onMerged: () => void) {
+  const st = mergeStatus(d);
+  const methods = d.repo.methods;
+  let { method, deleteBranch } = mergePref(methods);
+  let busy = false;
+
+  const methodPick = h('select.select', { id: 'merge-method' }, ...methods.map((m) => h('option', { value: m }, methodLabel(m)))) as HTMLSelectElement;
+  methodPick.value = method;
+  const go = h('button.btn.primary', { type: 'button' });
+  const autoToggle = toggle({ label: 'Merge automatically once the requirements pass', id: 'merge-auto', checked: st.auto && st.cls !== 'ok', onChange: () => renderMethods() });
+  autoToggle.title = words().cli === 'glab' ? 'GitLab auto-merge: it merges once its pipeline and merge checks pass' : 'gh pr merge --auto (the repo must allow auto-merge)';
+  const auto = autoToggle.input;
+  const renderMethods = () => {
+    go.textContent = auto.checked ? 'Merge when ready' : methodLabel(method);
+  };
+  methodPick.addEventListener('change', () => {
+    method = methodPick.value as GhMergeMethod;
+    savePref(MERGE_KEY, { method, deleteBranch });
+    renderMethods();
+  });
+  const delToggle = toggle({
+    label: `Delete ${it.headRefName} after merging`,
+    id: 'merge-del',
+    checked: deleteBranch,
+    onChange: (on) => {
+      deleteBranch = on;
+      savePref(MERGE_KEY, { method, deleteBranch });
+    },
+  });
+  const result = h('div.note.hidden');
+  const cancel = h('button.btn.ghost', { type: 'button' }, 'Cancel');
+  // Conflicts can't be merged from here, so fixing them is the main button.
+  const worker = conflicted(d)
+    ? h('button.btn.primary', { type: 'button', title: 'A new worker merges the base in, resolves the conflicts, then merges it the way picked above' }, 'New worker: fix conflicts & merge')
+    : h('button.btn', { type: 'button', title: 'A worker fixes whatever is in the way, then merges' }, 'Hand to a worker');
+
+  const el = h(
+    'div.modal.gh-merge',
+    { role: 'dialog', 'aria-label': `Merge ${words().pr} ${words().ref(it.number)}` },
+    h('header', {}, h('div.titles', {}, h('h2', {}, `Merge ${words().ref(it.number)}`), h('p.sub', { title: it.title }, it.title))),
+    h(
+      'div.body.stack',
+      {},
+      h('p.gh-branches', {}, h('code', { title: it.headRefName }, it.headRefName), h('span', { 'aria-hidden': 'true' }, '→'), h('code', { title: it.baseRefName }, it.baseRefName)),
+      h('div.note', { class: NOTE_TONE[st.cls] }, st.text),
+      d.checks.length ? checksList(d.checks) : null,
+      field('Merge method', methodPick),
+      h('div.stack.tight', {}, delToggle, st.auto ? autoToggle : null),
+      result,
+    ),
+    h('footer', {}, h('span.grow', {}, st.can || conflicted(d) ? null : worker), cancel, conflicted(d) ? worker : go),
+  );
+  renderMethods();
+  if (!st.can) go.disabled = true;
+
+  const modal = openModal(el, { onClose: () => mergeWaiters.delete(it.number) });
+  cancel.addEventListener('click', () => modal.close());
+  worker.addEventListener('click', () => {
+    modal.close();
+    handToWorker();
+  });
+  go.addEventListener('click', () => {
+    if (busy) return;
+    busy = true;
+    go.disabled = true;
+    setNote(result, 'info', h('span.spinner'), auto.checked && st.auto ? `Asking ${words().site} to merge it when ready…` : 'Merging…');
+    mergeWaiters.set(it.number, (msg) => {
+      mergeWaiters.delete(it.number);
+      busy = false;
+      if (msg.error) {
+        go.disabled = false;
+        setNote(result, 'bad', msg.error);
+        return;
+      }
+      modal.close();
+      onMerged();
+    });
+    net.send({ t: 'gh.merge', number: it.number, method, deleteBranch, auto: auto.checked && st.auto });
+  });
+  setTimeout(() => (st.can ? go : cancel).focus(), 30);
+}
+
+// ---- Close dialog -------------------------------------------------------------------------------
+
+const REASON_LABEL: Record<GhCloseReason, string> = { completed: 'Completed', 'not planned': 'Not planned' };
+
+/** Closes an issue (as completed or not planned) or a PR without merging, with an optional comment. */
+function openClose(kind: 'issue' | 'pull', it: GhIssue | GhPull, net: Net, onClosed: () => void) {
+  const key = `${kind}:${it.number}`;
+  const pull = kind === 'pull' ? (it as GhPull) : null;
+  let reason: GhCloseReason = 'completed';
+  let busy = false;
+
+  const go = h('button.btn.danger', { type: 'button' });
+  const reasons = h('div.seg', { role: 'radiogroup', 'aria-label': 'Why' });
+  const renderReasons = () => {
+    reasons.replaceChildren(
+      ...(Object.keys(REASON_LABEL) as GhCloseReason[]).map((r) =>
+        h('button.btn', { type: 'button', role: 'radio', 'aria-checked': String(r === reason), class: r === reason ? 'on' : '', onclick: () => ((reason = r), renderReasons()) }, REASON_LABEL[r]),
+      ),
+    );
+    go.textContent = pull ? `Close ${words().pull}` : `Close as ${reason}`;
+  };
+  const comment = h('textarea.input', { rows: 4, placeholder: 'Why it is being closed, for the record', 'aria-label': 'Closing comment' }) as HTMLTextAreaElement;
+  const delToggle = pull ? toggle({ label: `Delete ${pull.headRefName} too`, id: 'close-del' }) : null;
+  const w = pull && workerForPull(store.workers.values(), pull);
+  const result = h('div.note.hidden');
+  const cancel = h('button.btn.ghost', { type: 'button' }, 'Cancel');
+  const noun = pull ? words().pull : 'issue';
+  const ref = pull ? words().ref(it.number) : `#${it.number}`;
+  // GitLab doesn't record why an issue was closed.
+  const askWhy = !pull && words().cli === 'gh';
+
+  const el = h(
+    'div.modal.sm.gh-merge',
+    { role: 'dialog', 'aria-label': `Close ${noun} ${ref}` },
+    h('header', {}, h('div.titles', {}, h('h2', {}, `Close ${pull ? words().pr : 'issue'} ${ref}`), h('p.sub', { title: it.title }, it.title))),
+    h(
+      'div.body.stack',
+      {},
+      pull ? h('p.gh-branches', {}, h('code', { title: pull.headRefName }, pull.headRefName), h('span', { 'aria-hidden': 'true' }, '→'), h('code', { title: pull.baseRefName }, pull.baseRefName)) : null,
+      pull ? h('div.note.info', {}, `It won't be merged, and can be reopened on ${words().site} later.${w ? ` ${w.name} is still working on its branch.` : ''}`) : null,
+      delToggle ?? (askWhy ? h('div.field', {}, h('label', {}, 'Reason'), reasons) : null),
+      field('Comment (optional)', comment),
+      result,
+    ),
+    h('footer', {}, h('span.grow'), cancel, go),
+  );
+  renderReasons();
+  if (!pull && !askWhy) go.textContent = 'Close issue';
+
+  const modal = openModal(el, { onClose: () => closeWaiters.delete(key) });
+  cancel.addEventListener('click', () => modal.close());
+  go.addEventListener('click', () => {
+    if (busy) return;
+    busy = true;
+    go.disabled = true;
+    setNote(result, 'info', h('span.spinner'), `Closing the ${noun}…`);
+    closeWaiters.set(key, (msg) => {
+      closeWaiters.delete(key);
+      busy = false;
+      if (msg.error) {
+        go.disabled = false;
+        setNote(result, 'bad', msg.error);
+        return;
+      }
+      modal.close();
+      onClosed();
+    });
+    net.send({ t: 'gh.close', kind, number: it.number, comment: comment.value.trim() || undefined, reason: pull ? undefined : reason, deleteBranch: !!delToggle?.input.checked });
+  });
+  setTimeout(() => comment.focus(), 30);
+}
+
+// ---- Label picker -------------------------------------------------------------------------------
+
+/**
+ * Picks an issue's or PR's labels from the repo's own: tick them on and off, then save, and the
+ * office's gh or glab account adds and takes off the difference.
+ */
+export function openLabels(kind: 'issue' | 'pull', it: GhIssue | GhPull, net: Net, onSaved?: (labels: GhLabel[]) => void) {
+  const key = `${kind}:${it.number}`;
+  const had = new Set(it.labels.map((l) => l.name));
+  const on = new Set(had);
+  const w = words();
+  const name = kind === 'pull' ? `${w.pr} ${w.ref(it.number)}` : `issue #${it.number}`;
+  const manage = w.cli === 'glab' ? `${repoUrlOf(it.url)}/-/labels` : `${repoUrlOf(it.url)}/labels`;
+  let repo: GhLabel[] | null = null;
+  let error = '';
+  let busy = false;
+  let timer = 0;
+  /** Each row and the text the filter looks in. */
+  const rows = new Map<HTMLElement, string>();
+
+  const filter = h('input.input', { type: 'text', placeholder: 'Filter labels…', 'aria-label': 'Filter labels' }) as HTMLInputElement;
+  const list = h('ul.list.boxed.gh-labels');
+  const none = h('p.gh-quiet.hidden');
+  const result = h('div.note.hidden');
+  const summary = h('span.grow');
+  const cancel = h('button.btn.ghost', { type: 'button' }, 'Cancel');
+  const save = h('button.btn.primary', { type: 'button' }, 'Save labels');
+  const el = h(
+    'div.modal.gh-merge.gh-labeler',
+    { role: 'dialog', 'aria-label': `Labels on ${name}` },
+    h('header', {}, h('div.titles', {}, h('h2', {}, `Labels on ${name}`), h('p.sub', { title: it.title }, it.title))),
+    h('div.body.stack.tight', {}, filter, list, none, result),
+    h('footer', {}, summary, cancel, save),
+  );
+
+  const changes = () => ({ add: [...on].filter((n) => !had.has(n)), remove: [...had].filter((n) => !on.has(n)) });
+  const sync = () => {
+    const { add, remove } = changes();
+    save.disabled = busy || (!add.length && !remove.length);
+    save.textContent = busy ? 'Saving…' : 'Save labels';
+    summary.textContent = add.length || remove.length ? [...add.map((l) => `+${l}`), ...remove.map((l) => `−${l}`)].join('  ') : `${on.size} label${on.size === 1 ? '' : 's'} on it`;
+    for (const box of list.querySelectorAll('input')) box.disabled = busy;
+  };
+  const applyFilter = () => {
+    const q = filter.value.trim().toLowerCase();
+    let shown = 0;
+    for (const [row, text] of rows) {
+      const hit = !q || text.includes(q);
+      row.classList.toggle('hidden', !hit);
+      if (hit) shown++;
+    }
+    const empty = !!repo && !shown;
+    none.classList.toggle('hidden', !empty);
+    if (empty) none.replaceChildren(q ? `No labels match “${filter.value.trim()}”. ` : 'This repository has no labels yet. ', h('a', { href: manage, target: '_blank', rel: 'noopener noreferrer' }, `Make one on ${w.site} ↗`));
+  };
+  const row = (l: GhLabel) => {
+    const box = h('input', { type: 'checkbox' }) as HTMLInputElement;
+    box.checked = on.has(l.name);
+    box.addEventListener('change', () => {
+      if (box.checked) on.add(l.name);
+      else on.delete(l.name);
+      sync();
+    });
+    const li = h('li', {}, h('label.list-row.gh-label-row', {}, h('span.list-icon', {}, box), h('span.list-main', {}, h('span.list-title', {}, labelChip(l)), l.description ? h('span.list-meta', {}, l.description) : null)));
+    rows.set(li, `${l.name}\n${l.description ?? ''}`.toLowerCase());
+    return li;
+  };
+  const render = () => {
+    rows.clear();
+    // The ones it has first, then the rest, each A to Z. Worked out once, so a row never jumps away from the pointer.
+    const byName = (a: GhLabel, b: GhLabel) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+    const known = new Map((repo ?? []).map((l) => [l.name, l]));
+    const mine = it.labels.map((l) => known.get(l.name) ?? l).sort(byName);
+    const rest = (repo ?? []).filter((l) => !had.has(l.name)).sort(byName);
+    list.replaceChildren(...[...mine, ...rest].map(row));
+    if (error) list.append(h('li', {}, errorBox(error, load)));
+    else if (!repo) list.append(h('li', {}, spinnerRow("Loading the repo's labels…")));
+    applyFilter();
+    sync();
+  };
+  const load = () => {
+    error = '';
+    repo = null;
+    render();
+    getJson<GhLabel[]>('/api/gh/labels')
+      .then((l) => (repo = l))
+      .catch((err) => (error = (err as Error).message))
+      .finally(render);
+  };
+  const settle = () => {
+    labelWaiters.delete(key);
+    clearTimeout(timer);
+    busy = false;
+  };
+  const fail = (text: string) => {
+    setNote(result, 'bad', text);
+    sync();
+  };
+  const submit = () => {
+    const { add, remove } = changes();
+    if (busy || (!add.length && !remove.length)) return;
+    busy = true;
+    setNote(result, 'info', h('span.spinner'), `Saving the labels on ${w.site}…`);
+    sync();
+    labelWaiters.set(key, (msg) => {
+      settle();
+      if (!msg.labels) return fail(msg.error ?? `${w.site} did not take the labels`);
+      modal.close();
+      onSaved?.(msg.labels);
+    });
+    // The office drops messages while it's disconnected, and then no answer comes.
+    timer = window.setTimeout(() => {
+      settle();
+      fail('No answer from the office. Look at the board to see whether the labels changed before saving again.');
+    }, 45_000);
+    net.send({ t: 'gh.labels', kind, number: it.number, add, remove });
+  };
+
+  filter.addEventListener('input', applyFilter);
+  el.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    if (e.metaKey || e.ctrlKey) submit();
+    // Enter in the filter ticks (or unticks) the first label it shows.
+    else if (e.target === filter)
+      [...rows.keys()]
+        .find((r) => !r.classList.contains('hidden'))
+        ?.querySelector('input')
+        ?.click();
+    else return;
+    e.preventDefault();
+  });
+  const modal = openModal(el, { onClose: settle });
+  cancel.addEventListener('click', () => modal.close());
+  save.addEventListener('click', submit);
+  load();
+  setTimeout(() => filter.focus(), 30);
+}
+
+/** The button that opens the label picker, after an issue's or PR's labels. */
+function labelButton(kind: 'issue' | 'pull', it: () => GhIssue | GhPull, net: Net, onSaved: (labels: GhLabel[]) => void) {
+  const has = it().labels.length > 0;
+  return h('button.btn.sm.gh-label-edit', { type: 'button', title: 'Change the labels', 'aria-label': 'Change the labels', onclick: () => openLabels(kind, it(), net, onSaved) }, has ? 'Edit' : 'Add labels');
+}
+
+// ---- The PR window ------------------------------------------------------------------------------
+
+export function openPull(first: GhPull, net: Net, actions: BoardActions) {
+  let it = first;
+  const itemUrl = it.url;
+  const reviewed = new Reviewed(it.url);
+  let detail: GhPullDetail | null = null;
+  let detailError = '';
+  let files: DiffFile[] | null = null;
+  let diffError = '';
+  let tab: 'conversation' | 'files' = pref<string>(TAB_KEY, '') === 'files' ? 'files' : 'conversation';
+  let mode: 'tree' | 'list' = pref<string>(FILES_KEY, '') === 'list' ? 'list' : 'tree';
+  let filter = '';
+  let current = '';
+  const collapsedDirs = new Set<string>();
+  /** Files you opened or closed yourself; the rest follow the defaults (reviewed ones closed). */
+  const open = new Map<string, boolean>();
+  const sections = new Map<string, { sec: HTMLElement; body: HTMLElement; box: HTMLInputElement; built: boolean; big: boolean }>();
+
+  // --- Frame
+  const pill = h('span.pill');
+  const title = h('h3.gh-title');
+  const reload = h('button.btn', { type: 'button', title: `Reload from ${words().site}` }, 'Reload');
+  const close = h('button.btn.icon.close', { type: 'button', 'aria-label': 'Close', title: 'Close (Esc)' }, '✕');
+  const meta = h('div.gh-meta');
+  const aside = h('aside.gh-side');
+  const tabConv = h('button.tab', { type: 'button', role: 'tab' });
+  const tabFiles = h('button.tab', { type: 'button', role: 'tab' });
+  const conv = h('div.gh-conv');
+  // The comment box stays put while the conversation above it is redrawn, so a load finishing
+  // doesn't take the focus (or the text) away from someone typing.
+  const thread = h('div.gh-items');
+  const comment = commentBox('pull', it.number, itemUrl, net, (c) => {
+    if (!detail) return loadAll();
+    detail.comments.push(c);
+    renderConv();
+    renderFrame();
+  });
+  conv.append(h('div.gh-detail', {}, h('div.gh-col', {}, thread, comment.el), aside));
+  const filesPane = h('div.pd');
+  const footBtns = h('div.gh-actions');
+  const el = h(
+    'div.modal.full.gh-window',
+    { role: 'dialog', 'aria-label': `${words().pull} ${words().ref(it.number)}`, tabindex: -1 },
+    h('header', {}, pill, h('div.titles', {}, h('h2', {}, `${words().pull} ${words().ref(it.number)}`)), h('div.actions', {}, reload), close),
+    h('div.gh-hero', {}, title, meta),
+    h('nav.tabs.gh-strip', { role: 'tablist' }, tabConv, tabFiles),
+    h('div.gh-body', {}, conv, filesPane),
+    h('footer', {}, h('a.grow.gh-open', { href: it.url, target: '_blank', rel: 'noopener noreferrer' }, `Open on ${words().site} ↗`), footBtns),
+  );
+
+  const handToWorker = () => {
+    const p = mergePref(detail?.repo.methods ?? ['squash', 'merge', 'rebase']);
+    const w = words();
+    if (detail && conflicted(detail)) actions.assign(fixConflictsPrompt(it, p.method, p.deleteBranch), `Fix conflicts & merge ${w.pr} ${w.ref(it.number)}`);
+    else actions.assign(fixAndMergePrompt(it, p.method, p.deleteBranch), `Fix up & merge ${w.pr} ${w.ref(it.number)}`);
+  };
+
+  const renderFrame = () => {
+    const [word, cls] = stateOf(it);
+    pill.className = `pill ${cls}`;
+    pill.textContent = word;
+    title.replaceChildren(h('span.gh-ref', {}, words().ref(it.number)), ' ', it.title);
+    title.title = it.title;
+    const commits = detail ? `${detail.commits} commit${detail.commits === 1 ? '' : 's'}` : 'its commits';
+    meta.replaceChildren(
+      ...nodes(
+        avatar(it.author),
+        h('b', {}, it.author),
+        h('span', {}, it.state === 'MERGED' ? `merged ${commits} into` : `wants to merge ${commits} into`),
+        h('code', { title: it.baseRefName }, it.baseRefName),
+        h('span', {}, 'from'),
+        h('code', { title: it.headRefName }, it.headRefName),
+        h('span.gh-pm', {}, h('span.add', {}, `+${it.additions}`), ' ', h('span.del', {}, `−${it.deletions}`)),
+      ),
+    );
+    const worker = workerForPull(store.workers.values(), it);
+    const failing = detail?.checks.filter((c) => c.state === 'fail').length ?? 0;
+    const pendingChecks = detail?.checks.filter((c) => c.state === 'pending').length ?? 0;
+    const passed = detail?.checks.filter((c) => c.state === 'pass').length ?? 0;
+    aside.replaceChildren(
+      ...nodes(
+        sideSection(
+          'Review',
+          it.reviewDecision
+            ? h('span.gh-badge', { class: REVIEW_BADGE[it.reviewDecision]?.[1] ?? '' }, it.reviewDecision === 'REVIEW_REQUIRED' ? 'review required' : (REVIEW_BADGE[it.reviewDecision]?.[0] ?? it.reviewDecision.toLowerCase()))
+            : h('span.gh-side-none', {}, 'No review yet'),
+        ),
+        sideSection(
+          'Checks',
+          !detail
+            ? h('span.gh-side-none', {}, 'Loading…')
+            : !detail.checks.length
+              ? h('span.gh-side-none', {}, 'None')
+              : h(
+                  'div.gh-side-checks',
+                  {},
+                  failing ? h('span', { class: 'bad' }, `${failing} failing`) : null,
+                  pendingChecks ? h('span', { class: 'warn' }, `${pendingChecks} running`) : null,
+                  passed ? h('span', { class: 'ok' }, `${passed} passed`) : null,
+                ),
+        ),
+        sideSection(
+          'Labels',
+          h(
+            'div.chips',
+            {},
+            ...it.labels.map(labelChip),
+            labelButton(
+              'pull',
+              () => it,
+              net,
+              (labels) => ((it = { ...it, labels }), renderFrame()),
+            ),
+          ),
+        ),
+        worker ? sideSection('Worker', pullWorkerChip(worker)) : null,
+        sideSection('Branch', h('div.gh-side-branch', {}, h('code', { title: it.headRefName }, it.headRefName), h('small', {}, `into ${it.baseRefName}`))),
+      ),
+    );
+    const done = files ? files.filter((f) => reviewed.mark(f) === 'reviewed').length : 0;
+    tabConv.replaceChildren(...nodes('Conversation', detail ? h('span.n', {}, String(detail.comments.length + detail.reviews.length + detail.reviewComments.filter((c) => !c.replyTo).length)) : null));
+    tabFiles.replaceChildren(...nodes('Files changed', files ? h('span.n', {}, String(files.length)) : null, files?.length ? h('span.gh-progress', { class: done === files.length ? 'all' : '' }, `✓ ${done}/${files.length}`) : null));
+    tabConv.classList.toggle('on', tab === 'conversation');
+    tabFiles.classList.toggle('on', tab === 'files');
+    tabConv.setAttribute('aria-selected', String(tab === 'conversation'));
+    tabFiles.setAttribute('aria-selected', String(tab === 'files'));
+    conv.classList.toggle('hidden', tab !== 'conversation');
+    filesPane.classList.toggle('hidden', tab !== 'files');
+
+    const isOpen = it.state === 'OPEN';
+    const conflicts = !!detail && conflicted(detail);
+    const fw = words();
+    const pr = `${fw.pr} ${fw.ref(it.number)}`;
+    const merge = h(conflicts ? 'button.btn' : 'button.btn.primary', { type: 'button', disabled: !detail, title: detail ? `Merge this ${fw.pull}` : 'Loading…' }, 'Merge…');
+    merge.addEventListener('click', () => detail && openMerge(it, detail, net, handToWorker, loadAll));
+    const w = workerForPull(store.workers.values(), it);
+    footBtns.replaceChildren(
+      ...actionGroups(
+        [h('button.btn', { type: 'button', title: `Send a worker your own prompt about this ${fw.pr}`, onclick: () => actions.ask(pullContext(it), `Ask about ${pr}`) }, 'Ask a worker…')],
+        [
+          w ? h('button.btn', { type: 'button', title: `Show ${w.name} in the workspace`, onclick: () => actions.goToWorker(w.id) }, `Go to ${w.name}`) : null,
+          isOpen ? h('button.btn', { type: 'button', onclick: () => actions.assign(reviewPrompt(it), `Review ${pr}`) }, 'Review') : null,
+          conflicts
+            ? h('button.btn.primary', { type: 'button', title: 'A new worker merges the base in, resolves the conflicts, gets the checks green, then merges', onclick: handToWorker }, 'Fix conflicts & merge')
+            : isOpen
+              ? h('button.btn', { type: 'button', title: 'A worker addresses the review comments, gets the checks green, then merges', onclick: handToWorker }, 'Fix comments & merge')
+              : null,
+        ],
+        [isOpen ? h('button.btn.danger', { type: 'button', title: `Close this ${fw.pull} without merging it`, onclick: () => openClose('pull', it, net, loadAll) }, `Close ${fw.pr}…`) : null, isOpen ? merge : null],
+      ),
+    );
+  };
+
+  // --- Conversation
+  const showInDiff = (c: GhReviewComment) => {
+    setTab('files');
+    requestAnimationFrame(() => revealLine(c.path, c.side, c.line));
+  };
+
+  const renderConv = () => {
+    thread.replaceChildren(commentCard({ id: 'body', author: it.author, body: detail?.body ?? it.body, createdAt: it.createdAt, url: it.url }, itemUrl, 'opened this'));
+    if (detailError) return thread.append(errorBox(detailError, loadAll));
+    if (!detail) return thread.append(spinnerRow('Loading the conversation…'));
+    const d = detail;
+    const replies = repliesOf(d.reviewComments);
+    const items: { at: string; node: HTMLElement }[] = [
+      ...d.comments.map((c) => ({ at: c.createdAt, node: commentCard(c, itemUrl, 'commented') })),
+      ...d.reviews.map((r) => ({ at: r.createdAt, node: commentCard(r, itemUrl, '', REVIEW_BADGE[r.state ?? ''] ?? [r.state?.toLowerCase() ?? 'reviewed', '']) })),
+      ...d.reviewComments
+        .filter((c) => !c.replyTo)
+        .map((c) => ({
+          at: c.createdAt,
+          node: h(
+            'article.gh-card.gh-thread',
+            {},
+            h(
+              'header',
+              {},
+              h('code', { title: c.path }, `${c.path}${c.line ? `:${c.line}` : ''}`),
+              c.line == null ? h('span.gh-badge.muted', {}, 'outdated') : null,
+              h('span.grow'),
+              c.line != null ? h('button.btn.sm', { type: 'button', onclick: () => showInDiff(c) }, 'Show in diff') : null,
+            ),
+            renderThread(c, replies, itemUrl),
+          ),
+        })),
+    ].sort((a, b) => a.at.localeCompare(b.at));
+    thread.append(...items.map((x) => x.node));
+    if (!items.length) thread.append(h('p.gh-quiet', {}, 'No comments or reviews yet.'));
+
+    const st = mergeStatus(d);
+    const box = h('section.gh-mergebox', { class: st.cls }, h('div.note', { class: NOTE_TONE[st.cls] }, st.text), d.checks.length ? checksList(d.checks) : null);
+    if (it.state === 'OPEN' && st.can) box.append(h('div.gh-mergebox-go', {}, h('button.btn.primary', { type: 'button', onclick: () => openMerge(it, d, net, handToWorker, loadAll) }, 'Merge…')));
+    if (conflicted(d)) box.append(h('div.gh-mergebox-go', {}, h('button.btn.primary', { type: 'button', onclick: handToWorker }, 'New worker: fix conflicts & merge')));
+    else if (it.state === 'OPEN' && !st.can && !d.isDraft) box.append(h('div.gh-mergebox-go', {}, h('button.btn', { type: 'button', onclick: handToWorker }, 'Have a worker fix it & merge')));
+    thread.append(box);
+  };
+
+  // --- Files
+  /** The files in the order the sidebar lists them, after the filter. */
+  let order: DiffFile[] = [];
+  const shown = () => {
+    if (!files) return [];
+    const q = filter.trim().toLowerCase();
+    const list = mode === 'tree' ? treeOrder(buildTree(files)) : files;
+    return q ? list.filter((f) => f.path.toLowerCase().includes(q)) : list;
+  };
+
+  const isOpenFile = (f: DiffFile) => open.get(f.path) ?? reviewed.mark(f) !== 'reviewed';
+
+  const buildBody = (f: DiffFile) => {
+    const s = sections.get(f.path)!;
+    s.body.replaceChildren();
+    s.built = true;
+    s.body.append(renderFileDiff(f, detail?.reviewComments ?? [], itemUrl));
+  };
+
+  let budget = 0;
+  const syncSection = (f: DiffFile) => {
+    const s = sections.get(f.path)!;
+    const mark = reviewed.mark(f);
+    const isOpen = isOpenFile(f);
+    s.sec.classList.toggle('closed', !isOpen);
+    s.sec.classList.toggle('reviewed', mark === 'reviewed');
+    s.box.checked = mark === 'reviewed';
+    s.sec.querySelector('.pd-stale')?.classList.toggle('hidden', mark !== 'stale');
+    if (!isOpen || s.built) return;
+    // Big files and lock files wait for a click, so a huge PR doesn't lock up the window.
+    if (s.big && !open.get(f.path)) {
+      s.body.replaceChildren(
+        h(
+          'div.pd-big',
+          {},
+          looksGenerated(f.path) ? 'Generated or lock file — not shown by default.' : `Large diff (${f.lines.length} lines) — not shown by default.`,
+          h('button.btn.sm', { type: 'button', onclick: () => (open.set(f.path, true), buildBody(f)) }, 'Show diff'),
+        ),
+      );
+      return;
+    }
+    buildBody(f);
+  };
+
+  const setReviewed = (f: DiffFile, on: boolean, advance = false) => {
+    reviewed.set(f, on);
+    open.delete(f.path);
+    const s = sections.get(f.path);
+    const pane = filesPane.querySelector<HTMLElement>('.pd-main');
+    syncSection(f);
+    // Closing a file you were reading: keep its header in view instead of jumping past the next one.
+    if (on && s && pane && s.sec.offsetTop < pane.scrollTop) pane.scrollTop = s.sec.offsetTop;
+    if (on && advance) {
+      const next = order.slice(order.indexOf(f) + 1).find((x) => reviewed.mark(x) !== 'reviewed');
+      if (next) scrollToFile(next.path);
+    }
+    renderSide();
+    renderFrame();
+  };
+
+  const scrollToFile = (p: string, reveal = false) => {
+    const s = sections.get(p);
+    const pane = filesPane.querySelector<HTMLElement>('.pd-main');
+    const f = files?.find((x) => x.path === p);
+    if (!s || !pane || !f) return;
+    if (reveal && !isOpenFile(f)) {
+      open.set(p, true);
+      syncSection(f);
+    }
+    pane.scrollTop = s.sec.offsetTop;
+    setCurrent(p);
+  };
+
+  const revealLine = (p: string, side: 'LEFT' | 'RIGHT', line: number | null) => {
+    const f = files?.find((x) => x.path === p);
+    const s = sections.get(p);
+    if (!f || !s) return;
+    open.set(p, true);
+    syncSection(f);
+    if (!s.built) buildBody(f);
+    const row = s.body.querySelector<HTMLElement>(side === 'LEFT' ? `.pd-l[data-old="${line}"]:not(.add)` : `.pd-l[data-new="${line}"]`);
+    const pane = filesPane.querySelector<HTMLElement>('.pd-main')!;
+    if (!row) return scrollToFile(p);
+    // Rows sit in .pd-main's coordinates (it's the positioned ancestor), like the sections.
+    pane.scrollTop = row.offsetTop - pane.clientHeight / 3;
+    row.classList.add('flash');
+    setTimeout(() => row.classList.remove('flash'), 1600);
+    setCurrent(p);
+  };
+
+  const side = h('aside.pd-side');
+  const fileList = h('ul.pd-files', { role: 'tree' });
+  const filterInput = h('input.input.sm', { type: 'text', placeholder: 'Filter files…', 'aria-label': 'Filter files' }) as HTMLInputElement;
+  filterInput.addEventListener('input', () => {
+    filter = filterInput.value;
+    renderFiles();
+  });
+
+  const setCurrent = (p: string) => {
+    if (current === p) return;
+    current = p;
+    for (const li of fileList.querySelectorAll<HTMLElement>('li[data-path]')) {
+      const on = li.dataset.path === p;
+      li.classList.toggle('on', on);
+      if (on) li.scrollIntoView({ block: 'nearest' });
+    }
+  };
+
+  const checkBtn = (f: DiffFile) => {
+    const mark = reviewed.mark(f);
+    return h(
+      'button.pd-tick',
+      {
+        type: 'button',
+        class: mark,
+        title: mark === 'reviewed' ? 'Reviewed — click to unmark' : mark === 'stale' ? 'Changed since you reviewed it' : 'Mark as reviewed',
+        'aria-pressed': String(mark === 'reviewed'),
+        onclick: ((e: Event) => {
+          e.stopPropagation();
+          setReviewed(f, mark !== 'reviewed');
+        }) as EventListener,
+      },
+      mark === 'reviewed' ? '✓' : mark === 'stale' ? '!' : '',
+    );
+  };
+
+  const countComments = (p: string) => detail?.reviewComments.filter((c) => c.path === p && !c.replyTo).length ?? 0;
+
+  const fileRow = (f: DiffFile, depth: number) => {
+    const slash = f.path.lastIndexOf('/');
+    const n = countComments(f.path);
+    return depthOf(
+      depth,
+      h(
+        'li.pd-row',
+        { 'data-path': f.path, class: `${current === f.path ? 'on' : ''} ${reviewed.mark(f)}`, role: 'treeitem', title: f.path, onclick: () => scrollToFile(f.path, true) },
+        checkBtn(f),
+        h('span.pd-st', { class: f.status, title: STATUS_WORD[f.status] }, f.status),
+        // The name first and its folder after, so a narrow sidebar cuts the folder, not the name.
+        h('span.pd-path', {}, f.path.slice(slash + 1), mode === 'list' && slash >= 0 ? h('span.dir', {}, ` ${f.path.slice(0, slash)}`) : null),
+        n ? h('span.pd-c', { title: `${n} comment${n > 1 ? 's' : ''}` }, `💬${n}`) : null,
+        h('span.gh-pm', {}, f.binary ? h('span.bin', {}, 'bin') : h('span', {}, h('span.add', {}, `+${f.additions}`), ' ', h('span.del', {}, `−${f.deletions}`))),
+      ),
+    );
+  };
+
+  const dirRows = (d: TreeDir, depth: number, visible: Set<DiffFile>, out: HTMLElement[]) => {
+    for (const sub of d.dirs) {
+      const inside = treeOrder(sub).filter((f) => visible.has(f));
+      if (!inside.length) continue;
+      const shut = collapsedDirs.has(sub.path) && !filter;
+      const all = inside.every((f) => reviewed.mark(f) === 'reviewed');
+      out.push(
+        depthOf(
+          depth,
+          h(
+            'li.pd-dir',
+            {
+              role: 'treeitem',
+              'aria-expanded': String(!shut),
+              title: sub.path,
+              onclick: () => {
+                if (collapsedDirs.has(sub.path)) collapsedDirs.delete(sub.path);
+                else collapsedDirs.add(sub.path);
+                renderSide();
+              },
+            },
+            h('span.pd-caret', {}, shut ? '▸' : '▾'),
+            h('span.pd-path', {}, sub.name),
+            all ? h('span.pd-done', { title: 'Everything in here is reviewed' }, '✓') : null,
+          ),
+        ),
+      );
+      if (!shut) dirRows(sub, depth + 1, visible, out);
+    }
+    for (const f of d.files) if (visible.has(f)) out.push(fileRow(f, depth));
+  };
+
+  const renderSide = () => {
+    if (!files) return;
+    const rows: HTMLElement[] = [];
+    if (mode === 'tree') dirRows(buildTree(files), 0, new Set(order), rows);
+    else rows.push(...order.map((f) => fileRow(f, 0)));
+    if (!rows.length) rows.push(h('li.pd-none', {}, filter ? 'No files match.' : 'No files changed.'));
+    fileList.replaceChildren(...rows);
+    const done = files.filter((f) => reviewed.mark(f) === 'reviewed').length;
+    const bar = side.querySelector<HTMLElement>('.pd-bar i');
+    if (bar) bar.style.width = `${files.length ? (100 * done) / files.length : 0}%`;
+    const txt = side.querySelector<HTMLElement>('.pd-done-txt');
+    if (txt) txt.textContent = `${done} of ${files.length} file${files.length === 1 ? '' : 's'} reviewed`;
+  };
+
+  const renderFiles = () => {
+    order = shown();
+    renderSide();
+    const main = filesPane.querySelector<HTMLElement>('.pd-main');
+    if (!main || !files) return;
+    main.replaceChildren(...order.map((f) => sections.get(f.path)!.sec));
+    if (!order.length) main.append(h('div.pd-note', {}, 'No files match the filter.'));
+  };
+
+  const setupFiles = () => {
+    const was = filesPane.querySelector<HTMLElement>('.pd-main')?.scrollTop ?? 0;
+    filesPane.replaceChildren();
+    sections.clear();
+    if (diffError) return filesPane.append(errorBox(diffError, loadAll));
+    if (!files) return filesPane.append(spinnerRow('Loading the diff…'));
+    const modeBtn = (m: 'tree' | 'list', label: string) =>
+      h(
+        'button.btn',
+        {
+          type: 'button',
+          class: mode === m ? 'on' : '',
+          onclick: () => {
+            mode = m;
+            savePref(FILES_KEY, m);
+            for (const b of side.querySelectorAll('.pd-mode .btn')) b.classList.toggle('on', b.textContent === label);
+            renderFiles();
+          },
+        },
+        label,
+      );
+    side.replaceChildren(
+      h('div.pd-side-head', {}, h('div.seg.pd-mode', { role: 'radiogroup', 'aria-label': 'Show files as' }, modeBtn('tree', 'Tree'), modeBtn('list', 'List')), h('div.pd-bar', {}, h('i')), h('div.pd-done-txt')),
+      filterInput,
+      fileList,
+      h('div.pd-keys', {}, h('span', {}, h('span.key', {}, 'J'), h('span.key', {}, 'K'), 'next / previous'), h('span', {}, h('span.key', {}, 'V'), 'reviewed')),
+    );
+    const main = h('div.pd-main', { tabindex: -1 });
+    budget = 0;
+    for (const f of files) {
+      const box = h('input', { type: 'checkbox' }) as HTMLInputElement;
+      box.addEventListener('change', () => setReviewed(f, box.checked));
+      const body = h('div.pd-fbody');
+      const n = countComments(f.path);
+      const big = looksGenerated(f.path) || f.lines.length > 800 || budget > 6000;
+      if (!big) budget += f.lines.length;
+      const sec = h(
+        'section.pd-file',
+        { 'data-path': f.path },
+        h(
+          'header.pd-fh',
+          {},
+          h('button.pd-fold', { type: 'button', 'aria-label': 'Show or hide this file', onclick: () => (open.set(f.path, !isOpenFile(f)), syncSection(f)) }),
+          h('span.pd-st', { class: f.status, title: STATUS_WORD[f.status] }, f.status),
+          h('span.pd-fpath', { title: f.path }, f.status === 'R' && f.oldPath ? `${f.oldPath} → ${f.path}` : f.path),
+          h('span.gh-pm', {}, f.binary ? h('span.bin', {}, 'binary') : h('span', {}, h('span.add', {}, `+${f.additions}`), ' ', h('span.del', {}, `−${f.deletions}`))),
+          n ? h('span.pd-c', {}, `💬 ${n}`) : null,
+          h('span.pd-stale.hidden', { title: 'The file changed after you marked it reviewed' }, 'changed since review'),
+          h('label.pd-viewed', { title: 'Mark as reviewed (V)' }, box, 'Reviewed'),
+        ),
+        body,
+      );
+      sections.set(f.path, { sec, body, box, built: false, big });
+      syncSection(f);
+    }
+    main.addEventListener('scroll', () => {
+      if (spy) return;
+      spy = requestAnimationFrame(() => {
+        spy = 0;
+        const top = main.scrollTop + 12;
+        let at = '';
+        for (const f of order) {
+          const s = sections.get(f.path)!;
+          if (s.sec.offsetTop > top) break;
+          at = f.path;
+        }
+        if (at) setCurrent(at);
+      });
+    });
+    filesPane.append(side, main);
+    renderFiles();
+    main.scrollTop = was;
+    if (!current && order[0]) setCurrent(order[0].path);
+  };
+  let spy = 0;
+
+  const step = (dir: 1 | -1) => {
+    const i = order.findIndex((f) => f.path === current);
+    const next = order[Math.max(0, Math.min(order.length - 1, i + dir))];
+    if (next) scrollToFile(next.path, true);
+  };
+
+  el.addEventListener('keydown', (e) => {
+    if (tab !== 'files' || e.metaKey || e.ctrlKey || e.altKey) return;
+    const t = e.target as HTMLElement;
+    if (t.closest('input[type=text], textarea')) return;
+    if (e.key === 'j' || e.key === 'n') step(1);
+    else if (e.key === 'k' || e.key === 'p') step(-1);
+    else if (e.key === 'v') {
+      const f = files?.find((x) => x.path === current);
+      if (f) setReviewed(f, reviewed.mark(f) !== 'reviewed', true);
+    } else return;
+    e.preventDefault();
+  });
+
+  const setTab = (t: typeof tab) => {
+    tab = t;
+    savePref(TAB_KEY, t);
+    renderFrame();
+    if (t === 'files') filesPane.querySelector<HTMLElement>('.pd-main')?.focus({ preventScroll: true });
+  };
+  tabConv.addEventListener('click', () => setTab('conversation'));
+  tabFiles.addEventListener('click', () => setTab('files'));
+
+  // --- Loading
+  let generation = 0;
+  function loadAll() {
+    const g = ++generation;
+    detailError = '';
+    diffError = '';
+    renderConv();
+    getJson<GhPullDetail>(`/api/gh/pull?number=${it.number}`)
+      .then((d) => {
+        if (g !== generation) return;
+        detail = d;
+        comment.setViewer(d.viewer);
+        it = { ...it, state: d.state, isDraft: d.isDraft, reviewDecision: d.reviewDecision };
+        // Line comments go into the diff, so draw it again with them.
+        if (files) setupFiles();
+      })
+      .catch((err) => g === generation && (detailError = (err as Error).message))
+      .finally(() => g === generation && (renderFrame(), renderConv()));
+    getText(`/api/gh/pull/diff?number=${it.number}`)
+      .then((text) => {
+        if (g !== generation) return;
+        files = parseDiff(text);
+      })
+      .catch((err) => g === generation && (diffError = (err as Error).message))
+      .finally(() => g === generation && (setupFiles(), renderFrame()));
+    renderFrame();
+  }
+  reload.addEventListener('click', () => {
+    net.send({ t: 'gh.refresh' });
+    loadAll();
+  });
+
+  const unsub = store.on('pulls', () => {
+    const fresh = store.pulls.items.find((p) => p.number === it.number);
+    if (!fresh) return;
+    it = detail ? { ...fresh, state: fresh.state === 'OPEN' ? detail.state : fresh.state } : fresh;
+    renderFrame();
+  });
+  const modal: Modal = openModal(el, {
+    onClose: () => {
+      unsub();
+      comment.dispose();
+    },
+  });
+  close.addEventListener('click', () => modal.close());
+  renderFrame();
+  setupFiles();
+  loadAll();
+  setTimeout(() => el.focus({ preventScroll: true }), 30);
+}
+
+// ---- The issue window -----------------------------------------------------------------------------
+
+export function openIssue(first: GhIssue, net: Net, actions: BoardActions) {
+  let it = first;
+  const itemUrl = it.url;
+  let detail: GhIssueDetail | null = null;
+  let error = '';
+  const close = h('button.btn.icon.close', { type: 'button', 'aria-label': 'Close', title: 'Close (Esc)' }, '✕');
+  const pill = h('span.pill');
+  const conv = h('div.gh-conv');
+  const thread = h('div.gh-items');
+  const comment = commentBox('issue', it.number, itemUrl, net, (c) => {
+    if (!detail) return load();
+    detail.comments.push(c);
+    render();
+  });
+  // The footer stays put and renderFrame only shows and hides its buttons.
+  const closeIssue = h('button.btn.danger', { type: 'button', title: `Close this issue on ${words().site}`, onclick: () => openClose('issue', it, net, load) }, 'Close issue…');
+  const info = h('div.gh-side-info');
+  conv.append(h('div.gh-detail', {}, h('div.gh-col', {}, thread, comment.el), h('aside.gh-side', {}, info)));
+  const title = h('h3.gh-title', { title: it.title }, h('span.gh-ref', {}, `#${it.number}`), ' ', it.title);
+  const el = h(
+    'div.modal.xl.gh-window.issue',
+    { role: 'dialog', 'aria-label': `Issue #${it.number}` },
+    h('header', {}, pill, h('div.titles', {}, h('h2', {}, `Issue #${it.number}`)), close),
+    h('div.gh-hero', {}, title),
+    h('div.gh-body', {}, conv),
+    h(
+      'footer',
+      {},
+      h('a.grow.gh-open', { href: it.url, target: '_blank', rel: 'noopener noreferrer' }, `Open on ${words().site} ↗`),
+      h(
+        'div.gh-actions',
+        {},
+        ...actionGroups(
+          [h('button.btn', { type: 'button', title: 'Send a worker your own prompt about this issue', onclick: () => actions.ask(issueContext(it), `Ask about issue #${it.number}`) }, 'Ask a worker…')],
+          [closeIssue, h('button.btn.primary', { type: 'button', onclick: () => actions.assign(issuePrompt(it), `Hand issue #${it.number} to a worker`, it.number) }, 'Hand to a worker')],
+        ),
+      ),
+    ),
+  );
+  const renderFrame = () => {
+    const isOpen = it.state === 'OPEN';
+    info.replaceChildren(
+      sideSection('Assignees', it.assignees.length ? h('div.gh-side-list', {}, ...it.assignees.map((a) => h('span.gh-person', {}, avatar(a), a))) : h('span.gh-side-none', {}, 'No one')),
+      sideSection(
+        'Labels',
+        h(
+          'div.chips',
+          {},
+          ...it.labels.map(labelChip),
+          labelButton(
+            'issue',
+            () => it,
+            net,
+            (labels) => ((it = { ...it, labels }), renderFrame()),
+          ),
+        ),
+      ),
+    );
+    pill.className = `pill ${isOpen ? 'done' : 'offline'}`;
+    pill.textContent = isOpen ? 'open' : 'closed';
+    closeIssue.classList.toggle('hidden', !isOpen);
+  };
+  const render = () => {
+    thread.replaceChildren(commentCard({ id: 'body', author: it.author, body: detail?.body ?? it.body, createdAt: it.createdAt, url: it.url }, itemUrl, 'opened this'));
+    if (error) thread.append(errorBox(error, load));
+    else if (!detail) thread.append(spinnerRow('Loading comments…'));
+    else if (!detail.comments.length) thread.append(h('p.gh-quiet', {}, 'No comments yet.'));
+    else thread.append(...detail.comments.map((c) => commentCard(c, itemUrl, 'commented')));
+  };
+  let generation = 0;
+  function load() {
+    const g = ++generation;
+    error = '';
+    render();
+    getJson<GhIssueDetail>(`/api/gh/issue?number=${it.number}`)
+      .then((d) => {
+        if (g !== generation) return;
+        detail = d;
+        it = { ...it, state: d.state };
+        comment.setViewer(d.viewer);
+      })
+      .catch((err) => g === generation && (error = (err as Error).message))
+      .finally(() => g === generation && (renderFrame(), render()));
+  }
+  const unsubs = [
+    store.on('issues', () => {
+      const fresh = store.issues.items.find((i) => i.number === it.number);
+      if (!fresh) return;
+      // The board can lag behind a close made from here.
+      it = detail ? { ...fresh, state: fresh.state === 'OPEN' ? detail.state : fresh.state } : fresh;
+      renderFrame();
+    }),
+  ];
+  const modal = openModal(el, {
+    onClose: () => {
+      comment.dispose();
+      unsubs.forEach((u) => u());
+    },
+  });
+  close.addEventListener('click', () => modal.close());
+  renderFrame();
+  load();
+}
